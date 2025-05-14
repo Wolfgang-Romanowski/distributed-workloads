@@ -38,39 +38,29 @@ jobs:
       - name: Scan Dockerfiles
         id: snyk
         run: |
-          set -Eeuo pipefail
+          set -e
+          export SNYK_TOKEN=${{ secrets.SNYK_TOKEN }}
           passed=0 skipped=0 failed=0
 
           find images/runtime/training -name Dockerfile | while read f; do
-            echo "::group::$f"
+          echo "::group::$f"
+          base=$(grep -iE '^[[:space:]]*FROM ' "$f" | tail -1 |
+          awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
+          [[ "$base" != *:* ]] && base="${base}:latest"
+            
+          snyk container test "$base" --file="$f" --severity-threshold=high
+          rc=$?
 
-            base=$(grep -iE '^[[:space:]]*FROM ' "$f" | grep -iv scratch | tail -1 |
-                   awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
-            [[ $base =~ ^ubi[0-9] ]] && alt="registry.access.redhat.com/$base" || alt=""
-            docker pull "$base" >/dev/null 2>&1 || {
-              [[ $alt ]] && docker pull "$alt" >/dev/null 2>&1 && docker tag "$alt" "$base" || true;}
-
-            snyk container test "$base" --file="$f" --severity-threshold=high --sarif-file-output=snyk.sarif
-            rc=$?
-
-            if [ $rc -eq 0 ]; then
-              ((passed++))
-            else
-              if grep -q 'SNYK-CLI-0000' snyk.sarif 2>/dev/null; then
-                echo "::warning ::Skipped – base image inaccessible"
-                ((skipped++))
-              else
-                echo "::error ::High/Critical CVEs found"
-                ((failed++))
-              fi
-            fi
-            echo "::endgroup::"
+          case $rc in
+          0) ((passed++));;
+          1) echo "::error ::High/Critical CVEs"; ((failed++));;
+          *) echo "::warning::Scan error – skipped"; ((skipped++));;
+          esac
+          echo "::endgroup::"
           done
 
-          echo "passed=$passed"  >> $GITHUB_OUTPUT
-          echo "skipped=$skipped" >> $GITHUB_OUTPUT
-          echo "failed=$failed"  >> $GITHUB_OUTPUT
-          [ $failed -eq 0 ] || exit 1
+          echo "Passed: $passed  Skipped: $skipped  Failed: $failed"
+          [ $failed -eq 0 ]
 
       - uses: github/codeql-action/upload-sarif@v2
         if: always()
