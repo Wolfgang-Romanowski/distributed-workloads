@@ -8,9 +8,9 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: '0 3 * * *'              
+    - cron: '0 3 * * *'
   pull_request_target:
-    types: [ labeled ]
+    types: [ labeled ]    
 
 jobs:
   scan:
@@ -19,59 +19,73 @@ jobs:
       github.event_name == 'push' ||
       (github.event_name == 'pull_request_target' &&
        contains(github.event.pull_request.labels.*.name,'run-snyk'))
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
-    env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Install Snyk CLI
-        uses: snyk/actions/setup@master
+          repository: ${{ github.repository }}
+          ref: >-
+            ${{ github.event_name == 'pull_request_target'
+                && github.event.pull_request.base.ref
+                || github.sha }}
+          fetch-depth: 0
+      - name: Download PR Dockerfile diff
+        if: github.event_name == 'pull_request_target'
+        run: |
+          mkdir -p pr_overlay && cd pr_overlay
+          gh pr diff ${{ github.event.pull_request.number }} --name-only \
+            | grep 'images/runtime/training/.*/Dockerfile' | while read f; do
+              mkdir -p "$(dirname "../$f")"
+              gh pr checkout ${{ github.event.pull_request.number }} -- "$f" -q
+              mv "$f" "../$f"
+            done
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: snyk/actions/setup@master
       - name: Scan Dockerfiles
         id: snyk
-        continue-on-error: true  
+        continue-on-error: true
+        env:
+          TZ: UTC
         run: |
-          set -uo pipefail             
+          set -uo pipefail
           mkdir -p reports
-          passed=0 skipped=0 failed=0
+          passed=0 failed=0 skipped=0
 
           find images/runtime/training -name Dockerfile | while read f; do
             echo "::group::$f"
-
             base=$(grep -iE '^[[:space:]]*FROM ' "$f" | tail -1 \
                    | awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
             [[ "$base" != *:* ]] && base="${base%:}:latest"
 
             if [[ -z "$base" || "$base" == *'${'* || "$base" == *'-:' ]]; then
-              echo "Skipped – cannot resolve base image" > "reports/$(basename "$(dirname "$f")").txt"
+              echo "Skipped – cannot resolve base image" \
+                   >"reports/$(basename "$(dirname "$f")").txt"
               ((skipped++)); echo "::endgroup::"; continue
             fi
 
-            snyk container test "$base" --file="$f" --severity-threshold=high --print-deps \
-              > "reports/$(basename "$(dirname "$f")").txt" \
+            snyk container test "$base" --file="$f" \
+              --severity-threshold=high \
+              --token=${{ secrets.SNYK_TOKEN }} \
+              --print-deps \
+              >"reports/$(basename "$(dirname "$f")").txt" \
               && ((passed++)) || ((failed++))
 
             echo "::endgroup::"
           done
-
-          echo "passed=$passed"   >> "$GITHUB_OUTPUT"
-          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
-          echo "failed=$failed"   >> "$GITHUB_OUTPUT"
-
-      - name: Upload scan reports
+          echo "passed=$passed"   >>"$GITHUB_OUTPUT"
+          echo "skipped=$skipped" >>"$GITHUB_OUTPUT"
+          echo "failed=$failed"   >>"$GITHUB_OUTPUT"
+          unset SNYK_TOKEN
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: snyk-dockerfile-reports
           path: reports
-
       - name: Summary
         if: always()
         run: |
@@ -80,6 +94,20 @@ jobs:
           echo "* Skipped: ${{ steps.snyk.outputs.skipped }}" >> $GITHUB_STEP_SUMMARY
           echo "* Failed:  ${{ steps.snyk.outputs.failed }}"  >> $GITHUB_STEP_SUMMARY
           echo 'Full details in **snyk-dockerfile-reports**.' >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack (errors only, nightly & labelled PRs)
+        if: >
+          steps.snyk.outputs.failed != '0' &&
+          (github.event_name == 'schedule' ||
+           github.event_name == 'pull_request_target')
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": ":bangbang: Snyk Dockerfile scan – *${{ steps.snyk.outputs.failed }}* Dockerfile(s) hit High/Critical CVEs\nStatus: Failed :exclamation:\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|open details>\nCC - @openshift-ai-devops"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SNYK_SLACK_WEBHOOK }}
 
       - name: Gate on CVEs
         run: |
