@@ -1,37 +1,86 @@
 # Snyk scan for training‑runtime Dockerfiles
 # push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
 # Fails on High/Critical CVEs
+
 name: Snyk Dockerfile Scan
+
 on:
   push:
-    branches: [ main ]
-  pull_request_target:
-    types: [ labeled ]
+    branches: [main]
   schedule:
     - cron: '0 3 * * *'
+  pull_request_target:
+    types: [labeled]
+
 jobs:
-  snyk-scan:
-    if: >
-      github.event_name == 'schedule' ||
-      github.event_name == 'push' ||
-      (github.event_name == 'pull_request_target' &&
-       contains(github.event.pull_request.labels.*.name, 'run-snyk'))
+  scan:
+    if: github.event_name == 'schedule' ||
+        github.event_name == 'push' ||
+        (github.event_name == 'pull_request_target' && contains(github.event.pull_request.labels.*.name, 'run-snyk'))
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      RH_USERNAME: ${{ secrets.RH_USERNAME }}
+      RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: snyk/actions/setup@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      - uses: snyk/actions/setup@master  
+        with:
+          version: v1.1297.0
+      - name: Red Hat login (optional)
+        if: env.RH_USERNAME && env.RH_PASSWORD
+        run: echo "$RH_PASSWORD" | docker login registry.redhat.io -u "$RH_USERNAME" --password-stdin
       - name: Scan Dockerfiles
+        id: snyk
         run: |
-          set -e
-          export SNYK_TOKEN=${{ secrets.SNYK_TOKEN }}
+          set -Eeuo pipefail
+          passed=0 skipped=0 failed=0
+
           find images/runtime/training -name Dockerfile | while read f; do
-            echo "Scanning $f"
-            # Handles “FROM --platform=… image AS stage” as well
-            base=$(grep -iE '^FROM ' "$f" | head -n1 | awk '{for(i=2;i<=NF;i++){if($i=="AS"){break};print $i}}')
-            snyk container test "$base" --file="$f" --severity-threshold=high
+            echo "::group::$f"
+
+            base=$(grep -iE '^[[:space:]]*FROM ' "$f" | grep -iv scratch | tail -1 |
+                   awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
+            [[ $base =~ ^ubi[0-9] ]] && alt="registry.access.redhat.com/$base" || alt=""
+            docker pull "$base" >/dev/null 2>&1 || {
+              [[ $alt ]] && docker pull "$alt" >/dev/null 2>&1 && docker tag "$alt" "$base" || true;}
+
+            snyk container test "$base" --file="$f" --severity-threshold=high --sarif-file-output=snyk.sarif
+            rc=$?
+
+            if [ $rc -eq 0 ]; then
+              ((passed++))
+            else
+              if grep -q 'SNYK-CLI-0000' snyk.sarif 2>/dev/null; then
+                echo "::warning ::Skipped – base image inaccessible"
+                ((skipped++))
+              else
+                echo "::error ::High/Critical CVEs found"
+                ((failed++))
+              fi
+            fi
+            echo "::endgroup::"
           done
+
+          echo "passed=$passed"  >> $GITHUB_OUTPUT
+          echo "skipped=$skipped" >> $GITHUB_OUTPUT
+          echo "failed=$failed"  >> $GITHUB_OUTPUT
+          [ $failed -eq 0 ] || exit 1
+
+      - uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+      - name: Summary
+        if: always()
+        run: |
+          echo '### Snyk Dockerfile Scan' >> $GITHUB_STEP_SUMMARY
+          echo "* Passed:  ${{ steps.snyk.outputs.passed }}"  >> $GITHUB_STEP_SUMMARY
+          echo "* Skipped: ${{ steps.snyk.outputs.skipped }}" >> $GITHUB_STEP_SUMMARY
+          echo "* Failed:  ${{ steps.snyk.outputs.failed }}"  >> $GITHUB_STEP_SUMMARY
