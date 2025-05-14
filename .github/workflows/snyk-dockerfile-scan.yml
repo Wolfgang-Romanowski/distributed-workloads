@@ -31,5 +31,7 @@ jobs:
           export SNYK_TOKEN=${{ secrets.SNYK_TOKEN }}
           find images/runtime/training -name Dockerfile | while read f; do
             echo "Scanning $f"
-            snyk container test --file="$f" . --severity-threshold=high
+            # Handles “FROM --platform=… image AS stage” as well
+            base=$(grep -iE '^FROM ' "$f" | head -n1 | awk '{for(i=2;i<=NF;i++){if($i=="AS"){break};print $i}}')
+            snyk container test "$base" --file="$f" --severity-threshold=high
           done
