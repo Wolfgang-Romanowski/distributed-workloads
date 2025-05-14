@@ -6,71 +6,71 @@ name: Snyk Dockerfile Scan
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   schedule:
     - cron: '0 3 * * *'
   pull_request_target:
-    types: [labeled]
+    types:
+      - labeled
 
 jobs:
   scan:
-    if: github.event_name == 'schedule' ||
-        github.event_name == 'push' ||
-        (github.event_name == 'pull_request_target' && contains(github.event.pull_request.labels.*.name, 'run-snyk'))
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request_target' &&
+       contains(github.event.pull_request.labels.*.name,'run-snyk'))
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
+
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      RH_USERNAME: ${{ secrets.RH_USERNAME }}
-      RH_PASSWORD: ${{ secrets.RH_PASSWORD }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: snyk/actions/setup@master  
-        with:
-          version: v1.1297.0
-      - name: Red Hat login (optional)
-        if: env.RH_USERNAME && env.RH_PASSWORD
-        run: echo "$RH_PASSWORD" | docker login registry.redhat.io -u "$RH_USERNAME" --password-stdin
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
       - name: Scan Dockerfiles
         id: snyk
         run: |
-          set -e
-          export SNYK_TOKEN=${{ secrets.SNYK_TOKEN }}
+          set -Eeuo pipefail
           passed=0 skipped=0 failed=0
 
           find images/runtime/training -name Dockerfile | while read f; do
-          echo "::group::$f"
-          base=$(grep -iE '^[[:space:]]*FROM ' "$f" | tail -1 |
-          awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
-          [[ "$base" != *:* ]] && base="${base}:latest"
-            
-          snyk container test "$base" --file="$f" --severity-threshold=high
-          rc=$?
+            echo "::group::$f"
+            base=$(grep -iE '^[[:space:]]*FROM ' "$f" | tail -1 \
+                   | awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
+            [[ "$base" != *:* ]] && base="${base%:}:latest"
 
-          case $rc in
-          0) ((passed++));;
-          1) echo "::error ::High/Critical CVEs"; ((failed++));;
-          *) echo "::warning::Scan error – skipped"; ((skipped++));;
-          esac
-          echo "::endgroup::"
+            if [[ -z "$base" || "$base" == *'${'* || "$base" == *'-:' ]]; then
+              echo "::warning::skip $f – base image not resolvable"
+              ((skipped++)); echo "::endgroup::"; continue
+            fi
+
+            if snyk container test "$base" --file="$f" --severity-threshold=high; then
+              ((passed++))
+            else
+              ((failed++))
+            fi
+            echo "::endgroup::"
           done
 
-          echo "Passed: $passed  Skipped: $skipped  Failed: $failed"
+          echo "passed=$passed"   >> "$GITHUB_OUTPUT"
+          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+          echo "failed=$failed"   >> "$GITHUB_OUTPUT"
           [ $failed -eq 0 ]
-
-      - uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: snyk.sarif
 
       - name: Summary
         if: always()
         run: |
-          echo '### Snyk Dockerfile Scan' >> $GITHUB_STEP_SUMMARY
-          echo "* Passed:  ${{ steps.snyk.outputs.passed }}"  >> $GITHUB_STEP_SUMMARY
-          echo "* Skipped: ${{ steps.snyk.outputs.skipped }}" >> $GITHUB_STEP_SUMMARY
-          echo "* Failed:  ${{ steps.snyk.outputs.failed }}"  >> $GITHUB_STEP_SUMMARY
+          echo '### Snyk Dockerfile Scan'                       >> $GITHUB_STEP_SUMMARY
+          echo "* Passed:  ${{ steps.snyk.outputs.passed  }}"   >> $GITHUB_STEP_SUMMARY
+          echo "* Skipped: ${{ steps.snyk.outputs.skipped }}"   >> $GITHUB_STEP_SUMMARY
+          echo "* Failed:  ${{ steps.snyk.outputs.failed  }}"   >> $GITHUB_STEP_SUMMARY
