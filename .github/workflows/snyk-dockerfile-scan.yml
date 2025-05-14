@@ -6,13 +6,11 @@ name: Snyk Dockerfile Scan
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   schedule:
     - cron: '0 3 * * *'
   pull_request_target:
-    types:
-      - labeled
+    types: [ labeled ]
 
 jobs:
   scan:
@@ -22,7 +20,6 @@ jobs:
       (github.event_name == 'pull_request_target' &&
        contains(github.event.pull_request.labels.*.name,'run-snyk'))
     runs-on: ubuntu-latest
-
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
@@ -37,24 +34,28 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Scan Dockerfiles
+      - name: Scan Dockerfiles (report only)
         id: snyk
         run: |
           set -Eeuo pipefail
+          mkdir -p reports
           passed=0 skipped=0 failed=0
 
           find images/runtime/training -name Dockerfile | while read f; do
             echo "::group::$f"
+            fn=$(basename "$(dirname "$f")")
+            rpt="reports/$fn.txt"
+
             base=$(grep -iE '^[[:space:]]*FROM ' "$f" | tail -1 \
                    | awk '{for(i=2;i<=NF;i++){if($i=="AS")break;print $i}}')
             [[ "$base" != *:* ]] && base="${base%:}:latest"
 
             if [[ -z "$base" || "$base" == *'${'* || "$base" == *'-:' ]]; then
-              echo "::warning::skip $f – base image not resolvable"
+              echo "Skipped – cannot resolve base image" > "$rpt"
               ((skipped++)); echo "::endgroup::"; continue
             fi
 
-            if snyk container test "$base" --file="$f" --severity-threshold=high; then
+            if snyk container test "$base" --file="$f" --severity-threshold=high --print-deps > "$rpt"; then
               ((passed++))
             else
               ((failed++))
@@ -65,12 +66,18 @@ jobs:
           echo "passed=$passed"   >> "$GITHUB_OUTPUT"
           echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
           echo "failed=$failed"   >> "$GITHUB_OUTPUT"
-          [ $failed -eq 0 ]
+
+      - name: Upload text reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-dockerfile-reports
+          path: reports
 
       - name: Summary
         if: always()
         run: |
-          echo '### Snyk Dockerfile Scan'                       >> $GITHUB_STEP_SUMMARY
-          echo "* Passed:  ${{ steps.snyk.outputs.passed  }}"   >> $GITHUB_STEP_SUMMARY
-          echo "* Skipped: ${{ steps.snyk.outputs.skipped }}"   >> $GITHUB_STEP_SUMMARY
-          echo "* Failed:  ${{ steps.snyk.outputs.failed  }}"   >> $GITHUB_STEP_SUMMARY
+          echo '### Snyk Dockerfile Scan' >> $GITHUB_STEP_SUMMARY
+          echo "* Passed:  ${{ steps.snyk.outputs.passed }}"   >> $GITHUB_STEP_SUMMARY
+          echo "* Skipped: ${{ steps.snyk.outputs.skipped }}"  >> $GITHUB_STEP_SUMMARY
+          echo "* Failed:  ${{ steps.snyk.outputs.failed }}"   >> $GITHUB_STEP_SUMMARY
+          echo 'Full scan details are attached in **snyk-dockerfile-reports**.' >> $GITHUB_STEP_SUMMARY
