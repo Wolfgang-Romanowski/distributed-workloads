@@ -53,13 +53,13 @@ jobs:
             cp "${FILE}" "${TEMP_DOCKERFILE}"
 
             FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1)
-            VARS=$(echo "$FINAL_FROM" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?')
+            VARS=$(echo "$FINAL_FROM" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' || true)
 
             if [ -n "$VARS" ]; then
               grep '^ARG ' "${FILE}" | while read -r argline; do
                 VAR_NAME=$(echo "$argline" | cut -d' ' -f2 | cut -d= -f1)
-                DEFAULT_VAL=$(echo "$argline" | grep '=' | cut -d= -f2- | tr -d '"'\'')
-                [ -n "$DEFAULT_VAL" ] && export ${VAR_NAME}="${DEFAULT_VAL}"
+                DEFAULT_VAL=$(echo "$argline" | grep '=' | cut -d= -f2- | tr -d '"'"'" || true)
+                [ -n "$DEFAULT_VAL" ] && export "${VAR_NAME}"="${DEFAULT_VAL}"
               done
 
               envsubst "$(echo "$VARS" | tr ' ' '\n' | sed 's/[\$\{\}]//g' | xargs)" \
@@ -84,14 +84,14 @@ jobs:
               MED=$(jq '[.vulnerabilities[]|select(.severity=="medium")] | length' snyk-result.json)
               LOW=$(jq '[.vulnerabilities[]|select(.severity=="low")] | length' snyk-result.json)
 
-              SUMMARY+="- ${FILE}: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: ${BASE_IMAGE_NAME})\n"
+              SUMMARY="$SUMMARY- $FILE: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: $BASE_IMAGE_NAME)"$'\n'
               TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
               TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
               TOTAL_MEDIUM=$((TOTAL_MEDIUM + MED))
               TOTAL_LOW=$((TOTAL_LOW + LOW))
             else
-              ERROR_MSG=$(head -n1 snyk-error.log)
-              SUMMARY+="- ${FILE}: Scan failed - ${ERROR_MSG}\n"
+              ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
+              SUMMARY="$SUMMARY- $FILE: Scan failed - $ERROR_MSG"$'\n'
               SCAN_FAILURE=1
             fi
 
@@ -103,7 +103,7 @@ jobs:
           echo "Critical: ${TOTAL_CRITICAL}, High: ${TOTAL_HIGH}, Medium: ${TOTAL_MEDIUM}, Low: ${TOTAL_LOW}" >> $GITHUB_ENV
           echo "" >> $GITHUB_ENV
           echo "Details:" >> $GITHUB_ENV
-          echo -e "${SUMMARY}" >> $GITHUB_ENV
+          echo "$SUMMARY" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
 
