@@ -17,7 +17,7 @@ on:
 
 jobs:
   security_scan:
-    name: Scan Dockerfiles
+    name: Container Security Scan
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' ||
@@ -30,22 +30,22 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
 
-      - name: Setup Snyk CLI
-        uses: snyk/actions/setup@master
+      - name: Setup Snyk
+        uses: snyk/actions/setup@806182742461562b67788c74056e8d4614dd968a # v0.4.0
 
-      - name: Discover Dockerfiles
+      - name: Find Dockerfiles
         id: discover
         run: |
-          mapfile -t paths < <(find images/runtime/training -type f -name Dockerfile)
+          mapfile -t paths < <(find images/runtime -type f -name Dockerfile)
           echo "Found ${#paths[@]} Dockerfiles to scan"
           echo "paths=${paths[*]}" >> $GITHUB_OUTPUT
 
-      - name: Analyze Container Images
+      - name: Scan images
         id: analyze
         run: |
           IFS=' ' read -r -a dfs <<< "${{ steps.discover.outputs.paths }}"
@@ -148,7 +148,7 @@ jobs:
           
           echo "Scan complete: $total images scanned, $failed with issues ($high_total high, $critical_total critical vulnerabilities)"
 
-      - name: Generate Report
+      - name: Generate report
         if: always()
         run: |
           {
@@ -160,21 +160,21 @@ jobs:
                 cat "$r"
               fi
             done
-          } > full_report.md
+          } > security-scan-report.md
 
-      - name: Upload Scan Results
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: security-scan-reports
+          name: security-scan
           path: |
             results.txt
             summary.md
-            full_report.md
+            security-scan-report.md
             scan-*.json
           retention-days: 90
 
-      - name: Publish GitHub Summary
+      - name: Publish summary
         if: always()
         run: |
           echo "# Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
@@ -190,10 +190,10 @@ jobs:
             echo "✅ All images passed security scanning." >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Send Vulnerability Alert
+      - name: Send alert
         if: always() && steps.analyze.outputs.failed != '0'
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@v2.2.1
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_COLOR: '#FF4500'
@@ -209,10 +209,10 @@ jobs:
             
             <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed report>
 
-      - name: Send Success Notification
+      - name: Send success notification
         if: always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule')
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@v2.2.1
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_COLOR: '#2EB886'
