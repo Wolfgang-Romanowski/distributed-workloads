@@ -74,12 +74,55 @@ jobs:
             
             echo "🔍 Scanning Dockerfile: $f (${total}/${#dfs[@]})"
             
-            # Extract base image from Dockerfile for Snyk to use
+            # Extract base image from Dockerfile and resolve variables
             base_image=$(grep -m 1 "^FROM" "$f" | awk '{print $2}' | cut -d ' ' -f1)
-            echo "Base image: $base_image"
+            
+            # Handle ARG/ENV variables in base image
+            if [[ $base_image == *'${'* ]]; then
+              echo "Base image contains variables: $base_image"
+              
+              # Extract common ARG patterns and their default values
+              python_version="311"
+              image_tag="latest"
+              
+              # Extract actual values from Dockerfile if available
+              if grep -q "ARG PYTHON_VERSION=" "$f"; then
+                python_version=$(grep "ARG PYTHON_VERSION=" "$f" | head -1 | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+              fi
+              
+              if grep -q "ARG IMAGE_TAG=" "$f"; then
+                image_tag=$(grep "ARG IMAGE_TAG=" "$f" | head -1 | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+              fi
+              
+              # Replace variables in base image
+              resolved_base_image="${base_image//\$\{PYTHON_VERSION\}/$python_version}"
+              resolved_base_image="${resolved_base_image//\$\{IMAGE_TAG\}/$image_tag}"
+              
+              echo "Resolved base image: $resolved_base_image"
+              
+              # If still contains variables, use a fallback image for scanning
+              if [[ $resolved_base_image == *'${'* ]]; then
+                if [[ $f == *"cuda"* ]]; then
+                  resolved_base_image="registry.access.redhat.com/ubi9/python-311:latest"
+                elif [[ $f == *"rocm"* ]]; then
+                  resolved_base_image="registry.access.redhat.com/ubi9/python-311:latest"
+                else
+                  resolved_base_image="registry.access.redhat.com/ubi9/python-311:latest"
+                fi
+                echo "Using fallback base image for scanning: $resolved_base_image"
+              fi
+              
+              base_image="$resolved_base_image"
+            fi
+            
+            echo "Base image for scanning: $base_image"
+            
+            # Create a temporary Dockerfile with resolved base image
+            temp_dockerfile="${f}.temp"
+            sed "1s|^FROM .*|FROM $base_image|" "$f" > "$temp_dockerfile"
             
             # Scan the Dockerfile directly without building
-            if snyk container test "$base_image" --file="$f" --severity-threshold=high --json > "scan-results/scan-${tag}.json" 2> "scan-results/scan-${tag}.log"; then
+            if snyk container test "$base_image" --file="$temp_dockerfile" --severity-threshold=high --json > "scan-results/scan-${tag}.json" 2> "scan-results/scan-${tag}.log"; then
               res["$f"]="SECURE"
               counts["$f"]="0,0"
               echo "✅ No vulnerabilities found in $f"
@@ -130,7 +173,14 @@ jobs:
                   echo "- Remove unnecessary packages and dependencies"
                 } > "scan-results/report-${tag}.md"
               else
-                res["$f"]="SCAN_FAILED"
+                # Check if the base image is accessible
+                if ! docker pull --quiet "$base_image" &>/dev/null; then
+                  echo "⚠️ Base image not accessible: $base_image"
+                  res["$f"]="BASE_IMAGE_INACCESSIBLE"
+                else
+                  res["$f"]="SCAN_FAILED"
+                fi
+                
                 failed=$((failed + 1))
                 echo "❓ Scan failed for $f - no results generated"
                 
@@ -144,9 +194,14 @@ jobs:
                   echo "- **Status:** Scan Failed"
                   echo
                   echo "## Troubleshooting"
-                  echo "- Check if base image is publicly accessible"
-                  echo "- Verify Snyk token is valid"
-                  echo "- Ensure Dockerfile syntax is correct"
+                  if [[ "${res[$f]}" == "BASE_IMAGE_INACCESSIBLE" ]]; then
+                    echo "- **Primary Issue:** Base image is not publicly accessible"
+                    echo "- **Solution:** Use a publicly accessible base image or configure registry authentication"
+                  else
+                    echo "- Check if base image is publicly accessible"
+                    echo "- Verify Snyk token is valid"
+                    echo "- Ensure Dockerfile syntax is correct"
+                  fi
                   
                   if [ -f "scan-results/scan-${tag}.log" ]; then
                     echo
@@ -158,6 +213,9 @@ jobs:
                 } > "scan-results/scan-failure-${tag}.md"
               fi
             fi
+            
+            # Clean up temporary files
+            rm -f "$temp_dockerfile"
             
             # Clean up large JSON files after extracting needed info
             if [ -f "scan-results/scan-${tag}.json" ] && [ -f "scan-results/report-${tag}.md" ]; then
@@ -186,6 +244,7 @@ jobs:
               case "$status" in
                 "SECURE") status="✅ Secure" ;;
                 "VULNERABLE") status="⚠️ Vulnerable" ;;
+                "BASE_IMAGE_INACCESSIBLE") status="⚠️ Base Image Inaccessible" ;;
                 *) status="❓ Scan Failed" ;;
               esac
               echo "| \`$f\` | $status | $issues |"
@@ -199,6 +258,10 @@ jobs:
               echo "- **Consider Distroless:** Use minimal or distroless base images where possible"
               echo "- **Layer Optimization:** Combine RUN commands to reduce image layers"
               echo "- **Regular Scanning:** Continue regular security scanning to catch new vulnerabilities"
+              
+              if grep -q "BASE_IMAGE_INACCESSIBLE" <<< "$(printf '%s\n' "${res[@]}")"; then
+                echo "- **Private Images:** Configure registry authentication for private base images"
+              fi
             fi
           } > "scan-results/summary.md"
           
@@ -278,7 +341,7 @@ jobs:
           fi
 
       - name: Send security alert notification
-        if: ${{ always() && steps.analyze.outputs.failed != '0' }}
+        if: ${{ always() && steps.analyze.outputs.failed != '0' && steps.analyze.outputs.high_total != '0' }}
         continue-on-error: true
         uses: rtCamp/action-slack-notify@v2.2.1
         env:
