@@ -1,6 +1,6 @@
 # Snyk scan for training‑runtime Dockerfiles
 # push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
-# Fails on High/Critical CVEs
+# Fails on High/Critical CVE
 
 name: Container Security Scanner
 
@@ -203,7 +203,7 @@ jobs:
           fi
 
       - name: Send alert
-        if: always() && steps.analyze.outputs.failed != '0' && secrets.SLACK_WEBHOOK != ''
+        if: ${{ always() && steps.analyze.outputs.failed != '0' }}
         continue-on-error: true
         uses: rtCamp/action-slack-notify@v2.2.1
         env:
@@ -222,7 +222,7 @@ jobs:
             <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed report>
 
       - name: Send success notification
-        if: always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule') && secrets.SLACK_WEBHOOK != ''
+        if: ${{ always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule') }}
         continue-on-error: true
         uses: rtCamp/action-slack-notify@v2.2.1
         env:
