@@ -36,7 +36,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Snyk
-        uses: snyk/actions/setup@806182742461562b67788c74056e8d4614dd968a # v0.4.0
+        uses: snyk/actions/setup@master
 
       - name: Find Dockerfiles
         id: discover
