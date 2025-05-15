@@ -38,6 +38,17 @@ jobs:
         run: |
           set -u
 
+          # Clean up any temporary files from previous runs
+          find . -name "temp-*.Dockerfile" -delete
+
+          # Free up disk space by removing unnecessary packages
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          
+          # Display available disk space
+          echo "Available disk space before scan:"
+          df -h
+
           mapfile -t DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*")
           [ ${#DOCKERFILES[@]} -eq 0 ] && { echo "No Dockerfiles found."; exit 0; }
 
@@ -49,35 +60,43 @@ jobs:
           SCAN_FAILURE=0
 
           for FILE in "${DOCKERFILES[@]}"; do
-            TEMP_DOCKERFILE="temp-$(basename "${FILE}").Dockerfile"
-            cp "${FILE}" "${TEMP_DOCKERFILE}"
-
+            echo "Scanning $FILE..."
+            
+            # Extract base image without creating a full copy of the Dockerfile
             FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1)
-            VARS=$(echo "$FINAL_FROM" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' || true)
-
-            if [ -n "$VARS" ]; then
-              grep '^ARG ' "${FILE}" | while read -r argline; do
+            BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
+            
+            # Handle ARG variables in FROM
+            if [[ "$BASE_IMAGE_NAME" == *'$'* ]]; then
+              # Extract ARG values
+              while read -r argline; do
                 VAR_NAME=$(echo "$argline" | cut -d' ' -f2 | cut -d= -f1)
                 DEFAULT_VAL=$(echo "$argline" | grep '=' | cut -d= -f2- | tr -d '"'"'" || true)
-                [ -n "$DEFAULT_VAL" ] && export "${VAR_NAME}"="${DEFAULT_VAL}"
-              done
-
-              envsubst "$(echo "$VARS" | tr ' ' '\n' | sed 's/[\$\{\}]//g' | xargs)" \
-                < "${TEMP_DOCKERFILE}" > "${TEMP_DOCKERFILE}.resolved"
-              mv "${TEMP_DOCKERFILE}.resolved" "${TEMP_DOCKERFILE}"
+                
+                # Replace variables in base image name
+                if [ -n "$DEFAULT_VAL" ]; then
+                  VAR_PATTERN="\\\${$VAR_NAME}"
+                  BASE_IMAGE_NAME=$(echo "$BASE_IMAGE_NAME" | sed "s|$VAR_PATTERN|$DEFAULT_VAL|g")
+                  VAR_PATTERN="\\\$${VAR_NAME}"
+                  BASE_IMAGE_NAME=$(echo "$BASE_IMAGE_NAME" | sed "s|$VAR_PATTERN|$DEFAULT_VAL|g")
+                fi
+              done < <(grep '^ARG ' "${FILE}")
+            fi
+            
+            # If we still have unresolved variables, use a fallback image
+            if [[ "$BASE_IMAGE_NAME" == *'$'* || "$BASE_IMAGE_NAME" == *'{{'* || "$BASE_IMAGE_NAME" == *'}}'* ]]; then
+              BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi:latest"
+              echo "Using fallback image for $FILE: $BASE_IMAGE_NAME"
             fi
 
-            FINAL_FROM_RESOLVED=$(grep -Ei '^FROM ' "${TEMP_DOCKERFILE}" | tail -1)
-            if echo "$FINAL_FROM_RESOLVED" | grep -q '\$\|{{\|}}'; then
-              sed -i 's|^FROM.*|FROM registry.access.redhat.com/ubi8/ubi:latest|' "${TEMP_DOCKERFILE}"
-              BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi:latest (fallback)"
-            else
-              BASE_IMAGE_NAME=$(echo "$FINAL_FROM_RESOLVED" | sed -E 's/^FROM[[:space:]]+//I')
-            fi
-
-            snyk container test "${BASE_IMAGE_NAME}" --file="${TEMP_DOCKERFILE}" --exclude-app-vulns --json \
+            # Create a minimal Dockerfile for scanning
+            echo "FROM $BASE_IMAGE_NAME" > "temp-scan.Dockerfile"
+            
+            # Run Snyk scan on the minimal Dockerfile
+            snyk container test "$BASE_IMAGE_NAME" --file="temp-scan.Dockerfile" --exclude-app-vulns --json \
               > "snyk-result.json" 2> "snyk-error.log" || echo '{"vulnerabilities":[]}' > "snyk-result.json"
 
+            # Process results
             if jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
               CRIT=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="critical")) | length end' snyk-result.json)
               HIGH=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="high")) | length end' snyk-result.json)
@@ -95,7 +114,14 @@ jobs:
               SCAN_FAILURE=1
             fi
 
-            rm -f snyk-result.json snyk-error.log "${TEMP_DOCKERFILE}"
+            # Clean up after each scan to save disk space
+            rm -f snyk-result.json snyk-error.log temp-scan.Dockerfile
+            
+            # Display available disk space during scan
+            if [ $((RANDOM % 10)) -eq 0 ]; then
+              echo "Available disk space during scan:"
+              df -h
+            fi
           done
 
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
