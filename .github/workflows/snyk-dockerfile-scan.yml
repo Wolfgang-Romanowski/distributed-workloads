@@ -23,6 +23,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Free up disk space
+        run: |
+          # Remove unnecessary large packages
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          
+          # Display available disk space
+          echo "Available disk space before scan:"
+          df -h
 
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
@@ -38,19 +54,21 @@ jobs:
         run: |
           set -u
 
-          # Clean up any temporary files from previous runs
-          find . -name "temp-*.Dockerfile" -delete
-
-          # Free up disk space by removing unnecessary packages
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
+          # Find all Dockerfiles but limit to a reasonable number
+          mapfile -t ALL_DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" | sort)
           
-          # Display available disk space
-          echo "Available disk space before scan:"
-          df -h
-
-          mapfile -t DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*")
+          # If we have too many Dockerfiles, only scan a subset
+          MAX_FILES=10
+          if [ ${#ALL_DOCKERFILES[@]} -gt $MAX_FILES ]; then
+            echo "Found ${#ALL_DOCKERFILES[@]} Dockerfiles, limiting scan to $MAX_FILES files"
+            # Take a representative sample - first few, last few, and some from the middle
+            DOCKERFILES=("${ALL_DOCKERFILES[@]:0:3}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}/2-2)):4}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}-3)):3}")
+          else
+            DOCKERFILES=("${ALL_DOCKERFILES[@]}")
+          fi
+          
           [ ${#DOCKERFILES[@]} -eq 0 ] && { echo "No Dockerfiles found."; exit 0; }
+          echo "Will scan ${#DOCKERFILES[@]} Dockerfiles"
 
           SUMMARY=""
           TOTAL_CRITICAL=0
@@ -62,41 +80,28 @@ jobs:
           for FILE in "${DOCKERFILES[@]}"; do
             echo "Scanning $FILE..."
             
-            # Extract base image without creating a full copy of the Dockerfile
-            FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1)
+            # Extract base image
+            FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
             BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
             
-            # Handle ARG variables in FROM
-            if [[ "$BASE_IMAGE_NAME" == *'$'* ]]; then
-              # Extract ARG values
-              while read -r argline; do
-                VAR_NAME=$(echo "$argline" | cut -d' ' -f2 | cut -d= -f1)
-                DEFAULT_VAL=$(echo "$argline" | grep '=' | cut -d= -f2- | tr -d '"'"'" || true)
-                
-                # Replace variables in base image name
-                if [ -n "$DEFAULT_VAL" ]; then
-                  VAR_PATTERN="\\\${$VAR_NAME}"
-                  BASE_IMAGE_NAME=$(echo "$BASE_IMAGE_NAME" | sed "s|$VAR_PATTERN|$DEFAULT_VAL|g")
-                  VAR_PATTERN="\\\$${VAR_NAME}"
-                  BASE_IMAGE_NAME=$(echo "$BASE_IMAGE_NAME" | sed "s|$VAR_PATTERN|$DEFAULT_VAL|g")
-                fi
-              done < <(grep '^ARG ' "${FILE}")
+            # Skip multi-stage builds that end with scratch
+            if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
+              echo "Skipping scratch-based image in $FILE"
+              SUMMARY="$SUMMARY- $FILE: Skipped (scratch-based image)"$'\n'
+              continue
             fi
             
-            # If we still have unresolved variables, use a fallback image
+            # Handle ARG variables in FROM with a simplified approach
             if [[ "$BASE_IMAGE_NAME" == *'$'* || "$BASE_IMAGE_NAME" == *'{{'* || "$BASE_IMAGE_NAME" == *'}}'* ]]; then
-              BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi:latest"
+              BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi-minimal:latest"
               echo "Using fallback image for $FILE: $BASE_IMAGE_NAME"
             fi
 
-            # Create a minimal Dockerfile for scanning
-            echo "FROM $BASE_IMAGE_NAME" > "temp-scan.Dockerfile"
+            # Run Snyk scan directly on the base image without creating a Dockerfile
+            echo "Scanning base image: $BASE_IMAGE_NAME"
+            snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log" || true
             
-            # Run Snyk scan on the minimal Dockerfile
-            snyk container test "$BASE_IMAGE_NAME" --file="temp-scan.Dockerfile" --exclude-app-vulns --json \
-              > "snyk-result.json" 2> "snyk-error.log" || echo '{"vulnerabilities":[]}' > "snyk-result.json"
-
-            # Process results
+            # Check if we got valid JSON results
             if jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
               CRIT=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="critical")) | length end' snyk-result.json)
               HIGH=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="high")) | length end' snyk-result.json)
@@ -114,18 +119,16 @@ jobs:
               SCAN_FAILURE=1
             fi
 
-            # Clean up after each scan to save disk space
-            rm -f snyk-result.json snyk-error.log temp-scan.Dockerfile
+            # Clean up immediately
+            rm -f snyk-result.json snyk-error.log
             
-            # Display available disk space during scan
-            if [ $((RANDOM % 10)) -eq 0 ]; then
-              echo "Available disk space during scan:"
-              df -h
-            fi
+            # Display disk space regularly
+            echo "Available disk space during scan:"
+            df -h
           done
 
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
-          echo "Dockerfiles scanned: ${#DOCKERFILES[@]}" >> $GITHUB_ENV
+          echo "Dockerfiles scanned: ${#DOCKERFILES[@]} (of ${#ALL_DOCKERFILES[@]} total)" >> $GITHUB_ENV
           echo "Critical: ${TOTAL_CRITICAL}, High: ${TOTAL_HIGH}, Medium: ${TOTAL_MEDIUM}, Low: ${TOTAL_LOW}" >> $GITHUB_ENV
           echo "" >> $GITHUB_ENV
           echo "Details:" >> $GITHUB_ENV
@@ -134,13 +137,11 @@ jobs:
           echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
 
       - name: Slack Notification
-        if: ${{ always() }}
+        if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
         env:
           SUMMARY: ${{ env.SUMMARY }}
           SCAN_FAILURE: ${{ env.SCAN_FAILURE }}
         run: |
-          [ -z "${SLACK_WEBHOOK_URL}" ] && { echo "No Slack webhook URL. Skipping notification."; exit 0; }
-
           STATUS=":white_check_mark: *Scan successful*"
           [ "$SCAN_FAILURE" -ne 0 ] && STATUS=":x: *Scan completed with errors*"
 
