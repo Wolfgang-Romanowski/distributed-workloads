@@ -71,6 +71,7 @@ jobs:
           echo "Will scan ${#DOCKERFILES[@]} Dockerfiles"
 
           SUMMARY=""
+          SUMMARY_TABLE="| Dockerfile | Base Image | Critical | High | Medium | Low | Status |\n|-----------|------------|----------|------|--------|-----|--------|\n"
           TOTAL_CRITICAL=0
           TOTAL_HIGH=0
           TOTAL_MEDIUM=0
@@ -88,6 +89,7 @@ jobs:
             if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
               echo "Skipping scratch-based image in $FILE"
               SUMMARY="$SUMMARY- $FILE: Skipped (scratch-based image)"$'\n'
+              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | scratch | - | - | - | - | Skipped |\n"
               continue
             fi
             
@@ -109,6 +111,19 @@ jobs:
               LOW=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="low")) | length end' snyk-result.json)
 
               SUMMARY="$SUMMARY- $FILE: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: $BASE_IMAGE_NAME)"$'\n'
+              
+              # Add status based on vulnerability counts
+              STATUS="✅ Pass"
+              if [ "$CRIT" -gt 0 ]; then
+                STATUS="❌ Critical"
+              elif [ "$HIGH" -gt 0 ]; then
+                STATUS="⚠️ High"
+              elif [ "$MED" -gt 5 ]; then
+                STATUS="⚠️ Medium"
+              fi
+              
+              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $BASE_IMAGE_NAME | $CRIT | $HIGH | $MED | $LOW | $STATUS |\n"
+              
               TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
               TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
               TOTAL_MEDIUM=$((TOTAL_MEDIUM + MED))
@@ -116,6 +131,7 @@ jobs:
             else
               ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
               SUMMARY="$SUMMARY- $FILE: Scan failed - $ERROR_MSG"$'\n'
+              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $BASE_IMAGE_NAME | - | - | - | - | ❌ Failed |\n"
               SCAN_FAILURE=1
             fi
 
@@ -127,11 +143,17 @@ jobs:
             df -h
           done
 
+          # Add totals row to summary table
+          SUMMARY_TABLE="$SUMMARY_TABLE| **TOTAL** | **${#DOCKERFILES[@]} images** | **$TOTAL_CRITICAL** | **$TOTAL_HIGH** | **$TOTAL_MEDIUM** | **$TOTAL_LOW** | - |\n"
+
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
           echo "Dockerfiles scanned: ${#DOCKERFILES[@]} (of ${#ALL_DOCKERFILES[@]} total)" >> $GITHUB_ENV
           echo "Critical: ${TOTAL_CRITICAL}, High: ${TOTAL_HIGH}, Medium: ${TOTAL_MEDIUM}, Low: ${TOTAL_LOW}" >> $GITHUB_ENV
           echo "" >> $GITHUB_ENV
-          echo "Details:" >> $GITHUB_ENV
+          echo "## Summary Table" >> $GITHUB_ENV
+          echo "$SUMMARY_TABLE" >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "## Details" >> $GITHUB_ENV
           echo "$SUMMARY" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
