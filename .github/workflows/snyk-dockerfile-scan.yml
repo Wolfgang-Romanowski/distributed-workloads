@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   schedule:
-    - cron: "0 0 * * *" # Nightly at 00:00 UTC
+    - cron: "0 0 * * *"
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, labeled]
@@ -76,13 +76,13 @@ jobs:
             fi
 
             snyk container test "${BASE_IMAGE_NAME}" --file="${TEMP_DOCKERFILE}" --exclude-app-vulns --json \
-              > "snyk-result.json" 2> "snyk-error.log" || echo '{}' > "snyk-result.json"
+              > "snyk-result.json" 2> "snyk-error.log" || echo '{"vulnerabilities":[]}' > "snyk-result.json"
 
-            if jq '.' snyk-result.json &>/dev/null; then
-              CRIT=$(jq '[.vulnerabilities[]|select(.severity=="critical")] | length' snyk-result.json)
-              HIGH=$(jq '[.vulnerabilities[]|select(.severity=="high")] | length' snyk-result.json)
-              MED=$(jq '[.vulnerabilities[]|select(.severity=="medium")] | length' snyk-result.json)
-              LOW=$(jq '[.vulnerabilities[]|select(.severity=="low")] | length' snyk-result.json)
+            if jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
+              CRIT=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="critical")) | length end' snyk-result.json)
+              HIGH=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="high")) | length end' snyk-result.json)
+              MED=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="medium")) | length end' snyk-result.json)
+              LOW=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="low")) | length end' snyk-result.json)
 
               SUMMARY="$SUMMARY- $FILE: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: $BASE_IMAGE_NAME)"$'\n'
               TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
