@@ -2,7 +2,7 @@
 # push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
 # Fails on High/Critical CVEs
 
-name: Snyk Dockerfile Scan
+name: Container Security Scanner
 
 on:
   push:
@@ -16,74 +16,212 @@ on:
     - cron: "0 3 * * *"
 
 jobs:
-  snyk_scan:
+  security_scan:
+    name: Scan Dockerfiles
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' ||
       github.event_name == 'schedule' ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) ||
-      (github.event_name == 'pull_request_target' && contains(github.event.pull_request.labels.*.name, 'run-snyk'))
+      (github.event_name == 'pull_request_target' && contains(github.event.pull_request.labels.*.name, 'run-security-scan'))
     permissions:
       contents: read
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v3
         with:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
 
-      - name: List Dockerfiles
-        id: list
-        run: |
-          mapfile -t files < <(find images/runtime/training -type f -name Dockerfile)
-          echo "files=${files[*]}" >> $GITHUB_OUTPUT
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
 
-      - name: Build & scan Dockerfiles
-        id: scan
+      - name: Discover Dockerfiles
+        id: discover
         run: |
-          IFS=' ' read -r -a dfs <<< "${{ steps.list.outputs.files }}"
-          declare -A res; fail=0
-          echo "::group::Build & Snyk scan"
+          mapfile -t paths < <(find images/runtime/training -type f -name Dockerfile)
+          echo "Found ${#paths[@]} Dockerfiles to scan"
+          echo "paths=${paths[*]}" >> $GITHUB_OUTPUT
+
+      - name: Analyze Container Images
+        id: analyze
+        run: |
+          IFS=' ' read -r -a dfs <<< "${{ steps.discover.outputs.paths }}"
+          declare -A res; declare -A counts
+          total=0; failed=0; high_total=0; critical_total=0
+          
+          echo "::group::Scan Results"
           for f in "${dfs[@]}"; do
+            total=$((total + 1))
             dir=$(dirname "$f")
-            tag="snyk-scan-${dir//\//-}"
-            echo "▶ Building $tag"
-            docker build "$dir" --file "$f" --tag "$tag"
-            echo "▶ Scanning $tag"
-            snyk container test "$tag" --severity-threshold=high --json > "out-${tag}.json" \
-              && res["$f"]="PASS" || { res["$f"]="FAIL"; fail=1; }
-            docker rmi "$tag"
+            tag="scan-${dir//\//-}"
+            
+            echo "Scanning: $f"
+            if ! docker build "$dir" -f "$f" -t "$tag"; then
+              res["$f"]="BUILD_FAILED"
+              failed=$((failed + 1))
+              echo "Failed to build image from $f"
+              continue
+            fi
+            
+            if snyk container test "$tag" --severity-threshold=high --json > "scan-${tag}.json" 2> "scan-${tag}.log"; then
+              res["$f"]="SECURE"
+              counts["$f"]="0,0"
+              echo "No vulnerabilities found in $f"
+            else
+              if [ -f "scan-${tag}.json" ]; then
+                high=$(grep -o '"severity":"high"' "scan-${tag}.json" | wc -l)
+                critical=$(grep -o '"severity":"critical"' "scan-${tag}.json" | wc -l)
+                high_total=$((high_total + high))
+                critical_total=$((critical_total + critical))
+                
+                echo "Found $high high and $critical critical vulnerabilities in $f"
+                res["$f"]="VULNERABLE"
+                counts["$f"]="$high,$critical"
+                failed=$((failed + 1))
+                
+                {
+                  echo "# Security Report for $f"
+                  echo "## Summary"
+                  echo "- **Issues:** $high high, $critical critical vulnerabilities"
+                  echo "- **Scan Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                  echo
+                  echo "## Top Vulnerabilities"
+                  jq -r '.vulnerabilities | sort_by(.cvssScore) | reverse | .[0:5] | .[] | "### \(.title) [\(.id)](\(.url))\n**Severity:** \(.severity) (CVSS: \(.cvssScore))\n**Description:** \(.description)\n**Remediation:** \(.remediation)"' "scan-${tag}.json" 2>/dev/null
+                } > "report-${tag}.md"
+              else
+                res["$f"]="SCAN_FAILED"
+                failed=$((failed + 1))
+                echo "Scan failed for $f - no results generated"
+              fi
+            fi
+            
+            docker rmi "$tag" >/dev/null 2>&1
           done
+          
+          {
+            echo "# Container Security Scan Summary"
+            echo "## Overview"
+            echo "- **Images Scanned:** $total"
+            echo "- **Images with Issues:** $failed"
+            echo "- **Total Vulnerabilities:** $high_total high, $critical_total critical"
+            echo "- **Scan Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- **Triggered by:** ${{ github.event_name }}"
+            
+            echo
+            echo "## Results by Image"
+            echo "| Container Image | Status | Vulnerabilities |"
+            echo "|-----------------|--------|----------------|"
+            for f in "${dfs[@]}"; do
+              status="${res[$f]}"
+              IFS=',' read -r high critical <<< "${counts[$f]:-0,0}"
+              issues="$high high, $critical critical"
+              case "$status" in
+                "SECURE") status="✅ Secure" ;;
+                "VULNERABLE") status="⚠️ Vulnerable" ;;
+                "BUILD_FAILED") status="❌ Build Failed" ;;
+                *) status="❓ Scan Failed" ;;
+              esac
+              echo "| \`$f\` | $status | $issues |"
+            done
+            
+            if [[ $failed -gt 0 ]]; then
+              echo
+              echo "## Recommendations"
+              echo "- Review detailed reports for each vulnerable image"
+              echo "- Update base images to latest secure versions"
+              echo "- Consider using distroless or minimal base images"
+              echo "- Remove unnecessary packages and dependencies"
+            fi
+          } > summary.md
+          
+          for f in "${!res[@]}"; do
+            echo "$f : ${res[$f]}" 
+          done > results.txt
+          
           echo "::endgroup::"
-          for k in "${!res[@]}"; do echo "$k : ${res[$k]}"; done | tee summary.txt
-          echo "failed=$fail" >> $GITHUB_OUTPUT
-          exit $fail
+          echo "failed=$failed" >> $GITHUB_OUTPUT
+          echo "high_total=$high_total" >> $GITHUB_OUTPUT
+          echo "critical_total=$critical_total" >> $GITHUB_OUTPUT
+          
+          echo "Scan complete: $total images scanned, $failed with issues ($high_total high, $critical_total critical vulnerabilities)"
 
-      - uses: actions/upload-artifact@v4
+      - name: Generate Report
         if: always()
-        with:
-          name: snyk-dockerfile-results
-          path: |
-            summary.txt
-            out-*.json
+        run: |
+          {
+            cat summary.md
+            
+            for r in report-scan-*.md; do
+              if [ -f "$r" ]; then 
+                echo -e "\n---\n"
+                cat "$r"
+              fi
+            done
+          } > full_report.md
 
-      - name: Slack failure
-        if: failure()
+      - name: Upload Scan Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-reports
+          path: |
+            results.txt
+            summary.md
+            full_report.md
+            scan-*.json
+          retention-days: 90
+
+      - name: Publish GitHub Summary
+        if: always()
+        run: |
+          echo "# Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          grep -A 4 "## Overview" summary.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          grep -A 100 "## Results by Image" summary.md | grep -B 100 "## Recommendations" >> $GITHUB_STEP_SUMMARY || true
+          
+          if [[ "${{ steps.analyze.outputs.failed }}" -gt 0 ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Security issues detected. See artifacts for details." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ All images passed security scanning." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Send Vulnerability Alert
+        if: always() && steps.analyze.outputs.failed != '0'
+        continue-on-error: true
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_COLOR: '#FF4500'
+          SLACK_TITLE: 'Container Security Issues Detected'
           SLACK_MESSAGE: |
-            $(grep 'FAIL' summary.txt | sed 's/^/• /')
-            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Details>
+            Security scan detected vulnerabilities:
+            
+            • ${{ steps.analyze.outputs.high_total }} high, ${{ steps.analyze.outputs.critical_total }} critical vulnerabilities found
+            • ${{ steps.analyze.outputs.failed }} of ${{ steps.discover.outputs.paths }} images affected
+            
+            Affected images:
+            $(grep 'VULNERABLE\|FAILED' results.txt | sed 's/^/• /')
+            
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed report>
 
-      - name: Slack success
-        if: success() && github.event_name == 'push'
+      - name: Send Success Notification
+        if: always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule')
+        continue-on-error: true
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_COLOR: '#2EB886'
+          SLACK_TITLE: 'Container Security Scan Passed'
           SLACK_MESSAGE: |
-            All images clean on push to *main*.
+            All container images passed security scanning
+            
+            • ${{ steps.discover.outputs.paths }} images scanned
+            • No high or critical vulnerabilities found
+            • Scan triggered by: ${{ github.event_name }}
+            
             <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Details>
