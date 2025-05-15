@@ -71,7 +71,8 @@ jobs:
               counts["$f"]="0,0"
               echo "No vulnerabilities found in $f"
             else
-              if [ -f "scan-${tag}.json" ]; then
+              exit_code=$?
+              if [ $exit_code -eq 1 ] && [ -f "scan-${tag}.json" ]; then
                 high=$(grep -o '"severity":"high"' "scan-${tag}.json" | wc -l)
                 critical=$(grep -o '"severity":"critical"' "scan-${tag}.json" | wc -l)
                 high_total=$((high_total + high))
@@ -151,16 +152,21 @@ jobs:
       - name: Generate report
         if: always()
         run: |
-          {
-            cat summary.md
-            
-            for r in report-scan-*.md; do
-              if [ -f "$r" ]; then 
-                echo -e "\n---\n"
-                cat "$r"
-              fi
-            done
-          } > security-scan-report.md
+          if [ -f summary.md ]; then
+            {
+              cat summary.md
+              
+              for r in report-scan-*.md; do
+                if [ -f "$r" ]; then 
+                  echo -e "\n---\n"
+                  cat "$r"
+                fi
+              done
+            } > security-scan-report.md
+          else
+            echo "# Container Security Scan Report" > security-scan-report.md
+            echo "No scan results were generated. Check the workflow logs for details." >> security-scan-report.md
+          fi
 
       - name: Upload reports
         if: always()
@@ -172,26 +178,32 @@ jobs:
             summary.md
             security-scan-report.md
             scan-*.json
+          if-no-files-found: ignore
           retention-days: 90
 
       - name: Publish summary
         if: always()
         run: |
           echo "# Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          grep -A 4 "## Overview" summary.md >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          grep -A 100 "## Results by Image" summary.md | grep -B 100 "## Recommendations" >> $GITHUB_STEP_SUMMARY || true
           
-          if [[ "${{ steps.analyze.outputs.failed }}" -gt 0 ]]; then
+          if [ -f summary.md ]; then
+            grep -A 4 "## Overview" summary.md >> $GITHUB_STEP_SUMMARY || true
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ Security issues detected. See artifacts for details." >> $GITHUB_STEP_SUMMARY
+            grep -A 100 "## Results by Image" summary.md | grep -B 100 "## Recommendations" >> $GITHUB_STEP_SUMMARY || true
+            
+            if [[ "${{ steps.analyze.outputs.failed }}" -gt 0 ]]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ Security issues detected. See artifacts for details." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ All images passed security scanning." >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ All images passed security scanning." >> $GITHUB_STEP_SUMMARY
+            echo "No scan results were generated. Check the workflow logs for details." >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Send alert
-        if: always() && steps.analyze.outputs.failed != '0'
+        if: always() && steps.analyze.outputs.failed != '0' && secrets.SLACK_WEBHOOK != ''
         continue-on-error: true
         uses: rtCamp/action-slack-notify@v2.2.1
         env:
@@ -205,12 +217,12 @@ jobs:
             • ${{ steps.analyze.outputs.failed }} of ${{ steps.discover.outputs.paths }} images affected
             
             Affected images:
-            $(grep 'VULNERABLE\|FAILED' results.txt | sed 's/^/• /')
+            $(grep 'VULNERABLE\|FAILED' results.txt | sed 's/^/• /' || echo "• Check workflow logs for details")
             
             <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed report>
 
       - name: Send success notification
-        if: always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule')
+        if: always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule') && secrets.SLACK_WEBHOOK != ''
         continue-on-error: true
         uses: rtCamp/action-slack-notify@v2.2.1
         env:
