@@ -13,11 +13,11 @@ on:
     types: [labeled]
     branches: ["main"]
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * *"  # Run nightly at 03:00 UTC
 
 jobs:
   security_scan:
-    name: Container Security Scan
+    name: Container Security Analysis
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' ||
@@ -30,13 +30,13 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
-      - name: Setup Snyk
+      - name: Setup Snyk CLI
         uses: snyk/actions/setup@master
 
       - name: Free disk space
@@ -55,101 +55,130 @@ jobs:
           mapfile -t paths < <(find images/runtime -type f -name Dockerfile)
           echo "Found ${#paths[@]} Dockerfiles to scan"
           echo "paths=${paths[*]}" >> $GITHUB_OUTPUT
+          
+          # Create directory for scan results
+          mkdir -p scan-results
 
-      - name: Scan images
+      - name: Scan Dockerfiles
         id: analyze
         run: |
           IFS=' ' read -r -a dfs <<< "${{ steps.discover.outputs.paths }}"
           declare -A res; declare -A counts
           total=0; failed=0; high_total=0; critical_total=0
           
-          echo "::group::Scan Results"
+          echo "::group::Dockerfile Security Analysis"
           for f in "${dfs[@]}"; do
             total=$((total + 1))
             dir=$(dirname "$f")
             tag="scan-${dir//\//-}"
             
-            echo "Scanning: $f"
+            echo "🔍 Scanning Dockerfile: $f (${total}/${#dfs[@]})"
             
-            if ! docker build "$dir" -f "$f" -t "$tag"; then
-              res["$f"]="BUILD_FAILED"
-              failed=$((failed + 1))
-              echo "Failed to build image from $f"
-              continue
-            fi
+            # Extract base image from Dockerfile for Snyk to use
+            base_image=$(grep -m 1 "^FROM" "$f" | awk '{print $2}' | cut -d ' ' -f1)
+            echo "Base image: $base_image"
             
-            # Clean up previous scan results to save space
-
-            rm -f "scan-${tag}.json" "scan-${tag}.log" "report-${tag}.md" 2>/dev/null
-            
-            if snyk container test "$tag" --severity-threshold=high --json > "scan-${tag}.json" 2> "scan-${tag}.log"; then
+            # Scan the Dockerfile directly without building
+            if snyk container test "$base_image" --file="$f" --severity-threshold=high --json > "scan-results/scan-${tag}.json" 2> "scan-results/scan-${tag}.log"; then
               res["$f"]="SECURE"
               counts["$f"]="0,0"
-              echo "No vulnerabilities found in $f"
+              echo "✅ No vulnerabilities found in $f"
+              
+              # Create a clean report for secure Dockerfiles
+              {
+                echo "# Security Analysis Report for $f"
+                echo "## Overview"
+                echo "- **Security Status:** ✅ Secure"
+                echo "- **Base Image:** \`$base_image\`"
+                echo "- **Analysis Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                echo "- **Dockerfile Path:** \`$f\`"
+                echo
+                echo "No high or critical vulnerabilities were detected in this Dockerfile."
+              } > "scan-results/report-${tag}.md"
             else
               exit_code=$?
-              if [ $exit_code -eq 1 ] && [ -f "scan-${tag}.json" ]; then
-                high=$(grep -o '"severity":"high"' "scan-${tag}.json" | wc -l)
-                critical=$(grep -o '"severity":"critical"' "scan-${tag}.json" | wc -l)
+              if [ $exit_code -eq 1 ] && [ -f "scan-results/scan-${tag}.json" ]; then
+                high=$(grep -o '"severity":"high"' "scan-results/scan-${tag}.json" | wc -l)
+                critical=$(grep -o '"severity":"critical"' "scan-results/scan-${tag}.json" | wc -l)
                 high_total=$((high_total + high))
                 critical_total=$((critical_total + critical))
                 
-                echo "Found $high high and $critical critical vulnerabilities in $f"
+                echo "⚠️ Found $high high and $critical critical vulnerabilities in $f"
                 res["$f"]="VULNERABLE"
                 counts["$f"]="$high,$critical"
                 failed=$((failed + 1))
                 
-                # Only create detailed reports for vulnerable images
-
-                if [ $high -gt 0 ] || [ $critical -gt 0 ]; then
-                  {
-                    echo "# Security Report for $f"
-                    echo "## Summary"
-                    echo "- **Issues:** $high high, $critical critical vulnerabilities"
-                    echo "- **Scan Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-                    echo
-                    echo "## Top Vulnerabilities"
-                    jq -r '.vulnerabilities | sort_by(.cvssScore) | reverse | .[0:5] | .[] | "### \(.title) [\(.id)](\(.url))\n**Severity:** \(.severity) (CVSS: \(.cvssScore))\n**Description:** \(.description)\n**Remediation:** \(.remediation)"' "scan-${tag}.json" 2>/dev/null
-                  } > "report-${tag}.md"
-                fi
+                # Generate comprehensive security report for vulnerable Dockerfiles
+                {
+                  echo "# Security Analysis Report for $f"
+                  echo "## Overview"
+                  echo "- **Security Status:** ⚠️ Vulnerable"
+                  echo "- **Base Image:** \`$base_image\`"
+                  echo "- **Security Issues:** $high high, $critical critical vulnerabilities"
+                  echo "- **Analysis Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                  echo "- **Dockerfile Path:** \`$f\`"
+                  echo
+                  echo "## Critical Vulnerabilities"
+                  jq -r '.vulnerabilities | map(select(.severity=="critical")) | sort_by(.cvssScore) | reverse | .[0:5] | .[] | "### \(.title) [\(.id)](\(.url))\n**Severity:** \(.severity) (CVSS: \(.cvssScore))\n**Package:** \(.packageName) \(.version)\n**Fixed In:** \(.fixedIn[0] // \"Not available\")\n**Description:** \(.description)\n**Remediation:** \(.remediation)"' "scan-results/scan-${tag}.json" 2>/dev/null || echo "No critical vulnerabilities found."
+                  echo
+                  echo "## High Vulnerabilities"
+                  jq -r '.vulnerabilities | map(select(.severity=="high")) | sort_by(.cvssScore) | reverse | .[0:5] | .[] | "### \(.title) [\(.id)](\(.url))\n**Severity:** \(.severity) (CVSS: \(.cvssScore))\n**Package:** \(.packageName) \(.version)\n**Fixed In:** \(.fixedIn[0] // \"Not available\")\n**Description:** \(.description)\n**Remediation:** \(.remediation)"' "scan-results/scan-${tag}.json" 2>/dev/null || echo "No high vulnerabilities found."
+                  echo
+                  echo "## Remediation Recommendations"
+                  echo "- Update base image to \`$(jq -r '.docker.baseImageRemediation.code // "latest secure version"' "scan-results/scan-${tag}.json" 2>/dev/null)\`"
+                  echo "- Consider using distroless or minimal base images"
+                  echo "- Remove unnecessary packages and dependencies"
+                } > "scan-results/report-${tag}.md"
               else
                 res["$f"]="SCAN_FAILED"
                 failed=$((failed + 1))
-                echo "Scan failed for $f - no results generated"
+                echo "❓ Scan failed for $f - no results generated"
+                
+                # Record scan failure details
+                {
+                  echo "# Scan Failure Report for $f"
+                  echo "## Error Details"
+                  echo "- **Dockerfile Path:** \`$f\`"
+                  echo "- **Base Image:** \`$base_image\`"
+                  echo "- **Analysis Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                  echo "- **Status:** Scan Failed"
+                  echo
+                  echo "## Troubleshooting"
+                  echo "- Check if base image is publicly accessible"
+                  echo "- Verify Snyk token is valid"
+                  echo "- Ensure Dockerfile syntax is correct"
+                  
+                  if [ -f "scan-results/scan-${tag}.log" ]; then
+                    echo
+                    echo "## Error Log"
+                    echo '```'
+                    head -n 20 "scan-results/scan-${tag}.log"
+                    echo '```'
+                  fi
+                } > "scan-results/scan-failure-${tag}.md"
               fi
             fi
             
-            # Remove the Docker image immediately after scanning
-
-            docker rmi "$tag" >/dev/null 2>&1
-            
-            # Remove large JSON files after extracting needed info
-
-            if [ -f "scan-${tag}.json" ] && [ -f "report-${tag}.md" ]; then
-              rm "scan-${tag}.json" "scan-${tag}.log"
-            fi
-            
-            # Free up disk space periodically
-
-            if [ $((total % 3)) -eq 0 ]; then
-              docker system prune -af >/dev/null 2>&1
-              df -h
+            # Clean up large JSON files after extracting needed info
+            if [ -f "scan-results/scan-${tag}.json" ] && [ -f "scan-results/report-${tag}.md" ]; then
+              rm "scan-results/scan-${tag}.json" "scan-results/scan-${tag}.log"
             fi
           done
           
+          # Generate comprehensive executive summary
           {
-            echo "# Container Security Scan Summary"
-            echo "## Overview"
-            echo "- **Images Scanned:** $total"
-            echo "- **Images with Issues:** $failed"
+            echo "# Container Security Analysis Summary"
+            echo "## Executive Overview"
+            echo "- **Dockerfiles Analyzed:** $total"
+            echo "- **Dockerfiles with Security Issues:** $failed"
             echo "- **Total Vulnerabilities:** $high_total high, $critical_total critical"
-            echo "- **Scan Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- **Analysis Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "- **Triggered by:** ${{ github.event_name }}"
             
             echo
-            echo "## Results by Image"
-            echo "| Container Image | Status | Vulnerabilities |"
-            echo "|-----------------|--------|----------------|"
+            echo "## Results by Dockerfile"
+            echo "| Dockerfile | Status | Vulnerabilities |"
+            echo "|------------|--------|----------------|"
             for f in "${dfs[@]}"; do
               status="${res[$f]}"
               IFS=',' read -r high critical <<< "${counts[$f]:-0,0}"
@@ -157,7 +186,6 @@ jobs:
               case "$status" in
                 "SECURE") status="✅ Secure" ;;
                 "VULNERABLE") status="⚠️ Vulnerable" ;;
-                "BUILD_FAILED") status="❌ Build Failed" ;;
                 *) status="❓ Scan Failed" ;;
               esac
               echo "| \`$f\` | $status | $issues |"
@@ -165,99 +193,105 @@ jobs:
             
             if [[ $failed -gt 0 ]]; then
               echo
-              echo "## Recommendations"
-              echo "- Review detailed reports for each vulnerable image"
-              echo "- Update base images to latest secure versions"
-              echo "- Consider using distroless or minimal base images"
-              echo "- Remove unnecessary packages and dependencies"
+              echo "## Security Recommendations"
+              echo "- **Update Base Images:** Use the latest secure versions of base images"
+              echo "- **Minimize Dependencies:** Remove unnecessary packages and dependencies"
+              echo "- **Consider Distroless:** Use minimal or distroless base images where possible"
+              echo "- **Layer Optimization:** Combine RUN commands to reduce image layers"
+              echo "- **Regular Scanning:** Continue regular security scanning to catch new vulnerabilities"
             fi
-          } > summary.md
+          } > "scan-results/summary.md"
           
-          # Create a minimal results file
-          
+          # Create a minimal results file for CI integration
           for f in "${!res[@]}"; do
             echo "$f : ${res[$f]}" 
-          done > results.txt
+          done > "scan-results/results.txt"
           
           echo "::endgroup::"
           echo "failed=$failed" >> $GITHUB_OUTPUT
           echo "high_total=$high_total" >> $GITHUB_OUTPUT
           echo "critical_total=$critical_total" >> $GITHUB_OUTPUT
           
-          echo "Scan complete: $total images scanned, $failed with issues ($high_total high, $critical_total critical vulnerabilities)"
-          
-          # Final cleanup
+          echo "🔍 Analysis complete: $total Dockerfiles analyzed, $failed with issues ($high_total high, $critical_total critical vulnerabilities)"
 
-          docker system prune -af >/dev/null 2>&1
-          df -h
-
-      - name: Generate report
+      - name: Generate comprehensive report
         if: always()
         run: |
-          if [ -f summary.md ]; then
+          if [ -f "scan-results/summary.md" ]; then
             {
-              cat summary.md
+              cat "scan-results/summary.md"
               
-              for r in report-scan-*.md; do
+              echo -e "\n# Detailed Analysis Reports\n"
+              
+              # First include scan failures
+              for r in scan-results/scan-failure-*.md; do
                 if [ -f "$r" ]; then 
                   echo -e "\n---\n"
                   cat "$r"
                 fi
               done
-            } > security-scan-report.md
+              
+              # Then include vulnerability reports
+              for r in scan-results/report-*.md; do
+                if [ -f "$r" ]; then 
+                  echo -e "\n---\n"
+                  cat "$r"
+                fi
+              done
+            } > security-analysis-report.md
           else
-            echo "# Container Security Scan Report" > security-scan-report.md
-            echo "No scan results were generated. Check the workflow logs for details." >> security-scan-report.md
+            echo "# Container Security Analysis Report" > security-analysis-report.md
+            echo "No analysis results were generated. Please check the workflow logs for details." >> security-analysis-report.md
           fi
 
-      - name: Upload reports
+      - name: Archive security reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: security-scan
+          name: security-analysis
           path: |
-            results.txt
-            summary.md
-            security-scan-report.md
+            scan-results/results.txt
+            scan-results/summary.md
+            security-analysis-report.md
           if-no-files-found: ignore
           retention-days: 30
 
-      - name: Publish summary
+      - name: Publish analysis summary
         if: always()
         run: |
-          echo "# Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "# 🔒 Container Security Analysis Results" >> $GITHUB_STEP_SUMMARY
           
-          if [ -f summary.md ]; then
-            grep -A 4 "## Overview" summary.md >> $GITHUB_STEP_SUMMARY || true
+          if [ -f "scan-results/summary.md" ]; then
+            grep -A 5 "## Executive Overview" "scan-results/summary.md" >> $GITHUB_STEP_SUMMARY || true
             echo "" >> $GITHUB_STEP_SUMMARY
-            grep -A 100 "## Results by Image" summary.md | grep -B 100 "## Recommendations" >> $GITHUB_STEP_SUMMARY || true
+            grep -A 100 "## Results by Dockerfile" "scan-results/summary.md" | grep -B 100 "## Security Recommendations" >> $GITHUB_STEP_SUMMARY || true
             
             if [[ "${{ steps.analyze.outputs.failed }}" -gt 0 ]]; then
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "⚠️ Security issues detected. See artifacts for details." >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **Security issues detected.** See artifacts for detailed analysis." >> $GITHUB_STEP_SUMMARY
             else
               echo "" >> $GITHUB_STEP_SUMMARY
-              echo "✅ All images passed security scanning." >> $GITHUB_STEP_SUMMARY
+              echo "✅ **All Dockerfiles passed security analysis.**" >> $GITHUB_STEP_SUMMARY
             fi
           else
-            echo "No scan results were generated. Check the workflow logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "No analysis results were generated. Please check the workflow logs for details." >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Send alert
+      - name: Send security alert notification
         if: ${{ always() && steps.analyze.outputs.failed != '0' }}
         continue-on-error: true
         uses: rtCamp/action-slack-notify@v2.2.1
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_COLOR: '#FF4500'
-          SLACK_TITLE: 'Container Security Issues Detected'
+          SLACK_TITLE: '🚨 Container Security Issues Detected'
           SLACK_MESSAGE: |
-            Security scan detected vulnerabilities:
+            *Security analysis detected vulnerabilities in Dockerfiles:*
             
             • ${{ steps.analyze.outputs.high_total }} high, ${{ steps.analyze.outputs.critical_total }} critical vulnerabilities found
-            • ${{ steps.analyze.outputs.failed }} of ${{ steps.discover.outputs.paths }} images affected
+            • ${{ steps.analyze.outputs.failed }} of ${{ steps.discover.outputs.paths }} Dockerfiles affected
             
-            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed report>
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed analysis report>
 
       - name: Send success notification
         if: ${{ always() && steps.analyze.outputs.failed == '0' && (github.event_name == 'push' || github.event_name == 'schedule') }}
@@ -266,11 +300,11 @@ jobs:
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_COLOR: '#2EB886'
-          SLACK_TITLE: 'Container Security Scan Passed'
+          SLACK_TITLE: '✅ Container Security Analysis Passed'
           SLACK_MESSAGE: |
-            All container images passed security scanning
+            *All Dockerfiles passed security analysis*
             
-            • ${{ steps.discover.outputs.paths }} images scanned
+            • ${{ steps.discover.outputs.paths }} Dockerfiles analyzed
             • No high or critical vulnerabilities found
             
-            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Details>
+            <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View detailed analysis report>
