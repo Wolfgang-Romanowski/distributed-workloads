@@ -2,19 +2,19 @@ name: Container Security Scan
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * *" # Nightly at 00:00 UTC
   pull_request:
-    branches: [ "main" ]
-    types: [ opened, synchronize, reopened, labeled ]
+    branches: ["main"]
+    types: [opened, synchronize, reopened, labeled]
 
 jobs:
   snyk-container-scan:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security-scan') }}:contentReference[oaicite:5]{index=5}
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security-scan') }}
     runs-on: ubuntu-latest
     concurrency:
-      group: snyk-container-scan 
+      group: snyk-container-scan
       cancel-in-progress: true
 
     env:
@@ -29,24 +29,17 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Install jq (for JSON parsing)
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Scan all Dockerfiles with Snyk
-        id: scan
+      - name: Scan Dockerfiles with Snyk
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          set -eu
-          echo "Scanning all Dockerfiles in repository..."
+          set -u
 
-          mapfile -t DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" )
-          if [ ${#DOCKERFILES[@]} -eq 0 ]; then
-            echo "No Dockerfiles found. Exiting."
-            echo "SUMMARY=No Dockerfiles found to scan." >> $GITHUB_ENV
-            echo "SCAN_FAILURE=0" >> $GITHUB_ENV
-            exit 0
-          fi
+          mapfile -t DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*")
+          [ ${#DOCKERFILES[@]} -eq 0 ] && { echo "No Dockerfiles found."; exit 0; }
 
           SUMMARY=""
           TOTAL_CRITICAL=0
@@ -56,112 +49,74 @@ jobs:
           SCAN_FAILURE=0
 
           for FILE in "${DOCKERFILES[@]}"; do
-            echo "--------------------------------------------"
-            echo "Processing ${FILE}..."
-
             TEMP_DOCKERFILE="temp-$(basename "${FILE}").Dockerfile"
             cp "${FILE}" "${TEMP_DOCKERFILE}"
 
             FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1)
-
             VARS=$(echo "$FINAL_FROM" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?')
+
             if [ -n "$VARS" ]; then
+              grep '^ARG ' "${FILE}" | while read -r argline; do
+                VAR_NAME=$(echo "$argline" | cut -d' ' -f2 | cut -d= -f1)
+                DEFAULT_VAL=$(echo "$argline" | grep '=' | cut -d= -f2- | tr -d '"'\'')
+                [ -n "$DEFAULT_VAL" ] && export ${VAR_NAME}="${DEFAULT_VAL}"
+              done
 
-              while IFS= read -r line; do
-                if [[ "$line" =~ ^[[:space:]]*ARG[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)(=.*)? ]]; then
-                  VAR_NAME="${BASH_REMATCH[1]}"
-
-                  if [[ "${BASH_REMATCH[2]}" =~ =(.*) ]]; then
-                    # Remove '=' and any surrounding quotes
-                    DEFAULT_VAL="${BASH_REMATCH[2]#=}"
-                    DEFAULT_VAL="${DEFAULT_VAL%\"}"
-                    DEFAULT_VAL="${DEFAULT_VAL#\"}"
-                    DEFAULT_VAL="${DEFAULT_VAL%\'}"
-                    DEFAULT_VAL="${DEFAULT_VAL#\'}"
-                    export ${VAR_NAME}="${DEFAULT_VAL}"
-                  fi
-                fi
-              done < "${FILE}"
-
-              SUB_VARS=$(echo "$VARS" | tr ' ' '\n' | sed -E 's/[\$\{\}]//g' | xargs)
-              echo "Resolving ARGs in FROM: $SUB_VARS"
-
-              envsubst "$SUB_VARS" < "${TEMP_DOCKERFILE}" > "${TEMP_DOCKERFILE}.resolved"
+              envsubst "$(echo "$VARS" | tr ' ' '\n' | sed 's/[\$\{\}]//g' | xargs)" \
+                < "${TEMP_DOCKERFILE}" > "${TEMP_DOCKERFILE}.resolved"
               mv "${TEMP_DOCKERFILE}.resolved" "${TEMP_DOCKERFILE}"
             fi
 
             FINAL_FROM_RESOLVED=$(grep -Ei '^FROM ' "${TEMP_DOCKERFILE}" | tail -1)
             if echo "$FINAL_FROM_RESOLVED" | grep -q '\$\|{{\|}}'; then
-              echo "Unresolved FROM variables detected in ${FILE}. Using UBI base image as fallback."
-              sed -i -E 's#^FROM .*$#FROM registry.access.redhat.com/ubi8/ubi:latest#' "${TEMP_DOCKERFILE}"
-              FINAL_FROM_RESOLVED="FROM registry.access.redhat.com/ubi8/ubi:latest"
-              USE_FALLBACK=true
+              sed -i 's|^FROM.*|FROM registry.access.redhat.com/ubi8/ubi:latest|' "${TEMP_DOCKERFILE}"
+              BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi:latest (fallback)"
             else
-              USE_FALLBACK=false
+              BASE_IMAGE_NAME=$(echo "$FINAL_FROM_RESOLVED" | sed -E 's/^FROM[[:space:]]+//I')
             fi
 
+            snyk container test "${BASE_IMAGE_NAME}" --file="${TEMP_DOCKERFILE}" --exclude-app-vulns --json \
+              > "snyk-result.json" 2> "snyk-error.log" || echo '{}' > "snyk-result.json"
 
-            BASE_IMAGE_NAME=$(echo "$FINAL_FROM_RESOLVED" | sed -E 's/^FROM[[:space:]]+//I')
-            if $USE_FALLBACK; then
-              BASE_IMAGE_NAME="${BASE_IMAGE_NAME} (fallback)"
-            fi
+            if jq '.' snyk-result.json &>/dev/null; then
+              CRIT=$(jq '[.vulnerabilities[]|select(.severity=="critical")] | length' snyk-result.json)
+              HIGH=$(jq '[.vulnerabilities[]|select(.severity=="high")] | length' snyk-result.json)
+              MED=$(jq '[.vulnerabilities[]|select(.severity=="medium")] | length' snyk-result.json)
+              LOW=$(jq '[.vulnerabilities[]|select(.severity=="low")] | length' snyk-result.json)
 
-            echo "Running Snyk scan for ${FILE} (base: ${BASE_IMAGE_NAME})..."
-            snyk container test "${BASE_IMAGE_NAME}" --file="${TEMP_DOCKERFILE}" --exclude-app-vulns --json > "snyk-result.json" 2> "snyk-error.log" || true
-
-            if [ ! -s "snyk-result.json" ]; then
-              # JSON output is empty – an error occurred
-              SCAN_FAILURE=1
-              ERROR_MSG=$(head -1 "snyk-error.log")
-              echo "Snyk scan failed for ${FILE}: $ERROR_MSG"
-              SUMMARY+="- *${FILE}*: Scan **failed** – ${ERROR_MSG}\n"
-            else
-              CRIT=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' < "snyk-result.json")
-              HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' < "snyk-result.json")
-              MED=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' < "snyk-result.json")
-              LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' < "snyk-result.json")
-              echo "Vulnerabilities found: critical=$CRIT, high=$HIGH, medium=$MED, low=$LOW"
+              SUMMARY+="- ${FILE}: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: ${BASE_IMAGE_NAME})\n"
               TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
               TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
               TOTAL_MEDIUM=$((TOTAL_MEDIUM + MED))
               TOTAL_LOW=$((TOTAL_LOW + LOW))
-              SUMMARY+="- *${FILE}*: ${CRIT} critical, ${HIGH} high, ${MED} medium, ${LOW} low (Base image: ${BASE_IMAGE_NAME})\n"
+            else
+              ERROR_MSG=$(head -n1 snyk-error.log)
+              SUMMARY+="- ${FILE}: Scan failed - ${ERROR_MSG}\n"
+              SCAN_FAILURE=1
             fi
 
-            rm -f "snyk-result.json" "snyk-error.log" "${TEMP_DOCKERFILE}"
+            rm -f snyk-result.json snyk-error.log "${TEMP_DOCKERFILE}"
           done
 
-          TOTAL_IMAGES=${#DOCKERFILES[@]}
-          if [ "$SCAN_FAILURE" -eq 0 ]; then
-            SUMMARY_HEADER="Scanned ${TOTAL_IMAGES} Dockerfile(s): Found **${TOTAL_CRITICAL}** critical, **${TOTAL_HIGH}** high, **${TOTAL_MEDIUM}** medium, **${TOTAL_LOW}** low vulnerabilities in total."
-          else
-            SUMMARY_HEADER="Scanned ${TOTAL_IMAGES} Dockerfile(s) (with errors): Found **${TOTAL_CRITICAL}** critical, **${TOTAL_HIGH}** high, **${TOTAL_MEDIUM}** medium, **${TOTAL_LOW}** low vulnerabilities in those scanned."
-          fi
-
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
-          echo -e ":security_alert: *Snyk Container Scan Report* – ${GITHUB_REF##*/} (${GITHUB_EVENT_NAME})\n${SUMMARY_HEADER}\n*Details per image:*\n${SUMMARY}" >> $GITHUB_ENV
+          echo "Dockerfiles scanned: ${#DOCKERFILES[@]}" >> $GITHUB_ENV
+          echo "Critical: ${TOTAL_CRITICAL}, High: ${TOTAL_HIGH}, Medium: ${TOTAL_MEDIUM}, Low: ${TOTAL_LOW}" >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "Details:" >> $GITHUB_ENV
+          echo -e "${SUMMARY}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
-        shell: bash
 
       - name: Slack Notification
-        if: ${{ always() }}   # Run this even if previous step failed
+        if: ${{ always() }}
         env:
           SUMMARY: ${{ env.SUMMARY }}
           SCAN_FAILURE: ${{ env.SCAN_FAILURE }}
         run: |
+          [ -z "${SLACK_WEBHOOK_URL}" ] && { echo "No Slack webhook URL. Skipping notification."; exit 0; }
 
-          if [ "${SCAN_FAILURE:-1}" -eq 0 ]; then
-            STATUS=":white_check_mark: *Container security scan completed successfully*"
-          else
-            STATUS=":x: *Container security scan completed with errors*"
-          fi
-          
-          if [ -n "${SUMMARY}" ]; then
-            PAYLOAD="{\"text\": \"${STATUS}\n${SUMMARY//\"/\\\"}\"}"
-          else
-            PAYLOAD="{\"text\": \"${STATUS}\nScan failed before completion. Please check GitHub Actions logs for details.\"}"
-          fi
+          STATUS=":white_check_mark: *Scan successful*"
+          [ "$SCAN_FAILURE" -ne 0 ] && STATUS=":x: *Scan completed with errors*"
 
-          echo "Sending Slack notification..."
+          PAYLOAD="{\"text\":\"${STATUS}\n${SUMMARY}\"}"
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
