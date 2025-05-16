@@ -46,21 +46,6 @@ jobs:
 
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Verify Snyk authentication
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: |
-          # Verify Snyk is properly authenticated
-          if ! snyk auth; then
-            echo "::error::Failed to authenticate with Snyk. Please check your SNYK_TOKEN."
-            exit 1
-          fi
-          
-          echo "Snyk authentication successful"
-          snyk --version
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -70,6 +55,12 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           set -eu
+          
+          # Verify Snyk token is set
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::SNYK_TOKEN is not set. Please add it to your repository secrets."
+            exit 1
+          fi
           
           echo "Starting Dockerfile security scan..."
 
@@ -105,6 +96,14 @@ jobs:
           if ! snyk container test alpine:latest --json > test-snyk.json 2> test-snyk-error.log; then
             echo "::warning::Initial Snyk test failed. This may indicate issues with the Snyk service or authentication."
             cat test-snyk-error.log
+            
+            # Check for common error patterns
+            if grep -q "authentication failed" test-snyk-error.log; then
+              echo "::error::Authentication failed. Please verify your SNYK_TOKEN is correct and has the necessary permissions."
+              exit 1
+            elif grep -q "Could not pull image" test-snyk-error.log; then
+              echo "::warning::Could not pull test image. Network or registry issues may be present."
+            fi
           else
             echo "Initial Snyk test successful."
           fi
