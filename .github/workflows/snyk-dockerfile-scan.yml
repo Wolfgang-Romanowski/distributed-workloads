@@ -49,49 +49,13 @@ jobs:
           echo "Available disk space before scan:"
           df -h
 
-      - name: Find Dockerfiles
-        id: find-dockerfiles
-        run: |
-          set -eu
-          
-          echo "Finding Dockerfiles for analysis..."
-          
-          # Find all Dockerfiles but exclude examples and tests
-          mapfile -t ALL_DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" -not -path "*/examples/*" -not -path "*/tests/*" | sort)
-          
-          # If too many dockerfiles, only analyze a subset
-          MAX_FILES=15
-          if [ ${#ALL_DOCKERFILES[@]} -gt $MAX_FILES ]; then
-            echo "Found ${#ALL_DOCKERFILES[@]} Dockerfiles, limiting analysis to $MAX_FILES files"
-            # Take a representative sample - first few, last few, and some from the middle
-            DOCKERFILES=("${ALL_DOCKERFILES[@]:0:5}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}/2-2)):5}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}-5)):5}")
-          else
-            DOCKERFILES=("${ALL_DOCKERFILES[@]}")
-          fi
-          
-          # Check if any Dockerfiles were found
-          if [ ${#DOCKERFILES[@]} -eq 0 ]; then
-            echo "No Dockerfiles found."
-            exit 0
-          fi
-          
-          echo "Will analyze ${#DOCKERFILES[@]} Dockerfiles"
-          
-          # Create multiline output with proper escaping for each Dockerfile
-          {
-            echo "dockerfile_count=${#DOCKERFILES[@]}"
-            
-            # Store Dockerfiles as individual outputs
-            for i in "${!DOCKERFILES[@]}"; do
-              # Properly escape the path for use in GITHUB_OUTPUT
-              ESCAPED_PATH="${DOCKERFILES[$i]//\\/\\\\}"
-              ESCAPED_PATH="${ESCAPED_PATH//,/\\,}"
-              echo "dockerfile_${i}=${ESCAPED_PATH}"
-            done
-          } >> "$GITHUB_OUTPUT"
-
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Authenticate with Snyk
         env:
@@ -105,29 +69,33 @@ jobs:
             snyk auth "$SNYK_TOKEN"
           fi
 
-      - name: Scan Dockerfiles with Snyk
+      - name: Scan Dockerfiles
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          DOCKERFILE_COUNT: ${{ steps.find-dockerfiles.outputs.dockerfile_count }}
         run: |
           set -eu
           
           echo "Starting Dockerfile security scan..."
           
-          # No Dockerfiles to analyze
-          if [ -z "${DOCKERFILE_COUNT:-}" ] || [ "${DOCKERFILE_COUNT:-0}" -eq 0 ]; then
-            echo "No Dockerfiles to analyze."
+          # Find all Dockerfiles but exclude examples and tests
+          mapfile -t DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" -not -path "*/examples/*" -not -path "*/tests/*" | sort)
+          
+          # If too many dockerfiles, only analyze a subset
+          MAX_FILES=15
+          if [ ${#DOCKERFILES[@]} -gt $MAX_FILES ]; then
+            echo "Found ${#DOCKERFILES[@]} Dockerfiles, limiting analysis to $MAX_FILES files"
+            # Take a representative sample - first few, last few, and some from the middle
+            DOCKERFILES=("${DOCKERFILES[@]:0:5}" "${DOCKERFILES[@]:$((${#DOCKERFILES[@]}/2-2)):5}" "${DOCKERFILES[@]:$((${#DOCKERFILES[@]}-5)):5}")
+          fi
+          
+          # Check if any Dockerfiles were found
+          if [ ${#DOCKERFILES[@]} -eq 0 ]; then
+            echo "No Dockerfiles found."
             echo "SUMMARY=No Dockerfiles to analyze." >> $GITHUB_ENV
             exit 0
           fi
           
-          # Collect Dockerfile paths from output variables
-          DOCKERFILES=()
-          for i in $(seq 0 $((DOCKERFILE_COUNT - 1))); do
-            VAR_NAME="dockerfile_$i"
-            DOCKERFILE_PATH=$(eval echo "\${steps.find-dockerfiles.outputs.$VAR_NAME}")
-            DOCKERFILES+=("$DOCKERFILE_PATH")
-          done
+          echo "Will analyze ${#DOCKERFILES[@]} Dockerfiles"
           
           # Initialize summary variables
           SUMMARY=""
@@ -144,127 +112,48 @@ jobs:
           # Create structured table headers
           SUMMARY_TABLE="| Dockerfile | Base Image | Status | Issues |\n"
           SUMMARY_TABLE+="|------------|------------|--------|--------|\n"
-
-          # Check if Snyk token is available
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "::warning::SNYK_TOKEN not provided. Performing static analysis only."
-            
-            # Fallback to static analysis
-            for FILE in "${DOCKERFILES[@]}"; do
-              echo "Statically analyzing $FILE..."
-              
-              # Extract base image
-              FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
-              BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
-              
-              # Check for basic security issues
-              ISSUES=0
-              HIGH_ISSUES=0
-              
-              # Check for latest tag (HIGH)
-              if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
-                ISSUES=$((ISSUES + 1))
-                HIGH_ISSUES=$((HIGH_ISSUES + 1))
-              fi
-              
-              # Check for running as root (HIGH)
-              if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
-                ISSUES=$((ISSUES + 1))
-                HIGH_ISSUES=$((HIGH_ISSUES + 1))
-              fi
-              
-              # Determine status based on issues
-              if [ "$HIGH_ISSUES" -gt 0 ]; then
-                STATUS="🔴 High Risk"
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
-              elif [ "$ISSUES" -gt 0 ]; then
-                STATUS="🟡 Low Risk"
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              else
-                STATUS="🟢 Secure"
-              fi
-              
-              SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $ISSUES |\n"
-            done
-            
-            echo "Static analysis completed."
-          else
-            # Test if Snyk works by scanning a small image
+          
+          # Check if Snyk token is available or if test scan works
+          SNYK_AVAILABLE=false
+          if [ -n "$SNYK_TOKEN" ]; then
             echo "Testing Snyk with a simple image..."
-            if ! snyk container test alpine:3.14 --json > /dev/null 2>&1; then
-              echo "::warning::Snyk test failed. Falling back to static analysis."
-              
-              # Same static analysis as above
-              for FILE in "${DOCKERFILES[@]}"; do
-                echo "Statically analyzing $FILE..."
-                
-                # Extract base image
-                FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
-                BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
-                
-                # Simple scan for critical issues
-                ISSUES=0
-                HIGH_ISSUES=0
-                
-                if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
-                  ISSUES=$((ISSUES + 1))
-                  HIGH_ISSUES=$((HIGH_ISSUES + 1))
-                fi
-                
-                if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
-                  ISSUES=$((ISSUES + 1))
-                  HIGH_ISSUES=$((HIGH_ISSUES + 1))
-                fi
-                
-                if [ "$HIGH_ISSUES" -gt 0 ]; then
-                  STATUS="🔴 High Risk"
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                  TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
-                elif [ "$ISSUES" -gt 0 ]; then
-                  STATUS="🟡 Low Risk"
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                else
-                  STATUS="🟢 Secure"
-                fi
-                
-                SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $ISSUES |\n"
-              done
-            else
+            if snyk container test alpine:3.14 --json > /dev/null 2>&1; then
+              SNYK_AVAILABLE=true
               echo "Snyk is working properly. Proceeding with base image analysis."
+            else
+              echo "::warning::Snyk test failed. Falling back to static analysis."
+            fi
+          else
+            echo "::warning::SNYK_TOKEN not provided. Performing static analysis only."
+          fi
+          
+          # Process each Dockerfile
+          for FILE in "${DOCKERFILES[@]}"; do
+            echo "Analyzing $FILE..."
+            
+            # Extract base image
+            FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
+            BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
+            
+            if [ "$SNYK_AVAILABLE" = true ] && [ "$BASE_IMAGE_NAME" != "scratch" ] && [[ "$BASE_IMAGE_NAME" != *'$'* ]] && [[ "$BASE_IMAGE_NAME" != *'{{'* ]]; then
+              # Use Snyk to scan the base image
+              echo "Scanning base image: $BASE_IMAGE_NAME"
               
-              # Scan each Dockerfile's base image
-              for FILE in "${DOCKERFILES[@]}"; do
-                echo "Analyzing $FILE..."
-                
-                # Extract base image
-                FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
-                BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
-                
-                # Skip scratch images or templates
-                if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
-                  echo "Skipping scratch-based image"
-                  SUMMARY_TABLE+="| $FILE | scratch | ⚪ Skipped | 0 |\n"
-                  continue
+              # Scan with retry logic
+              MAX_RETRIES=2
+              SCAN_SUCCESS=false
+              
+              for RETRY in $(seq 0 $MAX_RETRIES); do
+                if [ "$RETRY" -gt 0 ]; then
+                  echo "Retry $RETRY/$MAX_RETRIES..."
                 fi
                 
-                # Handle ARGs in FROM statements
-                if [[ "$BASE_IMAGE_NAME" == *'$'* || "$BASE_IMAGE_NAME" == *'{{'* ]]; then
-                  echo "Using fallback image for template"
-                  BASE_IMAGE_NAME="alpine:3.14"
-                fi
-                
-                echo "Scanning base image: $BASE_IMAGE_NAME"
-                
-                # Scan with retry logic
-                MAX_RETRIES=2
-                for ((RETRY=0; RETRY<=MAX_RETRIES; RETRY++)); do
-                  if [ "$RETRY" -gt 0 ]; then
-                    echo "Retry $RETRY/$MAX_RETRIES..."
-                  fi
+                if snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log"; then
+                  SCAN_SUCCESS=true
                   
-                  if snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log"; then
-                    # Parse results
+                  # Parse results if file exists and is valid JSON
+                  if [ -s "snyk-result.json" ] && jq -e . "snyk-result.json" > /dev/null 2>&1; then
+                    # Parse vulnerabilities
                     CRIT=$(jq -r '.vulnerabilities | map(select(.severity=="critical")) | length // 0' snyk-result.json)
                     HIGH=$(jq -r '.vulnerabilities | map(select(.severity=="high")) | length // 0' snyk-result.json)
                     MED=$(jq -r '.vulnerabilities | map(select(.severity=="medium")) | length // 0' snyk-result.json)
@@ -286,22 +175,96 @@ jobs:
                     TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
                     TOTAL_MEDIUM=$((TOTAL_MEDIUM + MED))
                     TOTAL_LOW=$((TOTAL_LOW + LOW))
-                    
-                    break
-                  elif [ "$RETRY" -eq "$MAX_RETRIES" ]; then
-                    echo "::warning::Failed to scan $BASE_IMAGE_NAME after $MAX_RETRIES retries"
-                    ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
-                    SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | ❓ Scan Failed | 0 |\n"
-                    SCAN_FAILURE=$((SCAN_FAILURE + 1))
+                  else
+                    echo "::warning::Snyk produced invalid or empty JSON output for $BASE_IMAGE_NAME"
+                    SCAN_SUCCESS=false
                   fi
-                done
-                
-                # Remove temp files
-                rm -f snyk-result.json snyk-error.log
+                  
+                  break
+                elif [ "$RETRY" -eq "$MAX_RETRIES" ]; then
+                  echo "::warning::Failed to scan $BASE_IMAGE_NAME after $MAX_RETRIES retries"
+                  if [ -f "snyk-error.log" ]; then
+                    ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
+                    echo "Error: $ERROR_MSG"
+                  fi
+                fi
               done
+              
+              if [ "$SCAN_SUCCESS" = false ]; then
+                echo "Falling back to static analysis for $FILE"
+                SCAN_FAILURE=$((SCAN_FAILURE + 1))
+                
+                # Perform static analysis as fallback
+                STATIC_ISSUES=0
+                HIGH_ISSUES=0
+                
+                if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
+                  STATIC_ISSUES=$((STATIC_ISSUES + 1))
+                  HIGH_ISSUES=$((HIGH_ISSUES + 1))
+                fi
+                
+                if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
+                  STATIC_ISSUES=$((STATIC_ISSUES + 1))
+                  HIGH_ISSUES=$((HIGH_ISSUES + 1))
+                fi
+                
+                if [ "$HIGH_ISSUES" -gt 0 ]; then
+                  STATUS="🔴 High Risk (Static)"
+                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                  TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
+                elif [ "$STATIC_ISSUES" -gt 0 ]; then
+                  STATUS="🟡 Low Risk (Static)"
+                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                else
+                  STATUS="🟢 Secure (Static)"
+                fi
+                
+                SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $STATIC_ISSUES |\n"
+              fi
+              
+              # Clean up temp files
+              rm -f snyk-result.json snyk-error.log
+            else
+              # Static analysis for scratch, template images, or when Snyk is unavailable
+              if [ "$BASE_IMAGE_NAME" = "scratch" ]; then
+                echo "Skipping scan of scratch-based image"
+                SUMMARY_TABLE+="| $FILE | scratch | ⚪ Skipped | 0 |\n"
+                continue
+              elif [[ "$BASE_IMAGE_NAME" == *'$'* ]] || [[ "$BASE_IMAGE_NAME" == *'{{'* ]]; then
+                echo "Template detected in base image name: $BASE_IMAGE_NAME"
+              else
+                echo "Performing static analysis due to Snyk unavailability"
+              fi
+              
+              # Perform static analysis
+              STATIC_ISSUES=0
+              HIGH_ISSUES=0
+              
+              if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
+                STATIC_ISSUES=$((STATIC_ISSUES + 1))
+                HIGH_ISSUES=$((HIGH_ISSUES + 1))
+              fi
+              
+              if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
+                STATIC_ISSUES=$((STATIC_ISSUES + 1))
+                HIGH_ISSUES=$((HIGH_ISSUES + 1))
+              fi
+              
+              if [ "$HIGH_ISSUES" -gt 0 ]; then
+                STATUS="🔴 High Risk (Static)"
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
+              elif [ "$STATIC_ISSUES" -gt 0 ]; then
+                STATUS="🟡 Low Risk (Static)"
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              else
+                STATUS="🟢 Secure (Static)"
+              fi
+              
+              SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $STATIC_ISSUES |\n"
             fi
-          fi
-
+          done
+          
           # Create report
           REPORT="# Dockerfile Security Analysis Results\n\n"
           
@@ -315,6 +278,13 @@ jobs:
           fi
           REPORT+="* **Analysis Date:** $CURRENT_DATE\n"
           REPORT+="* **Triggered by:** $TRIGGER_EVENT\n\n"
+          
+          # Method used
+          if [ "$SNYK_AVAILABLE" = true ]; then
+            REPORT+="* **Analysis Method:** Snyk Container Scanning with static analysis fallback\n\n"
+          else
+            REPORT+="* **Analysis Method:** Static analysis only\n\n"
+          fi
           
           # Results table
           REPORT+="## Results\n\n"
@@ -339,16 +309,18 @@ jobs:
           fi
           
           REPORT+="\n_Scan completed at $(date -u)_\n"
-
+          
           # Set output variables
-          echo "SUMMARY<<EOF" >> $GITHUB_ENV
-          echo "$REPORT" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-          echo "ISSUES_COUNT=${ISSUES_COUNT}" >> $GITHUB_ENV
-          echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}" >> $GITHUB_ENV
-          echo "TOTAL_HIGH=${TOTAL_HIGH}" >> $GITHUB_ENV
-          echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
-          echo "ALL_FAILED=$([[ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]] && echo "true" || echo "false")" >> $GITHUB_ENV
+          {
+            echo "SUMMARY<<EOF"
+            echo -e "$REPORT"
+            echo "EOF"
+            echo "ISSUES_COUNT=${ISSUES_COUNT}"
+            echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}"
+            echo "TOTAL_HIGH=${TOTAL_HIGH}"
+            echo "SCAN_FAILURE=${SCAN_FAILURE}"
+            echo "ALL_FAILED=$([[ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]] && echo "true" || echo "false")"
+          } >> $GITHUB_ENV
 
       - name: Create Summary
         run: |
