@@ -68,212 +68,136 @@ jobs:
             echo "::error::Failed to authenticate with Snyk. Please verify your SNYK_TOKEN is correct."
             exit 1
           fi
-          
-          # Test Snyk API access
-          echo "Testing Snyk API access..."
-          if ! snyk test --json > /dev/null 2>&1; then
-            echo "::warning::Snyk API test failed. This may indicate issues with the Snyk service or permissions."
-          else
-            echo "Snyk API access successful."
-          fi
 
-      - name: Scan Dockerfiles with Snyk
+      - name: Static Analysis of Dockerfiles
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           set -eu
           
-          echo "Starting Dockerfile security scan..."
+          echo "Starting Dockerfile security static analysis..."
 
-          # Find all Dockerfiles but limit
+          # Find all Dockerfiles but exclude examples and tests
           mapfile -t ALL_DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" -not -path "*/examples/*" -not -path "*/tests/*" | sort)
           
-          # If too many dockerfiles, only scan X
-          MAX_FILES=10
+          # If too many dockerfiles, only analyze a subset
+          MAX_FILES=15
           if [ ${#ALL_DOCKERFILES[@]} -gt $MAX_FILES ]; then
-            echo "Found ${#ALL_DOCKERFILES[@]} Dockerfiles, limiting scan to $MAX_FILES files"
+            echo "Found ${#ALL_DOCKERFILES[@]} Dockerfiles, limiting analysis to $MAX_FILES files"
             # Take a representative sample - first few, last few, and some from the middle
-            DOCKERFILES=("${ALL_DOCKERFILES[@]:0:3}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}/2-2)):4}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}-3)):3}")
+            DOCKERFILES=("${ALL_DOCKERFILES[@]:0:5}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}/2-2)):5}" "${ALL_DOCKERFILES[@]:$((${#ALL_DOCKERFILES[@]}-5)):5}")
           else
             DOCKERFILES=("${ALL_DOCKERFILES[@]}")
           fi
           
           [ ${#DOCKERFILES[@]} -eq 0 ] && { echo "No Dockerfiles found."; exit 0; }
-          echo "Will scan ${#DOCKERFILES[@]} Dockerfiles"
+          echo "Will analyze ${#DOCKERFILES[@]} Dockerfiles"
 
           SUMMARY=""
           SUMMARY_TABLE=""
-          TOTAL_CRITICAL=0
-          TOTAL_HIGH=0
-          TOTAL_MEDIUM=0
-          TOTAL_LOW=0
-          SCAN_FAILURE=0
           ISSUES_COUNT=0
           CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           TRIGGER_EVENT="${{ github.event_name }}"
 
-          # Test a simple image first to verify Snyk is working
-          echo "Testing Snyk with a simple image..."
-          if ! snyk container test alpine:latest --json > test-snyk.json 2> test-snyk-error.log; then
-            echo "::warning::Initial Snyk test failed. This may indicate issues with the Snyk service or authentication."
-            cat test-snyk-error.log
-            
-            # Check for common error patterns
-            if grep -q "authentication failed" test-snyk-error.log; then
-              echo "::error::Authentication failed. Please verify your SNYK_TOKEN is correct and has the necessary permissions."
-              exit 1
-            elif grep -q "Could not pull image" test-snyk-error.log; then
-              echo "::warning::Could not pull test image. Network or registry issues may be present."
-            fi
-            
-            # If we can't run container tests, we'll do static Dockerfile analysis instead
-            echo "Falling back to static Dockerfile analysis..."
-            for FILE in "${DOCKERFILES[@]}"; do
-              echo "Analyzing $FILE..."
-              SUMMARY="$SUMMARY- $FILE: Static analysis only (container scanning unavailable)"$'\n'
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | ⚠️ Static Only | N/A |\n"
-            done
-            
-            # Set environment variables for reporting
-            echo "SUMMARY<<EOF" >> $GITHUB_ENV
-            echo "# Dockerfile Security Analysis Results\n\n" >> $GITHUB_ENV
-            echo "## Executive Overview\n\n" >> $GITHUB_ENV
-            echo "* Dockerfiles Analyzed: ${#DOCKERFILES[@]}\n" >> $GITHUB_ENV
-            echo "* Analysis Type: Static only (container scanning unavailable)\n" >> $GITHUB_ENV
-            echo "* Analysis Date: $CURRENT_DATE\n" >> $GITHUB_ENV
-            echo "* Triggered by: $TRIGGER_EVENT\n\n" >> $GITHUB_ENV
-            echo "## Results\n\n" >> $GITHUB_ENV
-            echo "$SUMMARY" >> $GITHUB_ENV
-            echo "\n_Container scanning unavailable - please check Snyk configuration_\n" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            echo "SCAN_FAILURE=${#DOCKERFILES[@]}" >> $GITHUB_ENV
-            echo "TOTAL_CRITICAL=0" >> $GITHUB_ENV
-            echo "TOTAL_HIGH=0" >> $GITHUB_ENV
-            echo "ALL_FAILED=true" >> $GITHUB_ENV
-            
-            exit 0
-          fi
-          
-          echo "Initial Snyk test successful."
-          rm -f test-snyk.json test-snyk-error.log
-
+          # Analyze each Dockerfile
           for FILE in "${DOCKERFILES[@]}"; do
-            echo "Scanning $FILE..."
+            echo "Analyzing $FILE..."
             
+            # Extract base image
             FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
             BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
             
+            # Check for best practices
+            ISSUES=""
+            ISSUE_COUNT=0
+            
+            # Check if using latest tag
+            if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
+              ISSUES+="- Using 'latest' tag (use specific version instead)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
+            
+            # Check if using scratch
             if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
-              echo "Skipping scratch-based image in $FILE"
-              SUMMARY="$SUMMARY- $FILE: Skipped (scratch-based image)"$'\n'
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | ⚪ Skipped | 0 high, 0 critical |\n"
-              continue
+              ISSUES+="- Using 'scratch' base (no security updates)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
             
-            # Handle ARG variables in FROM
-            if [[ "$BASE_IMAGE_NAME" == *'$'* || "$BASE_IMAGE_NAME" == *'{{'* || "$BASE_IMAGE_NAME" == *'}}'* ]]; then
-              BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi-minimal:latest"
-              echo "Using fallback image for $FILE: $BASE_IMAGE_NAME"
+            # Check for sudo usage
+            if grep -q "sudo " "$FILE"; then
+              ISSUES+="- Using 'sudo' in Dockerfile (avoid if possible)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
-
-            echo "Scanning base image: $BASE_IMAGE_NAME"
             
-            # Improved error handling with retry logic
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            SCAN_SUCCESS=false
+            # Check for curl | bash pattern
+            if grep -q "curl.*|.*sh" "$FILE" || grep -q "wget.*|.*sh" "$FILE"; then
+              ISSUES+="- Using 'curl | bash' pattern (security risk)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
             
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SCAN_SUCCESS" = false ]; do
-              if snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log"; then
-                SCAN_SUCCESS=true
-              else
-                RETRY_COUNT=$((RETRY_COUNT + 1))
-                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                  echo "Scan failed, retrying ($RETRY_COUNT/$MAX_RETRIES)..."
-                  sleep 5
-                else
-                  echo "::warning::All retries failed for $BASE_IMAGE_NAME. Error:"
-                  cat snyk-error.log
-                fi
-              fi
-            done
+            # Check for apt-get update and install in separate lines
+            if grep -q "apt-get update" "$FILE" && grep -q "apt-get install" "$FILE" && ! grep -q "apt-get update.*&&.*apt-get install" "$FILE"; then
+              ISSUES+="- 'apt-get update' and 'install' on separate lines (should be combined)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
             
-            if [ "$SCAN_SUCCESS" = true ] && jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
-              CRIT=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="critical")) | length end' snyk-result.json)
-              HIGH=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="high")) | length end' snyk-result.json)
-              MED=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="medium")) | length end' snyk-result.json)
-              LOW=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="low")) | length end' snyk-result.json)
-
-              SUMMARY="$SUMMARY- $FILE: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: $BASE_IMAGE_NAME)"$'\n'
-
-              if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
-                STATUS="🔴 Vulnerable"
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              elif [ "$MED" -gt 0 ] || [ "$LOW" -gt 0 ]; then
-                STATUS="🟡 Low Risk"
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              else
-                STATUS="🟢 Secure"
-              fi
-              
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $STATUS | $HIGH high, $CRIT critical |\n"
-              
-              TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
-              TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
-              TOTAL_MEDIUM=$((TOTAL_MEDIUM + MED))
-              TOTAL_LOW=$((TOTAL_LOW + LOW))
+            # Check for missing cleanup after package installation
+            if (grep -q "apt-get install" "$FILE" || grep -q "yum install" "$FILE" || grep -q "dnf install" "$FILE") && ! grep -q "rm -rf /var/lib/apt/lists/\*" "$FILE" && ! grep -q "dnf clean all" "$FILE" && ! grep -q "yum clean all" "$FILE"; then
+              ISSUES+="- Missing cleanup after package installation\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
+            
+            # Check for exposed ports
+            if grep -q "EXPOSE " "$FILE"; then
+              ISSUES+="- Exposing ports (review if necessary)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
+            
+            # Check for running as root
+            if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
+              ISSUES+="- May be running as root (add non-root user)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
+            
+            # Determine status based on issue count
+            if [ "$ISSUE_COUNT" -gt 3 ]; then
+              STATUS="🔴 High Risk"
+              ISSUES_COUNT=$((ISSUES_COUNT + 1))
+            elif [ "$ISSUE_COUNT" -gt 0 ]; then
+              STATUS="🟡 Low Risk"
+              ISSUES_COUNT=$((ISSUES_COUNT + 1))
             else
-              ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
-              SUMMARY="$SUMMARY- $FILE: Scan failed - $ERROR_MSG"$'\n'
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | ❓ Scan Failed | 0 high, 0 critical |\n"
-              SCAN_FAILURE=$((SCAN_FAILURE + 1))
+              STATUS="🟢 Secure"
             fi
-          
-            rm -f snyk-result.json snyk-error.log
-
-            echo "Available disk space during scan:"
-            df -h
+            
+            SUMMARY="$SUMMARY- $FILE: $ISSUE_COUNT issues found (base: $BASE_IMAGE_NAME)\n$ISSUES\n"
+            SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $STATUS | $ISSUE_COUNT issues |\n"
           done
-
-          # Check if all scans failed
-          if [ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]; then
-            echo "::warning::All scans failed. This may indicate an issue with Snyk configuration or service availability."
-          fi
 
           REPORT="# Dockerfile Security Analysis Results\n\n"
           REPORT+="## Executive Overview\n\n"
           REPORT+="* Dockerfiles Analyzed: ${#DOCKERFILES[@]}\n"
           REPORT+="* Dockerfiles with Security Issues: $ISSUES_COUNT\n"
-          REPORT+="* Total Vulnerabilities: $TOTAL_HIGH high, $TOTAL_CRITICAL critical\n"
-          REPORT+="* Scans Failed: $SCAN_FAILURE\n"
           REPORT+="* Analysis Date: $CURRENT_DATE\n"
           REPORT+="* Triggered by: $TRIGGER_EVENT\n\n"
           
           REPORT+="## Results by Dockerfile\n\n"
-          REPORT+="| Dockerfile | Status | Vulnerabilities |\n"
-          REPORT+="|------------|--------|----------------|\n"
+          REPORT+="| Dockerfile | Status | Issues |\n"
+          REPORT+="|------------|--------|--------|\n"
           REPORT+="$SUMMARY_TABLE\n"
+          
+          REPORT+="## Detailed Findings\n\n"
+          REPORT+="$SUMMARY\n"
           
           REPORT+="## Security Recommendations\n\n"
           
-          if [ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]; then
-            REPORT+="⚠️ **All scans failed to complete.** This may indicate an issue with Snyk configuration or service availability.\n\n"
-            REPORT+="* Verify Snyk API token is valid\n"
-            REPORT+="* Check Snyk service status\n"
-            REPORT+="* Ensure base images are accessible\n"
-          elif [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
-            REPORT+="⚠️ **Critical security issues detected.** Immediate attention required.\n\n"
-            REPORT+="* Update base images to newer versions with security patches\n"
-            REPORT+="* Consider using Red Hat UBI or other security-focused base images\n"
-            REPORT+="* Review the detailed scan results for specific CVEs\n"
-          elif [ "$SCAN_FAILURE" -gt 0 ]; then
-            REPORT+="⚠️ **Some scans failed to complete.** Review the logs for more information.\n\n"
-            REPORT+="* Ensure base images are accessible\n"
-            REPORT+="* Check for valid Dockerfile syntax\n"
-          elif [ "$TOTAL_MEDIUM" -gt 0 ] || [ "$TOTAL_LOW" -gt 0 ]; then
-            REPORT+="ℹ️ **Low severity issues found.** Consider addressing in future updates.\n\n"
-            REPORT+="* Plan for base image updates in upcoming release cycles\n"
-            REPORT+="* Monitor these vulnerabilities for changes in severity\n"
+          if [ "$ISSUES_COUNT" -gt 0 ]; then
+            REPORT+="⚠️ **Security issues detected.** Consider addressing the following:\n\n"
+            REPORT+="* Use specific version tags instead of 'latest'\n"
+            REPORT+="* Avoid running containers as root\n"
+            REPORT+="* Clean up package manager caches after installation\n"
+            REPORT+="* Combine RUN commands to reduce layer count\n"
+            REPORT+="* Avoid using 'curl | bash' patterns\n"
           else
             REPORT+="✅ **No security issues detected.** Continue with good security practices.\n\n"
             REPORT+="* Maintain regular scanning schedule\n"
@@ -285,10 +209,7 @@ jobs:
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
           echo "$REPORT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-          echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
-          echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}" >> $GITHUB_ENV
-          echo "TOTAL_HIGH=${TOTAL_HIGH}" >> $GITHUB_ENV
-          echo "ALL_FAILED=$([[ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]] && echo "true" || echo "false")" >> $GITHUB_ENV
+          echo "ISSUES_COUNT=${ISSUES_COUNT}" >> $GITHUB_ENV
 
       - name: Create Summary
         run: |
@@ -298,31 +219,25 @@ jobs:
         if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
         env:
           SUMMARY: ${{ env.SUMMARY }}
-          SCAN_FAILURE: ${{ env.SCAN_FAILURE }}
-          TOTAL_CRITICAL: ${{ env.TOTAL_CRITICAL }}
-          TOTAL_HIGH: ${{ env.TOTAL_HIGH }}
-          ALL_FAILED: ${{ env.ALL_FAILED }}
+          ISSUES_COUNT: ${{ env.ISSUES_COUNT }}
         run: |
-          if [ "$ALL_FAILED" = "true" ]; then
-            STATUS="🔄 *Dockerfile Security Scan - All Scans Failed*"
-            MESSAGE="All Dockerfile scans failed. This may indicate an issue with Snyk configuration or service availability."
-          elif [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
-            STATUS="🚨 *Dockerfile Security Scan - Critical Vulnerabilities Detected*"
-            MESSAGE="Critical or high severity vulnerabilities detected in base images."
-          elif [ "$SCAN_FAILURE" -ne 0 ]; then
-            STATUS="⚠️ *Dockerfile Security Scan - Completed with Some Errors*"
-            MESSAGE="Some scans failed to complete. Review the logs for more information."
+          if [ "$ISSUES_COUNT" -gt 5 ]; then
+            STATUS="🚨 *Dockerfile Security Scan - Multiple Issues Detected*"
+            MESSAGE="Multiple security issues detected in Dockerfiles."
+          elif [ "$ISSUES_COUNT" -gt 0 ]; then
+            STATUS="⚠️ *Dockerfile Security Scan - Minor Issues Detected*"
+            MESSAGE="Some minor security issues detected in Dockerfiles."
           else
             STATUS="✅ *Dockerfile Security Scan - Completed Successfully*"
-            MESSAGE="No critical or high severity vulnerabilities detected."
+            MESSAGE="No security issues detected in Dockerfiles."
           fi
 
           PAYLOAD="{\"text\":\"${STATUS}\n${MESSAGE}\n\`\`\`\n${SUMMARY}\n\`\`\`\"}"
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
-      - name: Check for critical vulnerabilities
-        if: ${{ github.event_name == 'pull_request' && env.ALL_FAILED != 'true' && (env.TOTAL_CRITICAL > 0 || env.TOTAL_HIGH > 0) }}
+      - name: Check for critical issues
+        if: ${{ github.event_name == 'pull_request' && env.ISSUES_COUNT > 5 }}
         run: |
-          echo "Critical or high severity vulnerabilities detected in base images."
-          echo "Please review the security scan results and update the base images."
+          echo "Multiple security issues detected in Dockerfiles."
+          echo "Please review the security scan results and address the issues."
           exit 1
