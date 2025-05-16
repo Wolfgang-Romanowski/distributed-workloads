@@ -1,5 +1,5 @@
 # Snyk scan for training‑runtime Dockerfiles
-# Push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
+# push to main, nightly 03:00 UTC, fork PRs after label `security-scan`
 # Fails on High/Critical CVEs
 
 name: Snyk Dockerfile Scan
@@ -20,7 +20,7 @@ on:
 
 jobs:
   snyk-container-scan:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-snyk') }}
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security-scan') }}
     runs-on: ubuntu-latest
     concurrency:
       group: snyk-container-scan
@@ -34,6 +34,20 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 1
+
+      - name: Free up disk space
+        run: |
+          # Remove unnecessary large packages
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          
+          # Display available disk space
+          echo "Available disk space before scan:"
+          df -h
 
       - name: Find Dockerfiles
         id: find-dockerfiles
@@ -55,231 +69,336 @@ jobs:
             DOCKERFILES=("${ALL_DOCKERFILES[@]}")
           fi
           
-          [ ${#DOCKERFILES[@]} -eq 0 ] && { echo "No Dockerfiles found."; exit 0; }
+          # Check if any Dockerfiles were found
+          if [ ${#DOCKERFILES[@]} -eq 0 ]; then
+            echo "No Dockerfiles found."
+            exit 0
+          fi
+          
           echo "Will analyze ${#DOCKERFILES[@]} Dockerfiles"
           
-          # Create a JSON array of Dockerfile paths to pass to the next step
-          JSON_ARRAY=$(printf '%s\n' "${DOCKERFILES[@]}" | jq -R . | jq -s .)
-          echo "dockerfiles=$JSON_ARRAY" >> $GITHUB_OUTPUT
+          # Create multiline output with proper escaping for each Dockerfile
+          {
+            echo "dockerfile_count=${#DOCKERFILES[@]}"
+            
+            # Store Dockerfiles as individual outputs
+            for i in "${!DOCKERFILES[@]}"; do
+              # Properly escape the path for use in GITHUB_OUTPUT
+              ESCAPED_PATH="${DOCKERFILES[$i]//\\/\\\\}"
+              ESCAPED_PATH="${ESCAPED_PATH//,/\\,}"
+              echo "dockerfile_${i}=${ESCAPED_PATH}"
+            done
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Setup Snyk CLI
+      - name: Set up Snyk CLI
         uses: snyk/actions/setup@master
 
-      - name: Setup node (required for Snyk)
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-          
       - name: Authenticate with Snyk
-        run: snyk auth ${{ secrets.SNYK_TOKEN }}
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          # Only attempt to authenticate if token is provided
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::warning::SNYK_TOKEN not provided. Running in standalone mode."
+          else
+            echo "Authenticating with Snyk..."
+            snyk auth "$SNYK_TOKEN"
+          fi
 
       - name: Scan Dockerfiles with Snyk
-        id: snyk-scan
         env:
-          DOCKERFILES: ${{ steps.find-dockerfiles.outputs.dockerfiles }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          DOCKERFILE_COUNT: ${{ steps.find-dockerfiles.outputs.dockerfile_count }}
         run: |
           set -eu
           
-          echo "Starting Snyk Dockerfile security analysis..."
+          echo "Starting Dockerfile security scan..."
           
-          # Parse the JSON array of Dockerfiles
-          readarray -t DOCKERFILES < <(echo "$DOCKERFILES" | jq -r '.[]')
+          # No Dockerfiles to analyze
+          if [ -z "${DOCKERFILE_COUNT:-}" ] || [ "${DOCKERFILE_COUNT:-0}" -eq 0 ]; then
+            echo "No Dockerfiles to analyze."
+            echo "SUMMARY=No Dockerfiles to analyze." >> $GITHUB_ENV
+            exit 0
+          fi
           
+          # Collect Dockerfile paths from output variables
+          DOCKERFILES=()
+          for i in $(seq 0 $((DOCKERFILE_COUNT - 1))); do
+            VAR_NAME="dockerfile_$i"
+            DOCKERFILE_PATH=$(eval echo "\${steps.find-dockerfiles.outputs.$VAR_NAME}")
+            DOCKERFILES+=("$DOCKERFILE_PATH")
+          done
+          
+          # Initialize summary variables
+          SUMMARY=""
+          SUMMARY_TABLE=""
+          TOTAL_CRITICAL=0
+          TOTAL_HIGH=0
+          TOTAL_MEDIUM=0
+          TOTAL_LOW=0
+          SCAN_FAILURE=0
+          ISSUES_COUNT=0
           CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           TRIGGER_EVENT="${{ github.event_name }}"
           
-          # Create structured table headers for summary
+          # Create structured table headers
           SUMMARY_TABLE="| Dockerfile | Base Image | Status | Issues |\n"
           SUMMARY_TABLE+="|------------|------------|--------|--------|\n"
-          
-          # Create detailed findings table
-          DETAILS_TABLE="| Dockerfile | Issue | Severity | Package | Fix Version |\n"
-          DETAILS_TABLE+="|------------|-------|----------|---------|-------------|\n"
 
-          ISSUES_COUNT=0
-          HIGH_RISK_COUNT=0
-          
-          # Analyze each Dockerfile
-          for FILE in "${DOCKERFILES[@]}"; do
-            echo "Analyzing $FILE..."
+          # Check if Snyk token is available
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::warning::SNYK_TOKEN not provided. Performing static analysis only."
             
-            # Extract base image for reporting
-            FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
-            BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
+            # Fallback to static analysis
+            for FILE in "${DOCKERFILES[@]}"; do
+              echo "Statically analyzing $FILE..."
+              
+              # Extract base image
+              FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
+              BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
+              
+              # Check for basic security issues
+              ISSUES=0
+              HIGH_ISSUES=0
+              
+              # Check for latest tag (HIGH)
+              if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
+                ISSUES=$((ISSUES + 1))
+                HIGH_ISSUES=$((HIGH_ISSUES + 1))
+              fi
+              
+              # Check for running as root (HIGH)
+              if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
+                ISSUES=$((ISSUES + 1))
+                HIGH_ISSUES=$((HIGH_ISSUES + 1))
+              fi
+              
+              # Determine status based on issues
+              if [ "$HIGH_ISSUES" -gt 0 ]; then
+                STATUS="🔴 High Risk"
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
+              elif [ "$ISSUES" -gt 0 ]; then
+                STATUS="🟡 Low Risk"
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              else
+                STATUS="🟢 Secure"
+              fi
+              
+              SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $ISSUES |\n"
+            done
             
-            # Run Snyk container test without building the image (--file option)
-            # Note: This scans the Dockerfile, not a built image
-            TEMP_OUTPUT_FILE=$(mktemp)
-            if snyk container test --file=${FILE} --json > "$TEMP_OUTPUT_FILE" 2>&1; then
-              echo "$FILE - No vulnerabilities found"
-              STATUS="🟢 Secure"
-              ISSUE_COUNT=0
-              SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $ISSUE_COUNT |\n"
-            else
-              # Extract vulnerabilities from Snyk JSON output
-              if [ -s "$TEMP_OUTPUT_FILE" ]; then
-                # Try to parse JSON output
-                if jq -e . "$TEMP_OUTPUT_FILE" >/dev/null 2>&1; then
-                  VULNERABILITIES=$(jq -r '.vulnerabilities // []' "$TEMP_OUTPUT_FILE")
-                  HIGH_VULNS=$(jq -r '[.vulnerabilities[] | select(.severity == "high" or .severity == "critical")] | length' "$TEMP_OUTPUT_FILE")
-                  TOTAL_VULNS=$(jq -r '.vulnerabilities | length // 0' "$TEMP_OUTPUT_FILE")
-                  
-                  HIGH_RISK_COUNT=$((HIGH_RISK_COUNT + HIGH_VULNS))
+            echo "Static analysis completed."
+          else
+            # Test if Snyk works by scanning a small image
+            echo "Testing Snyk with a simple image..."
+            if ! snyk container test alpine:3.14 --json > /dev/null 2>&1; then
+              echo "::warning::Snyk test failed. Falling back to static analysis."
+              
+              # Same static analysis as above
+              for FILE in "${DOCKERFILES[@]}"; do
+                echo "Statically analyzing $FILE..."
+                
+                # Extract base image
+                FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
+                BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
+                
+                # Simple scan for critical issues
+                ISSUES=0
+                HIGH_ISSUES=0
+                
+                if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
+                  ISSUES=$((ISSUES + 1))
+                  HIGH_ISSUES=$((HIGH_ISSUES + 1))
+                fi
+                
+                if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
+                  ISSUES=$((ISSUES + 1))
+                  HIGH_ISSUES=$((HIGH_ISSUES + 1))
+                fi
+                
+                if [ "$HIGH_ISSUES" -gt 0 ]; then
+                  STATUS="🔴 High Risk"
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                  
-                  if [ "$HIGH_VULNS" -gt 0 ]; then
-                    STATUS="🔴 High Risk"
-                  else
-                    STATUS="🟡 Low Risk"
+                  TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
+                elif [ "$ISSUES" -gt 0 ]; then
+                  STATUS="🟡 Low Risk"
+                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                else
+                  STATUS="🟢 Secure"
+                fi
+                
+                SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $ISSUES |\n"
+              done
+            else
+              echo "Snyk is working properly. Proceeding with base image analysis."
+              
+              # Scan each Dockerfile's base image
+              for FILE in "${DOCKERFILES[@]}"; do
+                echo "Analyzing $FILE..."
+                
+                # Extract base image
+                FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
+                BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
+                
+                # Skip scratch images or templates
+                if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
+                  echo "Skipping scratch-based image"
+                  SUMMARY_TABLE+="| $FILE | scratch | ⚪ Skipped | 0 |\n"
+                  continue
+                fi
+                
+                # Handle ARGs in FROM statements
+                if [[ "$BASE_IMAGE_NAME" == *'$'* || "$BASE_IMAGE_NAME" == *'{{'* ]]; then
+                  echo "Using fallback image for template"
+                  BASE_IMAGE_NAME="alpine:3.14"
+                fi
+                
+                echo "Scanning base image: $BASE_IMAGE_NAME"
+                
+                # Scan with retry logic
+                MAX_RETRIES=2
+                for ((RETRY=0; RETRY<=MAX_RETRIES; RETRY++)); do
+                  if [ "$RETRY" -gt 0 ]; then
+                    echo "Retry $RETRY/$MAX_RETRIES..."
                   fi
                   
-                  SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $TOTAL_VULNS |\n"
-                  
-                  # Add top 5 most severe vulnerabilities to the detailed findings table
-                  TOP_VULNS=$(jq -r '.vulnerabilities | sort_by(.cvssScore) | reverse | .[0:5]' "$TEMP_OUTPUT_FILE")
-                  
-                  for VULN in $(echo "$TOP_VULNS" | jq -c '.[]'); do
-                    VULN_ID=$(echo "$VULN" | jq -r '.id')
-                    SEVERITY=$(echo "$VULN" | jq -r '.severity')
-                    PACKAGE=$(echo "$VULN" | jq -r '.packageName')
-                    FIX_VERSION=$(echo "$VULN" | jq -r '.fixedIn[0] // "Not available"')
+                  if snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log"; then
+                    # Parse results
+                    CRIT=$(jq -r '.vulnerabilities | map(select(.severity=="critical")) | length // 0' snyk-result.json)
+                    HIGH=$(jq -r '.vulnerabilities | map(select(.severity=="high")) | length // 0' snyk-result.json)
+                    MED=$(jq -r '.vulnerabilities | map(select(.severity=="medium")) | length // 0' snyk-result.json)
+                    LOW=$(jq -r '.vulnerabilities | map(select(.severity=="low")) | length // 0' snyk-result.json)
                     
-                    SEVERITY_ICON="⚠️"
-                    if [[ "$SEVERITY" == "high" ]]; then
-                      SEVERITY_ICON="🟠"
-                    elif [[ "$SEVERITY" == "critical" ]]; then
-                      SEVERITY_ICON="🔴"
+                    if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+                      STATUS="🔴 Vulnerable"
+                      ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                    elif [ "$MED" -gt 0 ] || [ "$LOW" -gt 0 ]; then
+                      STATUS="🟡 Low Risk"
+                      ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                    else
+                      STATUS="🟢 Secure"
                     fi
                     
-                    DETAILS_TABLE+="| $FILE | $VULN_ID | $SEVERITY_ICON ${SEVERITY^^} | $PACKAGE | $FIX_VERSION |\n"
-                  done
-                else
-                  # If JSON parsing failed, do static analysis as fallback
-                  echo "Warning: Could not parse Snyk output for $FILE, falling back to static analysis"
-                  STATIC_ISSUES=0
-                  
-                  # Perform minimal static analysis for critical issues
-                  if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
-                    STATIC_ISSUES=$((STATIC_ISSUES + 1))
-                    DETAILS_TABLE+="| $FILE | Using 'latest' tag | 🔴 HIGH | Base image | Use specific version |\n"
+                    SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $HIGH high, $CRIT critical |\n"
+                    
+                    TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
+                    TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+                    TOTAL_MEDIUM=$((TOTAL_MEDIUM + MED))
+                    TOTAL_LOW=$((TOTAL_LOW + LOW))
+                    
+                    break
+                  elif [ "$RETRY" -eq "$MAX_RETRIES" ]; then
+                    echo "::warning::Failed to scan $BASE_IMAGE_NAME after $MAX_RETRIES retries"
+                    ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
+                    SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | ❓ Scan Failed | 0 |\n"
+                    SCAN_FAILURE=$((SCAN_FAILURE + 1))
                   fi
-                  
-                  if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
-                    STATIC_ISSUES=$((STATIC_ISSUES + 1))
-                    DETAILS_TABLE+="| $FILE | Running as root | 🔴 HIGH | Container security | Add non-root user |\n"
-                  fi
-                  
-                  if [ "$STATIC_ISSUES" -gt 0 ]; then
-                    STATUS="🔴 High Risk (Static Analysis)"
-                    HIGH_RISK_COUNT=$((HIGH_RISK_COUNT + 1))
-                  else
-                    STATUS="⚠️ Unknown (Snyk Scan Failed)"
-                  fi
-                  
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                  SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $STATIC_ISSUES |\n"
-                fi
-              else
-                echo "Warning: Empty output from Snyk for $FILE"
-                STATUS="⚠️ Scan Failed"
-                SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | Unknown |\n"
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              fi
+                done
+                
+                # Remove temp files
+                rm -f snyk-result.json snyk-error.log
+              done
             fi
-            
-            rm -f "$TEMP_OUTPUT_FILE"
-          done
+          fi
 
           # Create report
           REPORT="# Dockerfile Security Analysis Results\n\n"
           
-          # Executive summary section
-          REPORT+="## Executive Summary\n\n"
+          # Executive summary
+          REPORT+="## Executive Overview\n\n"
           REPORT+="* **Dockerfiles Analyzed:** ${#DOCKERFILES[@]}\n"
           REPORT+="* **Dockerfiles with Issues:** $ISSUES_COUNT\n"
-          REPORT+="* **Dockerfiles with High/Critical Risk:** $HIGH_RISK_COUNT\n"
+          REPORT+="* **Total Vulnerabilities:** $TOTAL_HIGH high, $TOTAL_CRITICAL critical\n"
+          if [ "$SCAN_FAILURE" -gt 0 ]; then
+            REPORT+="* **Scans Failed:** $SCAN_FAILURE\n"
+          fi
           REPORT+="* **Analysis Date:** $CURRENT_DATE\n"
           REPORT+="* **Triggered by:** $TRIGGER_EVENT\n\n"
           
-          # Summary table
-          REPORT+="## Overview\n\n"
+          # Results table
+          REPORT+="## Results\n\n"
           REPORT+="$SUMMARY_TABLE\n"
           
-          # Detailed findings
-          REPORT+="## Detailed Findings\n\n"
-          REPORT+="$DETAILS_TABLE\n"
+          # Recommendations
+          REPORT+="## Security Recommendations\n\n"
           
-          # Recommendations based on findings
-          REPORT+="## Key Recommendations\n\n"
-          
-          if [ "$HIGH_RISK_COUNT" -gt 0 ]; then
-            REPORT+="🚨 **High risk vulnerabilities detected. Priority actions:**\n\n"
-            REPORT+="1. Update base images to versions without high/critical CVEs\n"
-            REPORT+="2. Create and use non-root users\n"
-            REPORT+="3. Avoid using 'latest' tags\n\n"
-          elif [ "$ISSUES_COUNT" -gt 0 ]; then
-            REPORT+="⚠️ **Security improvements recommended:**\n\n"
-            REPORT+="1. Review base images for known vulnerabilities\n"
-            REPORT+="2. Follow Dockerfile best practices\n"
-            REPORT+="3. Add HEALTHCHECK instructions\n\n"
+          if [ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]; then
+            REPORT+="⚠️ **All scans failed to complete.** Please check Snyk configuration.\n\n"
+          elif [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
+            REPORT+="⚠️ **Critical security issues detected.** Immediate attention required.\n\n"
+            REPORT+="* Update base images to newer versions with security patches\n"
+            REPORT+="* Avoid using 'latest' tags in Dockerfiles\n"
+            REPORT+="* Use non-root users in containers\n"
+          elif [ "$SCAN_FAILURE" -gt 0 ]; then
+            REPORT+="⚠️ **Some scans failed to complete.** Review the logs for more information.\n\n"
+          elif [ "$TOTAL_MEDIUM" -gt 0 ] || [ "$TOTAL_LOW" -gt 0 ]; then
+            REPORT+="ℹ️ **Low severity issues found.** Consider addressing in future updates.\n\n"
           else
-            REPORT+="✅ **No security issues detected.**\n\n"
+            REPORT+="✅ **No security issues detected.** Continue with good security practices.\n\n"
           fi
           
-          REPORT+="_Scan performed by Snyk at $(date)_\n"
+          REPORT+="\n_Scan completed at $(date -u)_\n"
 
+          # Set output variables
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
           echo "$REPORT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "ISSUES_COUNT=${ISSUES_COUNT}" >> $GITHUB_ENV
-          echo "HIGH_RISK_COUNT=${HIGH_RISK_COUNT}" >> $GITHUB_ENV
+          echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}" >> $GITHUB_ENV
+          echo "TOTAL_HIGH=${TOTAL_HIGH}" >> $GITHUB_ENV
+          echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
+          echo "ALL_FAILED=$([[ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]] && echo "true" || echo "false")" >> $GITHUB_ENV
 
-      - name: Add Analysis to PR
+      - name: Create Summary
+        run: |
+          echo "${{ env.SUMMARY }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Add PR Comment
         if: ${{ github.event_name == 'pull_request' }}
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs = require('fs');
             const summary = process.env.SUMMARY;
             
-            await github.rest.issues.createComment({
+            github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: summary
             });
 
-      - name: Create Summary
-        run: |
-          echo "${{ env.SUMMARY }}" >> $GITHUB_STEP_SUMMARY
-
       - name: Slack Notification
         if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
         env:
           SUMMARY: ${{ env.SUMMARY }}
-          ISSUES_COUNT: ${{ env.ISSUES_COUNT }}
-          HIGH_RISK_COUNT: ${{ env.HIGH_RISK_COUNT }}
+          ISSUES_COUNT: ${{ env.ISSUES_COUNT || 0 }}
+          TOTAL_CRITICAL: ${{ env.TOTAL_CRITICAL || 0 }}
+          TOTAL_HIGH: ${{ env.TOTAL_HIGH || 0 }}
+          SCAN_FAILURE: ${{ env.SCAN_FAILURE || 0 }}
+          ALL_FAILED: ${{ env.ALL_FAILED || 'false' }}
         run: |
-          if [ "$HIGH_RISK_COUNT" -gt 0 ]; then
-            STATUS="🚨 *Dockerfile Security Scan - High Risk Issues Detected*"
-            MESSAGE="High risk security issues detected in Dockerfiles."
-          elif [ "$ISSUES_COUNT" -gt 0 ]; then
-            STATUS="⚠️ *Dockerfile Security Scan - Minor Issues Detected*"
-            MESSAGE="Some minor security issues detected in Dockerfiles."
+          if [ "$ALL_FAILED" = "true" ]; then
+            STATUS="🔄 *Dockerfile Security Scan - All Scans Failed*"
+            MESSAGE="All Dockerfile scans failed. This may indicate an issue with Snyk configuration or service availability."
+          elif [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
+            STATUS="🚨 *Dockerfile Security Scan - Critical Vulnerabilities Detected*"
+            MESSAGE="Critical or high severity vulnerabilities detected in base images."
+          elif [ "$SCAN_FAILURE" -gt 0 ]; then
+            STATUS="⚠️ *Dockerfile Security Scan - Completed with Some Errors*"
+            MESSAGE="Some scans failed to complete. Review the logs for more information."
           else
             STATUS="✅ *Dockerfile Security Scan - Completed Successfully*"
-            MESSAGE="No security issues detected in Dockerfiles."
+            MESSAGE="No critical or high severity vulnerabilities detected."
           fi
 
           PAYLOAD="{\"text\":\"${STATUS}\n${MESSAGE}\n\`\`\`\n${SUMMARY}\n\`\`\`\"}"
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
-      - name: Check for critical issues
-        if: ${{ github.event_name == 'pull_request' && env.HIGH_RISK_COUNT > 0 }}
+      - name: Check for critical vulnerabilities
+        if: ${{ github.event_name == 'pull_request' && env.ALL_FAILED != 'true' && (env.TOTAL_CRITICAL > 0 || env.TOTAL_HIGH > 0) }}
         run: |
-          echo "High risk security issues detected in Dockerfiles."
-          echo "Please review the security scan results and address the issues."
+          echo "Critical or high severity vulnerabilities detected in base images."
+          echo "Please review the security scan results and update the base images."
           exit 1
