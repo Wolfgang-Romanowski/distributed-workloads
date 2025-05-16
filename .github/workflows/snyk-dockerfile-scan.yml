@@ -49,6 +49,19 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
+      - name: Verify Snyk authentication
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          # Verify Snyk is properly authenticated
+          if ! snyk auth; then
+            echo "::error::Failed to authenticate with Snyk. Please check your SNYK_TOKEN."
+            exit 1
+          fi
+          
+          echo "Snyk authentication successful"
+          snyk --version
+
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
@@ -87,6 +100,16 @@ jobs:
           CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           TRIGGER_EVENT="${{ github.event_name }}"
 
+          # Test a simple image first to verify Snyk is working
+          echo "Testing Snyk with a simple image..."
+          if ! snyk container test alpine:latest --json > test-snyk.json 2> test-snyk-error.log; then
+            echo "::warning::Initial Snyk test failed. This may indicate issues with the Snyk service or authentication."
+            cat test-snyk-error.log
+          else
+            echo "Initial Snyk test successful."
+          fi
+          rm -f test-snyk.json test-snyk-error.log
+
           for FILE in "${DOCKERFILES[@]}"; do
             echo "Scanning $FILE..."
             
@@ -121,11 +144,14 @@ jobs:
                 if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
                   echo "Scan failed, retrying ($RETRY_COUNT/$MAX_RETRIES)..."
                   sleep 5
+                else
+                  echo "::warning::All retries failed for $BASE_IMAGE_NAME. Error:"
+                  cat snyk-error.log
                 fi
               fi
             done
             
-            if jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
+            if [ "$SCAN_SUCCESS" = true ] && jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
               CRIT=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="critical")) | length end' snyk-result.json)
               HIGH=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="high")) | length end' snyk-result.json)
               MED=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="medium")) | length end' snyk-result.json)
@@ -162,11 +188,17 @@ jobs:
             df -h
           done
 
+          # Check if all scans failed
+          if [ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]; then
+            echo "::warning::All scans failed. This may indicate an issue with Snyk configuration or service availability."
+          fi
+
           REPORT="# Dockerfile Security Analysis Results\n\n"
           REPORT+="## Executive Overview\n\n"
           REPORT+="* Dockerfiles Analyzed: ${#DOCKERFILES[@]}\n"
           REPORT+="* Dockerfiles with Security Issues: $ISSUES_COUNT\n"
           REPORT+="* Total Vulnerabilities: $TOTAL_HIGH high, $TOTAL_CRITICAL critical\n"
+          REPORT+="* Scans Failed: $SCAN_FAILURE\n"
           REPORT+="* Analysis Date: $CURRENT_DATE\n"
           REPORT+="* Triggered by: $TRIGGER_EVENT\n\n"
           
@@ -177,7 +209,12 @@ jobs:
           
           REPORT+="## Security Recommendations\n\n"
           
-          if [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
+          if [ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]; then
+            REPORT+="⚠️ **All scans failed to complete.** This may indicate an issue with Snyk configuration or service availability.\n\n"
+            REPORT+="* Verify Snyk API token is valid\n"
+            REPORT+="* Check Snyk service status\n"
+            REPORT+="* Ensure base images are accessible\n"
+          elif [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
             REPORT+="⚠️ **Critical security issues detected.** Immediate attention required.\n\n"
             REPORT+="* Update base images to newer versions with security patches\n"
             REPORT+="* Consider using Red Hat UBI or other security-focused base images\n"
@@ -204,6 +241,7 @@ jobs:
           echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
           echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}" >> $GITHUB_ENV
           echo "TOTAL_HIGH=${TOTAL_HIGH}" >> $GITHUB_ENV
+          echo "ALL_FAILED=$([[ "$SCAN_FAILURE" -eq "${#DOCKERFILES[@]}" ]] && echo "true" || echo "false")" >> $GITHUB_ENV
 
       - name: Create Summary
         run: |
@@ -216,20 +254,27 @@ jobs:
           SCAN_FAILURE: ${{ env.SCAN_FAILURE }}
           TOTAL_CRITICAL: ${{ env.TOTAL_CRITICAL }}
           TOTAL_HIGH: ${{ env.TOTAL_HIGH }}
+          ALL_FAILED: ${{ env.ALL_FAILED }}
         run: |
-          if [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
+          if [ "$ALL_FAILED" = "true" ]; then
+            STATUS="🔄 *Dockerfile Security Scan - All Scans Failed*"
+            MESSAGE="All Dockerfile scans failed. This may indicate an issue with Snyk configuration or service availability."
+          elif [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
             STATUS="🚨 *Dockerfile Security Scan - Critical Vulnerabilities Detected*"
+            MESSAGE="Critical or high severity vulnerabilities detected in base images."
           elif [ "$SCAN_FAILURE" -ne 0 ]; then
-            STATUS="⚠️ *Dockerfile Security Scan - Completed with Errors*"
+            STATUS="⚠️ *Dockerfile Security Scan - Completed with Some Errors*"
+            MESSAGE="Some scans failed to complete. Review the logs for more information."
           else
             STATUS="✅ *Dockerfile Security Scan - Completed Successfully*"
+            MESSAGE="No critical or high severity vulnerabilities detected."
           fi
 
-          PAYLOAD="{\"text\":\"${STATUS}\n\`\`\`\n${SUMMARY}\n\`\`\`\"}"
+          PAYLOAD="{\"text\":\"${STATUS}\n${MESSAGE}\n\`\`\`\n${SUMMARY}\n\`\`\`\"}"
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
       - name: Check for critical vulnerabilities
-        if: ${{ github.event_name == 'pull_request' && (env.TOTAL_CRITICAL > 0 || env.TOTAL_HIGH > 0) }}
+        if: ${{ github.event_name == 'pull_request' && env.ALL_FAILED != 'true' && (env.TOTAL_CRITICAL > 0 || env.TOTAL_HIGH > 0) }}
         run: |
           echo "Critical or high severity vulnerabilities detected in base images."
           echo "Please review the security scan results and update the base images."
