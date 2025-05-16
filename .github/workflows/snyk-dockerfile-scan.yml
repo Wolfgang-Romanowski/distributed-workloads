@@ -1,17 +1,21 @@
-name: Container Security Scan
+# Snyk scan for training‑runtime Dockerfiles
+# push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
+# Fails on High/Critical CVEs
+
+name: Snyk Dockerfile Scan
 
 on:
   push:
     branches: ["main"]
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 3 * * *"
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, labeled]
 
 jobs:
   snyk-container-scan:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security-scan') }}
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-snyk') }}
     runs-on: ubuntu-latest
     concurrency:
       group: snyk-container-scan
@@ -52,12 +56,14 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          set -u
+          set -eu
+          
+          echo "Starting Dockerfile security scan..."
 
-          # Find all Dockerfiles but limit to a reasonable number
+          # Find all Dockerfiles but limit
           mapfile -t ALL_DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" | sort)
           
-          # If we have too many Dockerfiles, only scan a subset
+          # If too many dockerfiles, only scan X
           MAX_FILES=10
           if [ ${#ALL_DOCKERFILES[@]} -gt $MAX_FILES ]; then
             echo "Found ${#ALL_DOCKERFILES[@]} Dockerfiles, limiting scan to $MAX_FILES files"
@@ -71,39 +77,54 @@ jobs:
           echo "Will scan ${#DOCKERFILES[@]} Dockerfiles"
 
           SUMMARY=""
-          SUMMARY_TABLE="| Dockerfile | Base Image | Critical | High | Medium | Low | Status |\n|-----------|------------|----------|------|--------|-----|--------|\n"
+          SUMMARY_TABLE=""
           TOTAL_CRITICAL=0
           TOTAL_HIGH=0
           TOTAL_MEDIUM=0
           TOTAL_LOW=0
           SCAN_FAILURE=0
+          ISSUES_COUNT=0
+          CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          TRIGGER_EVENT="${{ github.event_name }}"
 
           for FILE in "${DOCKERFILES[@]}"; do
             echo "Scanning $FILE..."
             
-            # Extract base image
             FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
             BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
             
-            # Skip multi-stage builds that end with scratch
             if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
               echo "Skipping scratch-based image in $FILE"
               SUMMARY="$SUMMARY- $FILE: Skipped (scratch-based image)"$'\n'
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | scratch | - | - | - | - | Skipped |\n"
+              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | ⚪ Skipped | 0 high, 0 critical |\n"
               continue
             fi
             
-            # Handle ARG variables in FROM with a simplified approach
+            # Handle ARG variables in FROM
             if [[ "$BASE_IMAGE_NAME" == *'$'* || "$BASE_IMAGE_NAME" == *'{{'* || "$BASE_IMAGE_NAME" == *'}}'* ]]; then
               BASE_IMAGE_NAME="registry.access.redhat.com/ubi8/ubi-minimal:latest"
               echo "Using fallback image for $FILE: $BASE_IMAGE_NAME"
             fi
 
-            # Run Snyk scan directly on the base image without creating a Dockerfile
             echo "Scanning base image: $BASE_IMAGE_NAME"
-            snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log" || true
             
-            # Check if we got valid JSON results
+            # Improved error handling with retry logic
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            SCAN_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SCAN_SUCCESS" = false ]; do
+              if snyk container test "$BASE_IMAGE_NAME" --json > "snyk-result.json" 2> "snyk-error.log"; then
+                SCAN_SUCCESS=true
+              else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  echo "Scan failed, retrying ($RETRY_COUNT/$MAX_RETRIES)..."
+                  sleep 5
+                fi
+              fi
+            done
+            
             if jq -e 'has("vulnerabilities")' snyk-result.json &>/dev/null; then
               CRIT=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="critical")) | length end' snyk-result.json)
               HIGH=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="high")) | length end' snyk-result.json)
@@ -111,18 +132,18 @@ jobs:
               LOW=$(jq -r '.vulnerabilities | if . == null then 0 else map(select(.severity=="low")) | length end' snyk-result.json)
 
               SUMMARY="$SUMMARY- $FILE: ${CRIT}C ${HIGH}H ${MED}M ${LOW}L (base: $BASE_IMAGE_NAME)"$'\n'
-              
-              # Add status based on vulnerability counts
-              STATUS="✅ Pass"
-              if [ "$CRIT" -gt 0 ]; then
-                STATUS="❌ Critical"
-              elif [ "$HIGH" -gt 0 ]; then
-                STATUS="⚠️ High"
-              elif [ "$MED" -gt 5 ]; then
-                STATUS="⚠️ Medium"
+
+              if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+                STATUS="🔴 Vulnerable"
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              elif [ "$MED" -gt 0 ] || [ "$LOW" -gt 0 ]; then
+                STATUS="🟡 Low Risk"
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              else
+                STATUS="🟢 Secure"
               fi
               
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $BASE_IMAGE_NAME | $CRIT | $HIGH | $MED | $LOW | $STATUS |\n"
+              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $STATUS | $HIGH high, $CRIT critical |\n"
               
               TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
               TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
@@ -131,41 +152,85 @@ jobs:
             else
               ERROR_MSG=$(head -n1 snyk-error.log || echo "Unknown error")
               SUMMARY="$SUMMARY- $FILE: Scan failed - $ERROR_MSG"$'\n'
-              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | $BASE_IMAGE_NAME | - | - | - | - | ❌ Failed |\n"
-              SCAN_FAILURE=1
+              SUMMARY_TABLE="$SUMMARY_TABLE| $FILE | ❓ Scan Failed | 0 high, 0 critical |\n"
+              SCAN_FAILURE=$((SCAN_FAILURE + 1))
             fi
-
-            # Clean up immediately
+          
             rm -f snyk-result.json snyk-error.log
-            
-            # Display disk space regularly
+
             echo "Available disk space during scan:"
             df -h
           done
 
-          # Add totals row to summary table
-          SUMMARY_TABLE="$SUMMARY_TABLE| **TOTAL** | **${#DOCKERFILES[@]} images** | **$TOTAL_CRITICAL** | **$TOTAL_HIGH** | **$TOTAL_MEDIUM** | **$TOTAL_LOW** | - |\n"
+          REPORT="# Dockerfile Security Analysis Results\n\n"
+          REPORT+="## Executive Overview\n\n"
+          REPORT+="* Dockerfiles Analyzed: ${#DOCKERFILES[@]}\n"
+          REPORT+="* Dockerfiles with Security Issues: $ISSUES_COUNT\n"
+          REPORT+="* Total Vulnerabilities: $TOTAL_HIGH high, $TOTAL_CRITICAL critical\n"
+          REPORT+="* Analysis Date: $CURRENT_DATE\n"
+          REPORT+="* Triggered by: $TRIGGER_EVENT\n\n"
+          
+          REPORT+="## Results by Dockerfile\n\n"
+          REPORT+="| Dockerfile | Status | Vulnerabilities |\n"
+          REPORT+="|------------|--------|----------------|\n"
+          REPORT+="$SUMMARY_TABLE\n"
+          
+          REPORT+="## Security Recommendations\n\n"
+          
+          if [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
+            REPORT+="⚠️ **Critical security issues detected.** Immediate attention required.\n\n"
+            REPORT+="* Update base images to newer versions with security patches\n"
+            REPORT+="* Consider using Red Hat UBI or other security-focused base images\n"
+            REPORT+="* Review the detailed scan results for specific CVEs\n"
+          elif [ "$SCAN_FAILURE" -gt 0 ]; then
+            REPORT+="⚠️ **Some scans failed to complete.** Review the logs for more information.\n\n"
+            REPORT+="* Ensure base images are accessible\n"
+            REPORT+="* Check for valid Dockerfile syntax\n"
+          elif [ "$TOTAL_MEDIUM" -gt 0 ] || [ "$TOTAL_LOW" -gt 0 ]; then
+            REPORT+="ℹ️ **Low severity issues found.** Consider addressing in future updates.\n\n"
+            REPORT+="* Plan for base image updates in upcoming release cycles\n"
+            REPORT+="* Monitor these vulnerabilities for changes in severity\n"
+          else
+            REPORT+="✅ **No security issues detected.** Continue with good security practices.\n\n"
+            REPORT+="* Maintain regular scanning schedule\n"
+            REPORT+="* Keep base images updated\n"
+          fi
+          
+          REPORT+="\n_Job summary generated at run-time_\n"
 
           echo "SUMMARY<<EOF" >> $GITHUB_ENV
-          echo "Dockerfiles scanned: ${#DOCKERFILES[@]} (of ${#ALL_DOCKERFILES[@]} total)" >> $GITHUB_ENV
-          echo "Critical: ${TOTAL_CRITICAL}, High: ${TOTAL_HIGH}, Medium: ${TOTAL_MEDIUM}, Low: ${TOTAL_LOW}" >> $GITHUB_ENV
-          echo "" >> $GITHUB_ENV
-          echo "## Summary Table" >> $GITHUB_ENV
-          echo "$SUMMARY_TABLE" >> $GITHUB_ENV
-          echo "" >> $GITHUB_ENV
-          echo "## Details" >> $GITHUB_ENV
-          echo "$SUMMARY" >> $GITHUB_ENV
+          echo "$REPORT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "SCAN_FAILURE=${SCAN_FAILURE}" >> $GITHUB_ENV
+          echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}" >> $GITHUB_ENV
+          echo "TOTAL_HIGH=${TOTAL_HIGH}" >> $GITHUB_ENV
+
+      - name: Create Summary
+        run: |
+          echo "${{ env.SUMMARY }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Slack Notification
         if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
         env:
           SUMMARY: ${{ env.SUMMARY }}
           SCAN_FAILURE: ${{ env.SCAN_FAILURE }}
+          TOTAL_CRITICAL: ${{ env.TOTAL_CRITICAL }}
+          TOTAL_HIGH: ${{ env.TOTAL_HIGH }}
         run: |
-          STATUS=":white_check_mark: *Scan successful*"
-          [ "$SCAN_FAILURE" -ne 0 ] && STATUS=":x: *Scan completed with errors*"
+          if [ "$TOTAL_CRITICAL" -gt 0 ] || [ "$TOTAL_HIGH" -gt 0 ]; then
+            STATUS="🚨 *Dockerfile Security Scan - Critical Vulnerabilities Detected*"
+          elif [ "$SCAN_FAILURE" -ne 0 ]; then
+            STATUS="⚠️ *Dockerfile Security Scan - Completed with Errors*"
+          else
+            STATUS="✅ *Dockerfile Security Scan - Completed Successfully*"
+          fi
 
-          PAYLOAD="{\"text\":\"${STATUS}\n${SUMMARY}\"}"
+          PAYLOAD="{\"text\":\"${STATUS}\n\`\`\`\n${SUMMARY}\n\`\`\`\"}"
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+
+      - name: Check for critical vulnerabilities
+        if: ${{ github.event_name == 'pull_request' && (env.TOTAL_CRITICAL > 0 || env.TOTAL_HIGH > 0) }}
+        run: |
+          echo "Critical or high severity vulnerabilities detected in base images."
+          echo "Please review the security scan results and update the base images."
+          exit 1
