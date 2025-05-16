@@ -7,11 +7,16 @@ name: Snyk Dockerfile Scan
 on:
   push:
     branches: ["main"]
+    paths:
+      - '**/Dockerfile*'
+      - '.github/workflows/snyk-dockerfile-scan.yml'
   schedule:
     - cron: "0 3 * * *"
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, labeled]
+    paths:
+      - '**/Dockerfile*'
 
 jobs:
   snyk-container-scan:
@@ -30,48 +35,8 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Free up disk space
-        run: |
-          # Remove unnecessary large packages
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          
-          # Display available disk space
-          echo "Available disk space before scan:"
-          df -h
-
-      - name: Set up Snyk CLI
-        uses: snyk/actions/setup@master
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Scan Dockerfiles with Snyk
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: |
-          set -eu
-          
-          # Verify Snyk token is set
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "::error::SNYK_TOKEN is not set. Please add it to your repository secrets."
-            exit 1
-          fi
-          
-          # Test authentication directly
-          echo "Testing Snyk authentication..."
-          if ! snyk auth "$SNYK_TOKEN"; then
-            echo "::error::Failed to authenticate with Snyk. Please verify your SNYK_TOKEN is correct."
-            exit 1
-          fi
-
       - name: Static Analysis of Dockerfiles
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        id: dockerfile-analysis
         run: |
           set -eu
           
@@ -96,6 +61,7 @@ jobs:
           SUMMARY=""
           SUMMARY_TABLE=""
           ISSUES_COUNT=0
+          HIGH_RISK_COUNT=0
           CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           TRIGGER_EVENT="${{ github.event_name }}"
 
@@ -110,59 +76,76 @@ jobs:
             # Check for best practices
             ISSUES=""
             ISSUE_COUNT=0
+            HIGH_RISK_ISSUES=0
             
-            # Check if using latest tag
+            # Check if using latest tag (HIGH RISK)
             if [[ "$BASE_IMAGE_NAME" == *":latest"* ]]; then
               ISSUES+="- Using 'latest' tag (use specific version instead)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
+              HIGH_RISK_ISSUES=$((HIGH_RISK_ISSUES + 1))
             fi
             
-            # Check if using scratch
+            # Check if using scratch (MEDIUM RISK)
             if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
               ISSUES+="- Using 'scratch' base (no security updates)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
             
-            # Check for sudo usage
+            # Check for sudo usage (MEDIUM RISK)
             if grep -q "sudo " "$FILE"; then
               ISSUES+="- Using 'sudo' in Dockerfile (avoid if possible)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
             
-            # Check for curl | bash pattern
+            # Check for curl | bash pattern (HIGH RISK)
             if grep -q "curl.*|.*sh" "$FILE" || grep -q "wget.*|.*sh" "$FILE"; then
               ISSUES+="- Using 'curl | bash' pattern (security risk)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
+              HIGH_RISK_ISSUES=$((HIGH_RISK_ISSUES + 1))
             fi
             
-            # Check for apt-get update and install in separate lines
+            # Check for apt-get update and install in separate lines (LOW RISK)
             if grep -q "apt-get update" "$FILE" && grep -q "apt-get install" "$FILE" && ! grep -q "apt-get update.*&&.*apt-get install" "$FILE"; then
               ISSUES+="- 'apt-get update' and 'install' on separate lines (should be combined)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
             
-            # Check for missing cleanup after package installation
+            # Check for missing cleanup after package installation (MEDIUM RISK)
             if (grep -q "apt-get install" "$FILE" || grep -q "yum install" "$FILE" || grep -q "dnf install" "$FILE") && ! grep -q "rm -rf /var/lib/apt/lists/\*" "$FILE" && ! grep -q "dnf clean all" "$FILE" && ! grep -q "yum clean all" "$FILE"; then
               ISSUES+="- Missing cleanup after package installation\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
             
-            # Check for exposed ports
+            # Check for exposed ports (LOW RISK)
             if grep -q "EXPOSE " "$FILE"; then
               ISSUES+="- Exposing ports (review if necessary)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
             fi
             
-            # Check for running as root
+            # Check for running as root (HIGH RISK)
             if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
               ISSUES+="- May be running as root (add non-root user)\n"
               ISSUE_COUNT=$((ISSUE_COUNT + 1))
+              HIGH_RISK_ISSUES=$((HIGH_RISK_ISSUES + 1))
             fi
             
-            # Determine status based on issue count
-            if [ "$ISSUE_COUNT" -gt 3 ]; then
+            # Check for COPY with --chown (MEDIUM RISK)
+            if grep -q "COPY " "$FILE" && ! grep -q "COPY --chown=" "$FILE"; then
+              ISSUES+="- COPY without --chown (may create files with incorrect permissions)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
+            
+            # Check for ADD instead of COPY (LOW RISK)
+            if grep -q "ADD " "$FILE" && ! [[ "$FILE" =~ \.tar$ ]]; then
+              ISSUES+="- Using ADD instead of COPY (COPY is preferred for most cases)\n"
+              ISSUE_COUNT=$((ISSUE_COUNT + 1))
+            fi
+            
+            # Determine status based on issue count and severity
+            if [ "$HIGH_RISK_ISSUES" -gt 1 ] || [ "$ISSUE_COUNT" -gt 3 ]; then
               STATUS="🔴 High Risk"
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              HIGH_RISK_COUNT=$((HIGH_RISK_COUNT + 1))
             elif [ "$ISSUE_COUNT" -gt 0 ]; then
               STATUS="🟡 Low Risk"
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -178,6 +161,7 @@ jobs:
           REPORT+="## Executive Overview\n\n"
           REPORT+="* Dockerfiles Analyzed: ${#DOCKERFILES[@]}\n"
           REPORT+="* Dockerfiles with Security Issues: $ISSUES_COUNT\n"
+          REPORT+="* High Risk Dockerfiles: $HIGH_RISK_COUNT\n"
           REPORT+="* Analysis Date: $CURRENT_DATE\n"
           REPORT+="* Triggered by: $TRIGGER_EVENT\n\n"
           
@@ -191,18 +175,29 @@ jobs:
           
           REPORT+="## Security Recommendations\n\n"
           
-          if [ "$ISSUES_COUNT" -gt 0 ]; then
+          if [ "$HIGH_RISK_COUNT" -gt 0 ]; then
+            REPORT+="🚨 **High risk security issues detected.** Consider addressing the following:\n\n"
+            REPORT+="* Use specific version tags instead of 'latest' to ensure reproducible builds\n"
+            REPORT+="* Avoid running containers as root - create and use non-privileged users\n"
+            REPORT+="* Never use 'curl | bash' patterns which bypass security checks\n"
+          elif [ "$ISSUES_COUNT" -gt 0 ]; then
             REPORT+="⚠️ **Security issues detected.** Consider addressing the following:\n\n"
-            REPORT+="* Use specific version tags instead of 'latest'\n"
-            REPORT+="* Avoid running containers as root\n"
             REPORT+="* Clean up package manager caches after installation\n"
             REPORT+="* Combine RUN commands to reduce layer count\n"
-            REPORT+="* Avoid using 'curl | bash' patterns\n"
-          else
+            REPORT+="* Use COPY with --chown to set proper file permissions\n"
+          else {
             REPORT+="✅ **No security issues detected.** Continue with good security practices.\n\n"
             REPORT+="* Maintain regular scanning schedule\n"
             REPORT+="* Keep base images updated\n"
+          }
           fi
+          
+          REPORT+="## Best Practices for Dockerfile Security\n\n"
+          REPORT+="1. **Use specific image versions** - Avoid 'latest' tags\n"
+          REPORT+="2. **Run as non-root user** - Create and use a dedicated user\n"
+          REPORT+="3. **Minimize image size** - Use multi-stage builds and clean up\n"
+          REPORT+="4. **Scan for vulnerabilities** - Use container scanning tools\n"
+          REPORT+="5. **Keep base images updated** - Regularly rebuild with latest patches\n"
           
           REPORT+="\n_Job summary generated at run-time_\n"
 
@@ -210,6 +205,7 @@ jobs:
           echo "$REPORT" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "ISSUES_COUNT=${ISSUES_COUNT}" >> $GITHUB_ENV
+          echo "HIGH_RISK_COUNT=${HIGH_RISK_COUNT}" >> $GITHUB_ENV
 
       - name: Create Summary
         run: |
@@ -220,10 +216,11 @@ jobs:
         env:
           SUMMARY: ${{ env.SUMMARY }}
           ISSUES_COUNT: ${{ env.ISSUES_COUNT }}
+          HIGH_RISK_COUNT: ${{ env.HIGH_RISK_COUNT }}
         run: |
-          if [ "$ISSUES_COUNT" -gt 5 ]; then
-            STATUS="🚨 *Dockerfile Security Scan - Multiple Issues Detected*"
-            MESSAGE="Multiple security issues detected in Dockerfiles."
+          if [ "$HIGH_RISK_COUNT" -gt 0 ]; then
+            STATUS="🚨 *Dockerfile Security Scan - High Risk Issues Detected*"
+            MESSAGE="High risk security issues detected in Dockerfiles."
           elif [ "$ISSUES_COUNT" -gt 0 ]; then
             STATUS="⚠️ *Dockerfile Security Scan - Minor Issues Detected*"
             MESSAGE="Some minor security issues detected in Dockerfiles."
@@ -236,8 +233,8 @@ jobs:
           curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
       - name: Check for critical issues
-        if: ${{ github.event_name == 'pull_request' && env.ISSUES_COUNT > 5 }}
+        if: ${{ github.event_name == 'pull_request' && env.HIGH_RISK_COUNT > 0 }}
         run: |
-          echo "Multiple security issues detected in Dockerfiles."
+          echo "High risk security issues detected in Dockerfiles."
           echo "Please review the security scan results and address the issues."
           exit 1
