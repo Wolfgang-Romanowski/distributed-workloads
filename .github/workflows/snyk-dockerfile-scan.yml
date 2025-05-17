@@ -3,13 +3,13 @@ name: Snyk Dockerfile Scan
 
 on:
   schedule:
-    - cron: '0 3 * * *'          # nightly
-  push:                           # every push to main (testing)
-    branches: [main]
+    - cron: '0 3 * * *'          # nightly 03:00 UTC
+  push:
+    branches: [main]             # run on every push for now
     paths:
       - '**/Dockerfile*'
       - '.github/workflows/snyk-dockerfile-scan.yml'
-  pull_request_target:            # fork PRs once label added
+  pull_request_target:           # fork PRs when maintainer adds label
     types: [labeled]
 
 jobs:
@@ -19,32 +19,27 @@ jobs:
 
     if: |
       github.event_name == 'schedule' ||
-      github.event_name == 'push'     ||
+      github.event_name == 'push' ||
       (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      PY_DEF:     '3.11'    # default PYTHON_VERSION
-      TAG_DEF:    'latest'  # default IMAGE_TAG
+      PY_DEF:     '3.11'   # default for ${PYTHON_VERSION}
+      TAG_DEF:    'latest' # default for ${IMAGE_TAG}
 
     steps:
-      - name: Checkout (schedule / push)
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'push' }}
-        uses: actions/checkout@v3
-
-      - name: Checkout PR code (labeled fork PR)
-        if: ${{ github.event_name == 'pull_request_target' }}
-        uses: actions/checkout@v3
+      # checkout the correct ref (handles both push and PR runs)
+      - uses: actions/checkout@v3
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install Snyk CLI
         run: npm install -g snyk
 
-      - name: Run Snyk scans on Dockerfiles
+      - name: Scan Dockerfiles with Snyk
         shell: bash
         run: |
-          set +e   # continue even if individual scans fail
+          set +e   # collect all results
 
           images=(
             "py311-cuda121-torch241"
@@ -53,62 +48,47 @@ jobs:
             "py311-rocm62-torch251"
           )
 
-          echo "| Image                     | Scan Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ------------------------- | ----------- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image                     | Mode | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ------------------------- | ---- | ------ |" >> "$GITHUB_STEP_SUMMARY"
 
           for img in "${images[@]}"; do
-            dockerfile="images/runtime/training/$img/Dockerfile"
-            echo "🔎  Scanning $dockerfile"
-
-            # Verify Dockerfile exists
-            if [[ ! -f "$dockerfile" ]]; then
-              echo "❌  Dockerfile not found"
-              echo "| $img | missing |" >> "$GITHUB_STEP_SUMMARY"
+            df="images/runtime/training/$img/Dockerfile"
+            if [[ ! -f "$df" ]]; then
+              echo "| $img | - | missing |" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
 
-            # Defaults (can be overridden by ARG lines)
-            PYTHON_VERSION="$PY_DEF"
-            IMAGE_TAG="$TAG_DEF"
+            # Resolve template variables
+            PY=$PY_DEF; TAG=$TAG_DEF
+            arg_py=$(grep -E '^ARG[[:space:]]+PYTHON_VERSION=' "$df" | tail -1 | cut -d'=' -f2)
+            arg_tag=$(grep -E '^ARG[[:space:]]+IMAGE_TAG='     "$df" | tail -1 | cut -d'=' -f2)
+            [[ $arg_py  ]] && PY=$arg_py
+            [[ $arg_tag ]] && TAG=$arg_tag
 
-            # Override from ARG lines if present
-            arg_py=$(grep -E '^ARG[[:space:]]+PYTHON_VERSION=' "$dockerfile" | tail -1 | cut -d'=' -f2)
-            arg_tag=$(grep -E '^ARG[[:space:]]+IMAGE_TAG='     "$dockerfile" | tail -1 | cut -d'=' -f2)
-            [[ -n "$arg_py"  ]] && PYTHON_VERSION="$arg_py"
-            [[ -n "$arg_tag" ]] && IMAGE_TAG="$arg_tag"
+            base=$(grep -Ei '^FROM ' "$df" | tail -1 | awk '{print $2}')
+            base=${base//\$\{PYTHON_VERSION\}/$PY}
+            base=${base//\$\{IMAGE_TAG\}/$TAG}
 
-            # Extract last FROM image
-            base_image=$(grep -Ei '^FROM ' "$dockerfile" | tail -1 | awk '{print $2}')
+            mode="container"
+            snyk container test --remote "$base" --file="$df" --fail-on=critical -q
+            rc=$?
 
-            # Substitute known vars
-            resolved_image=$(echo "$base_image" \
-              | sed "s/\${PYTHON_VERSION}/$PYTHON_VERSION/g" \
-              | sed "s/\${IMAGE_TAG}/$IMAGE_TAG/g")
-
-            # Skip if still unresolved
-            if [[ "$resolved_image" == *'${'* || "$resolved_image" == *'$'* ]]; then
-              echo "⚠️  Skipping – unresolved base image ($resolved_image)"
-              echo "| $img | skipped |" >> "$GITHUB_STEP_SUMMARY"
-              continue
+            # If container scan bombs (rc >=2), fall back to IaC scan
+            if [[ $rc -ge 2 ]]; then
+              mode="iac"
+              snyk iac test "$df" --severity-threshold=high -q
+              rc=$?
             fi
 
-            # Run Snyk scan (remote mode -> no local Docker pull/build)
-            snyk container test --remote "$resolved_image" --file="$dockerfile"
-            exit_code=$?
+            if   [[ $rc -eq 0 ]]; then status="passed"
+            elif [[ $rc -eq 1 ]]; then status="failed"
+            else                       status="error"; fi
 
-            # Map exit code to status
-            if   [ $exit_code -eq 0 ]; then status="passed"
-            elif [ $exit_code -eq 1 ]; then status="failed"
-            else                           status="error"; fi
-
-            echo "| $img | $status |" >> "$GITHUB_STEP_SUMMARY"
-
-            if [ $exit_code -ne 0 ]; then
-              echo "Snyk scan for $img -> $status (exit $exit_code)"
-            fi
+            echo "| $img | $mode | $status |" >> "$GITHUB_STEP_SUMMARY"
+            [[ $rc -ne 0 ]] && echo "↳ $img via $mode ended with status '$status' (exit $rc)"
           done
 
-          exit 0  # workflow is informational only
+          exit 0  # never fail workflow; purely informational
 
-      - name: Finalize Summary
-        run: echo "**Snyk Dockerfile scan completed – see table above for results.**" >> "$GITHUB_STEP_SUMMARY"
+      - name: Finish summary
+        run: echo "**Snyk Dockerfile scan complete – see table above.**" >> "$GITHUB_STEP_SUMMARY"
