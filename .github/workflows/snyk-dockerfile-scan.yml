@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: '0 3 * * *'          # nightly 03:00 UTC
   push:
-    branches: [main]             # run on every push for now
+    branches: [main]             # run on every push to main
     paths:
       - '**/Dockerfile*'
       - '.github/workflows/snyk-dockerfile-scan.yml'
@@ -48,13 +48,13 @@ jobs:
             "py311-rocm62-torch251"
           )
 
-          echo "| Image                     | Mode | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ------------------------- | ---- | ------ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Mode | Status | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ----- | ---- | ------ | --------------- |" >> "$GITHUB_STEP_SUMMARY"
 
           for img in "${images[@]}"; do
             df="images/runtime/training/$img/Dockerfile"
             if [[ ! -f "$df" ]]; then
-              echo "| $img | - | missing |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| $img | - | missing | - |" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
 
@@ -69,26 +69,53 @@ jobs:
             base=${base//\$\{PYTHON_VERSION\}/$PY}
             base=${base//\$\{IMAGE_TAG\}/$TAG}
 
+            # Try container test mode first
             mode="container"
-            snyk container test --remote "$base" --file="$df" --fail-on=critical -q
+            echo "Scanning $img as container with base image: $base"
+            output=$(snyk container test --remote "$base" --file="$df" 2>&1)
             rc=$?
 
             # If container scan bombs (rc >=2), fall back to IaC scan
             if [[ $rc -ge 2 ]]; then
               mode="iac"
-              snyk iac test "$df" --severity-threshold=high -q
+              echo "Falling back to IaC scanning for $img"
+              output=$(snyk iac test "$df" --severity-threshold=high 2>&1)
               rc=$?
             fi
 
-            if   [[ $rc -eq 0 ]]; then status="passed"
-            elif [[ $rc -eq 1 ]]; then status="failed"
-            else                       status="error"; fi
+            # Analyze results
+            if   [[ $rc -eq 0 ]]; then 
+              status="✅ passed"
+              vulns="0"
+            elif [[ $rc -eq 1 ]]; then 
+              status="❌ failed"
+              # Try to extract vulnerability count
+              count=$(echo "$output" | grep -o '[0-9]* vulnerable' | head -1 | cut -d' ' -f1)
+              if [[ $count ]]; then
+                vulns="$count"
+              else
+                vulns="1+"
+              fi
+            else
+              status="⚠️ error"
+              vulns="-"
+            fi
 
-            echo "| $img | $mode | $status |" >> "$GITHUB_STEP_SUMMARY"
-            [[ $rc -ne 0 ]] && echo "↳ $img via $mode ended with status '$status' (exit $rc)"
+            echo "| $img | $mode | $status | $vulns |" >> "$GITHUB_STEP_SUMMARY"
+            
+            # Save detailed output to file for debugging
+            echo "### Output for $img ($mode):" > "/tmp/${img}_output.txt"
+            echo "$output" >> "/tmp/${img}_output.txt"
+            
+            # Print status to console
+            if [[ $rc -ne 0 ]]; then
+              echo "↳ $img via $mode ended with status '$status' (exit $rc)"
+            fi
           done
 
           exit 0  # never fail workflow; purely informational
 
       - name: Finish summary
-        run: echo "**Snyk Dockerfile scan complete – see table above.**" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "**Snyk Dockerfile scan complete – see table above.**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Note: This workflow is in reporting mode only and will not fail PR checks." >> "$GITHUB_STEP_SUMMARY"
