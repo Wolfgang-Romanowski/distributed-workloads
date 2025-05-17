@@ -57,7 +57,7 @@ jobs:
 
           for img in "${images[@]}"; do
             echo "🔎 Scanning Dockerfile for $img..."
-            snyk test --file="images/runtime/training/$img/Dockerfile"
+            snyk container test --file="images/runtime/training/$img/Dockerfile"
             exit_code=$?
 
             if [ $exit_code -eq 0 ]; then
