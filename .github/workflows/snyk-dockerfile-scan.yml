@@ -4,47 +4,47 @@ name: Snyk Dockerfile Scan
 on:
   schedule:
     - cron: '0 3 * * *'
-  # Trigger on pull requests (from forks) when a label is added
+  push:  # <-- Trigger on every push (for testing purposes)
+    branches:
+      - main
+    paths:
+      - '**/Dockerfile*'
+      - '.github/workflows/snyk-dockerfile-scan.yml'
   pull_request_target:
-    types: [labeled]   # Only run when a PR is labeled (used for fork PRs to allow secrets)
+    types: [labeled]
 
 jobs:
   snyk-dockerfile-scan:
     name: Snyk Dockerfile Scan
     runs-on: ubuntu-latest
 
-    # Only run for the scheduled event or if the added label matches 'run-snyk-scan'
-    if: ${{ github.event_name == 'schedule' || (github.event.label.name == 'run-snyk-scan') }}
+    # Run for scheduled, push events, or labeled PRs from forks
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
-    # Pass the Snyk token as an environment variable for authentication
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      # Checkout the repository code on the appropriate ref
-      - name: Check out code (for schedule)
-        if: ${{ github.event_name == 'schedule' }}
+      - name: Check out code (for schedule and push)
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'push' }}
         uses: actions/checkout@v3
 
       - name: Check out PR code (for labeled fork PR)
         if: ${{ github.event_name == 'pull_request_target' }}
         uses: actions/checkout@v3
         with:
-          # Checkout the fork's HEAD commit so we scan the PR's Dockerfile content
           ref: ${{ github.event.pull_request.head.sha }}
 
-      # Install Snyk CLI (if not already available on the runner)
       - name: Install Snyk CLI
         run: npm install -g snyk
 
       - name: Run Snyk scans on Dockerfiles
-        # Loop through each target Dockerfile and perform a static scan
-        # without building the image. Capture the result for summary.
         run: |
-          # Disable immediate exit on errors to allow collecting results for all files
           set +e
 
-          # Define the list of image Dockerfile paths to scan
           images=(
             "py311-cuda121-torch241"
             "py311-cuda124-torch251"
@@ -52,18 +52,14 @@ jobs:
             "py311-rocm62-torch251"
           )
 
-          # Initialize a Markdown table in the job summary (headers)
           echo "| Image                     | Scan Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ------------------------- | ----------- |" >> "$GITHUB_STEP_SUMMARY"
 
-          # Iterate over each Dockerfile and run Snyk scan
           for img in "${images[@]}"; do
             echo "🔎 Scanning Dockerfile for $img..."
-            # Run Snyk in container mode on the Dockerfile (no image build)
             snyk test --file="images/runtime/training/$img/Dockerfile"
-            exit_code=$?  # capture the Snyk CLI exit code
+            exit_code=$?
 
-            # Determine status based on Snyk exit code: 0=passed, 1=vulns found (failed), 2 or higher=error
             if [ $exit_code -eq 0 ]; then
               status="passed"
             elif [ $exit_code -eq 1 ]; then
@@ -72,19 +68,15 @@ jobs:
               status="error"
             fi
 
-            # Append the result to the summary table
             echo "| $img | $status |" >> "$GITHUB_STEP_SUMMARY"
 
-            # Optionally, handle non-zero exit codes (just log, do not exit)
             if [ $exit_code -ne 0 ]; then
               echo "Snyk scan for $img completed with status: $status (exit code $exit_code)"
             fi
           done
 
-          # Ensure the script does not fail the job (we want to report only)
           exit 0
         shell: bash
 
-      # (Optional) Add an explicit success message in summary
       - name: Finalize Summary
         run: echo "**Snyk Dockerfile scan completed**. See the table above for results." >> "$GITHUB_STEP_SUMMARY"
