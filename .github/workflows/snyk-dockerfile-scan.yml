@@ -23,9 +23,9 @@ jobs:
       (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
     env:
-      SNYK_TOKEN:    ${{ secrets.SNYK_TOKEN }}
-      PY_DEF:        "3.11"   # default PYTHON_VERSION
-      TAG_DEF:       "latest" # default IMAGE_TAG
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      PY_DEF:     '3.11'    # default PYTHON_VERSION
+      TAG_DEF:    'latest'  # default IMAGE_TAG
 
     steps:
       - name: Checkout (schedule / push)
@@ -44,7 +44,7 @@ jobs:
       - name: Run Snyk scans on Dockerfiles
         shell: bash
         run: |
-          set +e   # keep going even if individual scans fail
+          set +e   # continue even if individual scans fail
 
           images=(
             "py311-cuda121-torch241"
@@ -92,8 +92,8 @@ jobs:
               continue
             fi
 
-            # Run Snyk scan
-            snyk container test "$resolved_image" --file="$dockerfile"
+            # Run Snyk scan (remote mode -> no local Docker pull/build)
+            snyk container test --remote "$resolved_image" --file="$dockerfile"
             exit_code=$?
 
             # Map exit code to status
@@ -108,7 +108,7 @@ jobs:
             fi
           done
 
-          exit 0  # always succeed (informational only)
+          exit 0  # workflow is informational only
 
       - name: Finalize Summary
         run: echo "**Snyk Dockerfile scan completed – see table above for results.**" >> "$GITHUB_STEP_SUMMARY"
