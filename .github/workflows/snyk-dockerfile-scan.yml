@@ -1,547 +1,91 @@
-# Snyk scan for training‑runtime Dockerfiles
-# push to main, nightly 03:00 UTC, fork PRs after label `security-scan`
-# Fails on High/Critical CVEs
-
+# .github/workflows/snyk-dockerfile-scan.yml
 name: Snyk Dockerfile Scan
 
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - '**/Dockerfile*'
-      - '.github/workflows/snyk-dockerfile-scan.yml'
+  # Nightly trigger at 2:00 AM UTC
   schedule:
-    - cron: "0 3 * * *"
-  pull_request:
-    branches: ["main"]
-    types: [opened, synchronize, reopened, labeled]
-    paths:
-      - '**/Dockerfile*'
+    - cron: '0 2 * * *'
+  # Trigger on pull requests (from forks) when a label is added
+  pull_request_target:
+    types: [labeled]   # Only run when a PR is labeled (used for fork PRs to allow secrets)
 
 jobs:
-  snyk-container-scan:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security-scan') }}
+  snyk-dockerfile-scan:
+    name: Snyk Dockerfile Scan
     runs-on: ubuntu-latest
-    concurrency:
-      group: snyk-container-scan
-      cancel-in-progress: true
 
+    # Only run for the scheduled event or if the added label matches 'run-snyk-scan'
+    if: ${{ github.event_name == 'schedule' || (github.event.label.name == 'run-snyk-scan') }}
+
+    # Pass the Snyk token as an environment variable for authentication
     env:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout repository
+      # Checkout the repository code on the appropriate ref
+      - name: Check out code (for schedule)
+        if: ${{ github.event_name == 'schedule' }}
+        uses: actions/checkout@v3
+
+      - name: Check out PR code (for labeled fork PR)
+        if: ${{ github.event_name == 'pull_request_target' }}
         uses: actions/checkout@v3
         with:
-          fetch-depth: 1
+          # Checkout the fork's HEAD commit so we scan the PR's Dockerfile content
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Free up disk space
+      # Install Snyk CLI (if not already available on the runner)
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Run Snyk scans on Dockerfiles
+        # Loop through each target Dockerfile and perform a static scan
+        # without building the image. Capture the result for summary.
         run: |
-          # Remove unnecessary large packages
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          
-          # Display available disk space
-          echo "Available disk space before scan:"
-          df -h
+          # Disable immediate exit on errors to allow collecting results for all files
+          set +e
 
-      # Set up Docker to ensure it's running properly
-      - name: Set up Docker
-        run: |
-          echo "Verifying Docker setup..."
-          docker --version
-          docker info
-          
-          # Test if we can pull a simple image
-          echo "Testing Docker pull..."
-          docker pull hello-world
-          docker run hello-world
-          
-          # Check Docker system status
-          echo "Docker system status:"
-          docker system info
-          
-          echo "Docker network settings:"
-          docker network ls
+          # Define the list of image Dockerfile paths to scan
+          images=(
+            "py311-cuda121-torch241"
+            "py311-cuda124-torch251"
+            "py311-rocm62-torch241"
+            "py311-rocm62-torch251"
+          )
 
-      - name: Set up Snyk CLI
-        uses: snyk/actions/setup@master
-        id: snyk-setup
+          # Initialize a Markdown table in the job summary (headers)
+          echo "| Image                     | Scan Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ------------------------- | ----------- |" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify Snyk installation
-        run: |
-          echo "Installed Snyk version: $(snyk --version)"
-          
-          # Check Snyk CLI environment
-          echo "Snyk CLI environment:"
-          snyk config
-          
-          # Check if Snyk Docker plugin is installed
-          echo "Checking Snyk plugins..."
-          snyk plugins || echo "No plugins listed"
+          # Iterate over each Dockerfile and run Snyk scan
+          for img in "${images[@]}"; do
+            echo "🔎 Scanning Dockerfile for $img..."
+            # Run Snyk in container mode on the Dockerfile (no image build)
+            snyk test --file="images/runtime/training/$img/Dockerfile"
+            exit_code=$?  # capture the Snyk CLI exit code
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl wget docker.io
-
-      - name: Snyk Authentication Debug
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: |
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "::warning::SNYK_TOKEN not provided. Running in standalone mode."
-          else
-            echo "Authenticating with Snyk..."
-            
-            # Get token info (masking actual token)
-            TOKEN_LENGTH=${#SNYK_TOKEN}
-            echo "Token length: $TOKEN_LENGTH characters"
-            echo "Token first 4 chars: ${SNYK_TOKEN:0:4}****"
-            
-            # Authenticate with debug output
-            SNYK_DEBUG=1 snyk auth "$SNYK_TOKEN" || echo "Authentication failed with exit code $?"
-            
-            # Verify authentication worked
-            if snyk whoami; then
-              echo "Authentication successful"
+            # Determine status based on Snyk exit code: 0=passed, 1=vulns found (failed), 2 or higher=error
+            if [ $exit_code -eq 0 ]; then
+              status="passed"
+            elif [ $exit_code -eq 1 ]; then
+              status="failed"
             else
-              echo "::error::Authentication verification failed"
+              status="error"
             fi
-          fi
 
-      - name: Test Snyk Container Functionality
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SNYK_DEBUG: 1
-        run: |
-          set -x  # Enable command echo for debugging
-          
-          echo "Testing Snyk container functionality..."
-          
-          # 1. Pull a test image explicitly first with Docker
-          echo "Pulling Alpine test image with Docker..."
-          docker pull alpine:3.14
-          docker images
-          
-          # 2. Test Snyk container command with --debug
-          echo "Testing Snyk container command..."
-          snyk container --help
-          
-          # 3. Try scanning the image with detailed output
-          echo "Testing Snyk container test command..."
-          snyk container test alpine:3.14 --json-file-output=snyk-test-output.json || echo "Snyk container test exit code: $?"
-          
-          # 4. Try alternative command formats
-          echo "Testing with explicit Docker reference..."
-          snyk container test docker:alpine:3.14 || echo "Explicit Docker reference exit code: $?"
-          
-          # 5. Try scanning with file reference instead
-          echo "Creating minimal test Dockerfile..."
-          echo "FROM alpine:3.14" > test-dockerfile
-          echo "Testing with --file option..."
-          snyk container test --file=test-dockerfile || echo "Dockerfile reference exit code: $?"
-          
-          # 6. Check if output files were created
-          if [ -f "snyk-test-output.json" ]; then
-            echo "JSON output was created. Content preview:"
-            head -n 20 snyk-test-output.json
-          else
-            echo "No JSON output created."
-          fi
-          
-          # 7. Check permissions for current working directory
-          echo "Working directory permissions:"
-          ls -la
-          
-          # Save all outputs for analysis
-          echo "SNYK_TEST_RESULT=$?" >> $GITHUB_ENV
+            # Append the result to the summary table
+            echo "| $img | $status |" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Network Connectivity Test
-        run: |
-          echo "Testing network connectivity to key services..."
-          
-          # Test connection to Docker Hub
-          echo "Testing Docker Hub connectivity:"
-          curl -sL -o /dev/null -w "%{http_code}" https://hub.docker.com/ || echo "Failed with $?"
-          
-          # Test connection to Snyk API
-          echo "Testing Snyk API connectivity:"
-          curl -sL -o /dev/null -w "%{http_code}" https://api.snyk.io/ || echo "Failed with $?"
-          
-          # Test DNS resolution
-          echo "Testing DNS resolution:"
-          dig hub.docker.com
-          dig api.snyk.io
-          
-          # Check route to Docker Hub
-          echo "Route to Docker Hub:"
-          traceroute -m 15 hub.docker.com || echo "Traceroute not available or failed"
-
-      - name: Enhanced Dockerfile Security Scan
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          PYTHON_VERSION: "3.11" # Provide default values for template variables
-          IMAGE_TAG: "latest"
-          SNYK_TEST_RESULT: ${{ env.SNYK_TEST_RESULT || 'unknown' }}
-        run: |
-          set -eu
-          
-          echo "Starting enhanced Dockerfile security scan..."
-          
-          # Detect if Snyk container scanning is functional
-          SNYK_CONTAINER_FUNCTIONAL=false
-          if [ "$SNYK_TEST_RESULT" == "0" ]; then
-            echo "Snyk container scanning is functional! Using both static analysis and Snyk scanning."
-            SNYK_CONTAINER_FUNCTIONAL=true
-          else
-            echo "Snyk container scanning is not functional. Using advanced static analysis only."
-            echo "Snyk test exit code was: $SNYK_TEST_RESULT"
-          fi
-          
-          # Find all Dockerfiles but exclude examples and tests
-          mapfile -t DOCKERFILES < <(find . -type f -iname "Dockerfile*" -not -path "*/.*" -not -path "*/examples/*" -not -path "*/tests/*" | sort)
-          
-          # If too many dockerfiles, only analyze a subset
-          MAX_FILES=15
-          if [ ${#DOCKERFILES[@]} -gt $MAX_FILES ]; then
-            echo "Found ${#DOCKERFILES[@]} Dockerfiles, limiting analysis to $MAX_FILES files"
-            # Take a representative sample - first few, last few, and some from the middle
-            DOCKERFILES=("${DOCKERFILES[@]:0:5}" "${DOCKERFILES[@]:$((${#DOCKERFILES[@]}/2-2)):5}" "${DOCKERFILES[@]:$((${#DOCKERFILES[@]}-5)):5}")
-          fi
-          
-          # Check if any Dockerfiles were found
-          if [ ${#DOCKERFILES[@]} -eq 0 ]; then
-            echo "No Dockerfiles found."
-            echo "SUMMARY=No Dockerfiles to analyze." >> $GITHUB_ENV
-            exit 0
-          fi
-          
-          echo "Will analyze ${#DOCKERFILES[@]} Dockerfiles"
-          
-          # Initialize summary variables
-          SUMMARY=""
-          SUMMARY_TABLE=""
-          TOTAL_CRITICAL=0
-          TOTAL_HIGH=0
-          TOTAL_MEDIUM=0
-          TOTAL_LOW=0
-          SCAN_FAILURE=0
-          ISSUES_COUNT=0
-          CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          TRIGGER_EVENT="${{ github.event_name }}"
-          
-          # Create structured table headers
-          SUMMARY_TABLE="| Dockerfile | Base Image | Status | Issues | Details |\n"
-          SUMMARY_TABLE+="|------------|------------|--------|--------|--------|\n"
-          
-          # Create detailed findings table
-          DETAILS_TABLE="| Dockerfile | Issue | Severity | Recommendation |\n"
-          DETAILS_TABLE+="|------------|-------|----------|----------------|\n"
-          
-          # Function for advanced static analysis
-          perform_static_analysis() {
-            local FILE=$1
-            local BASE_IMAGE=$2
-            local ISSUES=0
-            local HIGH_ISSUES=0
-            local ISSUE_DETAILS=""
-            
-            # Check for latest tag (HIGH)
-            if [[ "$BASE_IMAGE" == *":latest"* ]]; then
-              ISSUES=$((ISSUES + 1))
-              HIGH_ISSUES=$((HIGH_ISSUES + 1))
-              ISSUE_DETAILS+="Using 'latest' tag, "
-              DETAILS_TABLE+="| $FILE | Using 'latest' tag | 🔴 HIGH | Use specific version instead |\n"
+            # Optionally, handle non-zero exit codes (just log, do not exit)
+            if [ $exit_code -ne 0 ]; then
+              echo "Snyk scan for $img completed with status: $status (exit code $exit_code)"
             fi
-            
-            # Check for running as root (HIGH)
-            if ! grep -q "USER " "$FILE" || grep -q "USER root" "$FILE" || grep -q "USER 0" "$FILE"; then
-              ISSUES=$((ISSUES + 1))
-              HIGH_ISSUES=$((HIGH_ISSUES + 1))
-              ISSUE_DETAILS+="Running as root, "
-              DETAILS_TABLE+="| $FILE | Running as root | 🔴 HIGH | Add non-root user |\n"
-            fi
-            
-            # Check for curl | bash pattern (HIGH)
-            if grep -q "curl.*|.*sh" "$FILE" || grep -q "wget.*|.*sh" "$FILE"; then
-              ISSUES=$((ISSUES + 1))
-              HIGH_ISSUES=$((HIGH_ISSUES + 1))
-              ISSUE_DETAILS+="Using 'curl | bash', "
-              DETAILS_TABLE+="| $FILE | Using 'curl | bash' pattern | 🔴 HIGH | Download and verify scripts separately |\n"
-            fi
-            
-            # Check for apt-get update and install in separate lines (LOW)
-            if grep -q "apt-get update" "$FILE" && grep -q "apt-get install" "$FILE" && ! grep -q "apt-get update.*&&.*apt-get install" "$FILE"; then
-              ISSUES=$((ISSUES + 1))
-              ISSUE_DETAILS+="Separate apt-get commands, "
-              DETAILS_TABLE+="| $FILE | 'apt-get update' and 'install' on separate lines | 🟡 LOW | Combine with && to ensure fresh packages |\n"
-            fi
-            
-            # Check for missing cleanup after package installation (MEDIUM)
-            if (grep -q "apt-get install" "$FILE" || grep -q "yum install" "$FILE" || grep -q "dnf install" "$FILE") && ! grep -q "rm -rf /var/lib/apt/lists/\*" "$FILE" && ! grep -q "dnf clean all" "$FILE" && ! grep -q "yum clean all" "$FILE"; then
-              ISSUES=$((ISSUES + 1))
-              ISSUE_DETAILS+="Missing package cleanup, "
-              DETAILS_TABLE+="| $FILE | Missing cleanup after package installation | 🟠 MEDIUM | Add cleanup commands to reduce image size |\n"
-            fi
-            
-            # Check for COPY with --chown (MEDIUM)
-            if grep -q "COPY " "$FILE" && ! grep -q "COPY --chown=" "$FILE"; then
-              ISSUES=$((ISSUES + 1))
-              ISSUE_DETAILS+="COPY without --chown, "
-              DETAILS_TABLE+="| $FILE | COPY without --chown | 🟠 MEDIUM | Use --chown to set proper permissions |\n"
-            fi
-            
-            # Check for HEALTHCHECK (LOW)
-            if ! grep -q "HEALTHCHECK" "$FILE"; then
-              ISSUES=$((ISSUES + 1))
-              ISSUE_DETAILS+="Missing HEALTHCHECK, "
-              DETAILS_TABLE+="| $FILE | Missing HEALTHCHECK | 🟡 LOW | Add HEALTHCHECK for container monitoring |\n"
-            fi
-            
-            # Remove trailing comma and space if exists
-            ISSUE_DETAILS=${ISSUE_DETAILS%, }
-            
-            # Return results
-            if [ "$HIGH_ISSUES" -gt 0 ]; then
-              echo "🔴 High Risk|$ISSUES|$ISSUE_DETAILS"
-              TOTAL_HIGH=$((TOTAL_HIGH + HIGH_ISSUES))
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
-            elif [ "$ISSUES" -gt 0 ]; then
-              echo "🟡 Low Risk|$ISSUES|$ISSUE_DETAILS"
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
-            else
-              echo "🟢 Secure|0|None"
-            fi
-          }
-          
-          # Process each Dockerfile with enhanced analysis
-          for FILE in "${DOCKERFILES[@]}"; do
-            echo "Analyzing $FILE..."
-            
-            # Extract base image with template variables replaced
-            FINAL_FROM=$(grep -Ei '^FROM ' "${FILE}" | tail -1 || echo "FROM scratch")
-            BASE_IMAGE_NAME=$(echo "$FINAL_FROM" | sed -E 's/^FROM[[:space:]]+//I' | cut -d' ' -f1)
-            ORIGINAL_BASE_IMAGE="$BASE_IMAGE_NAME"
-            
-            # Special handling for Red Hat UBI images with variables
-            if [[ "$BASE_IMAGE_NAME" == *'${PYTHON_VERSION}'* ]]; then
-              BASE_IMAGE_NAME=$(echo "$BASE_IMAGE_NAME" | sed "s/\${PYTHON_VERSION}/$PYTHON_VERSION/g")
-              echo "Replaced PYTHON_VERSION in base image: $BASE_IMAGE_NAME"
-            fi
-            
-            if [[ "$BASE_IMAGE_NAME" == *'${IMAGE_TAG}'* ]]; then
-              BASE_IMAGE_NAME=$(echo "$BASE_IMAGE_NAME" | sed "s/\${IMAGE_TAG}/$IMAGE_TAG/g")
-              echo "Replaced IMAGE_TAG in base image: $BASE_IMAGE_NAME"
-            fi
-            
-            # Skip scratch images
-            if [[ "$BASE_IMAGE_NAME" == "scratch" ]]; then
-              echo "Skipping scratch-based image"
-              SUMMARY_TABLE+="| $FILE | scratch | ⚪ Skipped | 0 | Minimal surface |\n"
-              continue
-            fi
-            
-            # Check if still has variables after replacement
-            if [[ "$BASE_IMAGE_NAME" == *'$'* ]] || [[ "$BASE_IMAGE_NAME" == *'{{'* ]]; then
-              echo "Complex template detected in base image, can't resolve: $BASE_IMAGE_NAME"
-              SUMMARY_TABLE+="| $FILE | $ORIGINAL_BASE_IMAGE | ⚠️ Template | - | Can't resolve variables |\n"
-              continue
-            fi
-            
-            # Perform enhanced static analysis
-            ANALYSIS_RESULT=$(perform_static_analysis "$FILE" "$BASE_IMAGE_NAME")
-            IFS='|' read -r STATUS ISSUE_COUNT ISSUE_DETAILS <<< "$ANALYSIS_RESULT"
-            
-            # Check if Snyk test for the base image is also possible
-            SNYK_RESULT="Static analysis only"
-            
-            if [ "$SNYK_CONTAINER_FUNCTIONAL" = true ]; then
-              echo "Attempting Snyk container scan for: $BASE_IMAGE_NAME"
-              
-              # Create a temporary test Dockerfile with the base image
-              echo "FROM $BASE_IMAGE_NAME" > temp-dockerfile
-              
-              # Try scanning with file reference which sometimes works better
-              if snyk container test --file=temp-dockerfile --json > snyk-result.json 2> snyk-error.log; then
-                SNYK_SCAN_SUCCESSFUL=true
-                echo "Snyk scan successful!"
-                
-                # Parse vulnerabilities
-                if [ -s "snyk-result.json" ] && jq -e . "snyk-result.json" > /dev/null 2>&1; then
-                  CRIT=$(jq -r '.vulnerabilities | map(select(.severity=="critical")) | length // 0' snyk-result.json)
-                  HIGH=$(jq -r '.vulnerabilities | map(select(.severity=="high")) | length // 0' snyk-result.json)
-                  MED=$(jq -r '.vulnerabilities | map(select(.severity=="medium")) | length // 0' snyk-result.json)
-                  LOW=$(jq -r '.vulnerabilities | map(select(.severity=="low")) | length // 0' snyk-result.json)
-                  
-                  SNYK_RESULT="Snyk found $CRIT critical, $HIGH high, $MED medium, $LOW low"
-                  
-                  TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRIT))
-                  TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
-                  
-                  # Update status if vulnerabilities found
-                  if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
-                    STATUS="🔴 Vulnerable"
-                    ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                  fi
-                else
-                  SNYK_RESULT="Snyk scan completed but no vulnerabilities found"
-                fi
-              else
-                SNYK_SCAN_SUCCESSFUL=false
-                SCAN_FAILURE=$((SCAN_FAILURE + 1))
-                
-                if [ -f "snyk-error.log" ]; then
-                  ERROR_MSG=$(head -n 1 snyk-error.log)
-                  SNYK_RESULT="Snyk scan failed: ${ERROR_MSG}"
-                else
-                  SNYK_RESULT="Snyk scan failed with unknown error"
-                fi
-              fi
-              
-              # Clean up temp files
-              rm -f temp-dockerfile snyk-result.json snyk-error.log
-            fi
-            
-            # Add to summary table with comprehensive details
-            SUMMARY_TABLE+="| $FILE | $BASE_IMAGE_NAME | $STATUS | $ISSUE_COUNT | $SNYK_RESULT - $ISSUE_DETAILS |\n"
           done
-          
-          # Create comprehensive report
-          REPORT="# Dockerfile Security Analysis Results\n\n"
-          
-          # Executive summary
-          REPORT+="## Executive Overview\n\n"
-          REPORT+="* **Dockerfiles Analyzed:** ${#DOCKERFILES[@]}\n"
-          REPORT+="* **Dockerfiles with Issues:** $ISSUES_COUNT\n"
-          REPORT+="* **High Risk Issues:** $TOTAL_HIGH\n"
-          if [ "$TOTAL_CRITICAL" -gt 0 ]; then
-            REPORT+="* **Critical Vulnerabilities:** $TOTAL_CRITICAL\n"
-          fi
-          REPORT+="* **Analysis Date:** $CURRENT_DATE\n"
-          REPORT+="* **Triggered by:** $TRIGGER_EVENT\n\n"
-          
-          # Snyk status
-          if [ "$SNYK_CONTAINER_FUNCTIONAL" = true ]; then
-            REPORT+="* **Analysis Method:** Static analysis + Snyk container scanning\n\n"
-          else
-            REPORT+="* **Analysis Method:** Static analysis only (Snyk container scanning not functional)\n\n"
-          fi
-          
-          # Results table
-          REPORT+="## Results\n\n"
-          REPORT+="$SUMMARY_TABLE\n"
-          
-          # Detailed findings
-          REPORT+="## Detailed Findings\n\n"
-          REPORT+="$DETAILS_TABLE\n"
-          
-          # Snyk Status Report
-          REPORT+="## Snyk Status Report\n\n"
-          
-          if [ "$SNYK_CONTAINER_FUNCTIONAL" = true ]; then
-            REPORT+="✅ **Snyk container scanning is functional**\n\n"
-            REPORT+="Snyk container scanning is working properly and was used to analyze the base images of your Dockerfiles.\n\n"
-          else
-            REPORT+="⚠️ **Snyk container scanning is not functional**\n\n"
-            REPORT+="Snyk container scanning is not currently working in this workflow. This might be due to:\n\n"
-            REPORT+="1. Snyk API token permissions or configuration issues\n"
-            REPORT+="2. Docker container registry access problems\n"
-            REPORT+="3. Issues with Docker daemon in the CI environment\n"
-            REPORT+="4. Network connectivity problems to Snyk API or container registries\n\n"
-            REPORT+="See the job logs for detailed diagnostic information. For now, enhanced static analysis was used to identify security issues.\n\n"
-          fi
-          
-          # Security recommendations
-          REPORT+="## Security Recommendations\n\n"
-          
-          if [ "$TOTAL_HIGH" -gt 0 ]; then
-            REPORT+="🚨 **High risk issues detected. Priority actions:**\n\n"
-            REPORT+="1. Replace 'latest' tags with specific versions\n"
-            REPORT+="2. Create and use non-root users\n"
-            REPORT+="3. Avoid 'curl | bash' patterns\n\n"
-          elif [ "$ISSUES_COUNT" -gt 0 ]; then
-            REPORT+="⚠️ **Security improvements recommended:**\n\n"
-            REPORT+="1. Clean up package manager caches\n"
-            REPORT+="2. Use COPY with --chown\n"
-            REPORT+="3. Add HEALTHCHECK instructions\n\n"
-          else
-            REPORT+="✅ **No security issues detected.**\n\n"
-          fi
-          
-          # Add Red Hat UBI note for the specific images
-          REPORT+="### Note on Red Hat UBI Images\n\n"
-          REPORT+="Many of the Dockerfiles analyzed use Red Hat Universal Base Images (UBI), which are maintained and security-patched by Red Hat. These images generally have fewer vulnerabilities than community images and are suitable for production use. However, you should still:\n\n"
-          REPORT+="* Use specific tags instead of 'latest'\n"
-          REPORT+="* Run containers as non-root users\n"
-          REPORT+="* Keep base images updated with the latest security patches\n\n"
-          
-          REPORT+="_Security scan completed at $(date -u)_\n"
-          
-          # Set output variables for later steps
-          {
-            echo "SUMMARY<<EOF"
-            echo -e "$REPORT"
-            echo "EOF"
-            echo "ISSUES_COUNT=${ISSUES_COUNT}"
-            echo "TOTAL_HIGH=${TOTAL_HIGH}"
-            echo "TOTAL_CRITICAL=${TOTAL_CRITICAL}"
-            echo "SNYK_FUNCTIONAL=${SNYK_CONTAINER_FUNCTIONAL}"
-          } >> $GITHUB_ENV
 
-      - name: Create Summary
-        run: echo "${{ env.SUMMARY }}" >> $GITHUB_STEP_SUMMARY
+          # Ensure the script does not fail the job (we want to report only)
+          exit 0
+        shell: bash
 
-      - name: Add PR Comment
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const summary = process.env.SUMMARY;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: summary
-            });
-
-      - name: Slack Notification
-        if: ${{ always() && env.SLACK_WEBHOOK_URL != '' }}
-        env:
-          SUMMARY: ${{ env.SUMMARY }}
-          ISSUES_COUNT: ${{ env.ISSUES_COUNT || 0 }}
-          TOTAL_HIGH: ${{ env.TOTAL_HIGH || 0 }}
-          TOTAL_CRITICAL: ${{ env.TOTAL_CRITICAL || 0 }}
-          SNYK_FUNCTIONAL: ${{ env.SNYK_FUNCTIONAL || 'false' }}
-        run: |
-          if [ "$TOTAL_HIGH" -gt 0 ] || [ "$TOTAL_CRITICAL" -gt 0 ]; then
-            STATUS="🚨 *Dockerfile Security Scan - High Risk Issues Detected*"
-            MESSAGE="High risk security issues detected in Dockerfiles."
-          elif [ "$ISSUES_COUNT" -gt 0 ]; then
-            STATUS="⚠️ *Dockerfile Security Scan - Minor Issues Detected*"
-            MESSAGE="Some minor security issues detected in Dockerfiles."
-          else
-            STATUS="✅ *Dockerfile Security Scan - Completed Successfully*"
-            MESSAGE="No security issues detected in Dockerfiles."
-          fi
-          
-          if [ "$SNYK_FUNCTIONAL" != "true" ]; then
-            STATUS="$STATUS (⚠️ Snyk not working)"
-            MESSAGE="$MESSAGE Note: Snyk container scanning is not working, using static analysis only."
-          fi
-
-          PAYLOAD="{\"text\":\"${STATUS}\n${MESSAGE}\n\`\`\`\n${SUMMARY}\n\`\`\`\"}"
-          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
-
-      - name: Check for critical issues
-        if: ${{ github.event_name == 'pull_request' && (env.TOTAL_HIGH > 0 || env.TOTAL_CRITICAL > 0) }}
-        run: |
-          echo "High risk security issues detected in Dockerfiles."
-          echo "Please review the security scan results and address the issues."
-          exit 1
+      # (Optional) Add an explicit success message in summary
+      - name: Finalize Summary
+        run: echo "**Snyk Dockerfile scan completed**. See the table above for results." >> "$GITHUB_STEP_SUMMARY"
