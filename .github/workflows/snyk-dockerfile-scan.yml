@@ -1,49 +1,62 @@
 # .github/workflows/snyk-dockerfile-scan.yml
+# -------------------------------------------------
+#  Snyk scan for training-runtime Dockerfiles
+#  • Runs nightly, on every push to main (for testing), and on fork-PRs once
+#    a maintainer labels the PR with `run-snyk-scan`.
+#  • Performs *static* Dockerfile scans (no image builds).
+#  • Extracts the base image from each Dockerfile and supplies it to Snyk
+#    because `snyk container test` requires an image argument.
+#  • Does not fail the workflow; results are reported in the job summary.
+# -------------------------------------------------
+
 name: Snyk Dockerfile Scan
 
 on:
   schedule:
-    - cron: '0 3 * * *'
-  push:  # <-- Trigger on every push (for testing purposes)
-    branches:
-      - main
+    - cron: '0 3 * * *'          # nightly 03:00 UTC
+  push:                           # trigger on every push to main (testing)
+    branches: [main]
     paths:
       - '**/Dockerfile*'
       - '.github/workflows/snyk-dockerfile-scan.yml'
-  pull_request_target:
+  pull_request_target:            # trigger on fork PRs when label added
     types: [labeled]
 
 jobs:
   snyk-dockerfile-scan:
-    name: Snyk Dockerfile Scan
     runs-on: ubuntu-latest
+    name: Snyk Dockerfile Scan
 
-    # Run for scheduled, push events, or labeled PRs from forks
+    # Run for: cron, push, or labeled PR
     if: |
       github.event_name == 'schedule' ||
-      github.event_name == 'push' ||
+      github.event_name == 'push'     ||
       (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Check out code (for schedule and push)
+      # Checkout appropriate ref
+      - name: Checkout (schedule / push)
         if: ${{ github.event_name == 'schedule' || github.event_name == 'push' }}
         uses: actions/checkout@v3
 
-      - name: Check out PR code (for labeled fork PR)
+      - name: Checkout PR code (labeled fork PR)
         if: ${{ github.event_name == 'pull_request_target' }}
         uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      # Install Snyk CLI
       - name: Install Snyk CLI
         run: npm install -g snyk
 
+      # Run scans
       - name: Run Snyk scans on Dockerfiles
+        shell: bash
         run: |
-          set +e
+          set +e   # keep going even if individual scans fail
 
           images=(
             "py311-cuda121-torch241"
@@ -56,17 +69,34 @@ jobs:
           echo "| ------------------------- | ----------- |" >> "$GITHUB_STEP_SUMMARY"
 
           for img in "${images[@]}"; do
-            echo "🔎 Scanning Dockerfile for $img..."
-            snyk container test --file="images/runtime/training/$img/Dockerfile"
+            dockerfile="images/runtime/training/$img/Dockerfile"
+            echo "🔎  Scanning $dockerfile"
+
+            # Verify the Dockerfile exists
+            if [[ ! -f "$dockerfile" ]]; then
+              echo "❌  Dockerfile not found: $dockerfile"
+              echo "| $img | missing |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            # Extract the last FROM line’s image (handles multi-stage builds)
+            base_image=$(grep -Ei '^FROM ' "$dockerfile" | tail -1 | awk '{print $2}')
+
+            # If the base image cannot be resolved, skip
+            if [[ -z "$base_image" || "$base_image" == *'${'* || "$base_image" == *'$'* ]]; then
+              echo "⚠️  Skipping $img – unresolved base image ($base_image)"
+              echo "| $img | skipped |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            # Run Snyk scan
+            snyk container test "$base_image" --file="$dockerfile"
             exit_code=$?
 
-            if [ $exit_code -eq 0 ]; then
-              status="passed"
-            elif [ $exit_code -eq 1 ]; then
-              status="failed"
-            else
-              status="error"
-            fi
+            # Map Snyk exit code to status
+            if   [ $exit_code -eq 0 ]; then status="passed"
+            elif [ $exit_code -eq 1 ]; then status="failed"
+            else                           status="error"; fi
 
             echo "| $img | $status |" >> "$GITHUB_STEP_SUMMARY"
 
@@ -75,8 +105,8 @@ jobs:
             fi
           done
 
+          # Always succeed so we’re purely informational
           exit 0
-        shell: bash
 
       - name: Finalize Summary
-        run: echo "**Snyk Dockerfile scan completed**. See the table above for results." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "**Snyk Dockerfile scan completed – see table above for results.**" >> "$GITHUB_STEP_SUMMARY"
