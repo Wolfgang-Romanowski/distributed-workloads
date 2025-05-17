@@ -2,9 +2,8 @@
 name: Snyk Dockerfile Scan
 
 on:
-  # Nightly trigger at 2:00 AM UTC
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 3 * * *'
   # Trigger on pull requests (from forks) when a label is added
   pull_request_target:
     types: [labeled]   # Only run when a PR is labeled (used for fork PRs to allow secrets)
