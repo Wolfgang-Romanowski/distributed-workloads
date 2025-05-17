@@ -33,8 +33,29 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Install Snyk CLI
-        run: npm install -g snyk
+      - name: Setup Snyk
+        run: |
+          # Install latest Snyk CLI 
+          npm install -g snyk
+          
+          # Verify installation and auth
+          snyk --version
+          
+          # Check if SNYK_TOKEN is set
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::warning::SNYK_TOKEN is not set. Please add this secret to your repository."
+            exit 1
+          fi
+          
+          # Authenticate with Snyk
+          echo "Authenticating with Snyk..."
+          snyk auth $SNYK_TOKEN
+
+      - name: Check Snyk CLI help
+        run: |
+          # Check available commands and options to ensure we're using correct syntax
+          snyk container test --help
+          snyk iac test --help
 
       - name: Scan Dockerfiles with Snyk
         shell: bash
@@ -58,6 +79,12 @@ jobs:
               continue
             fi
 
+            echo "Processing Dockerfile: $df"
+            
+            # Debug: print Dockerfile content
+            echo "Dockerfile content (first 10 lines):"
+            head -10 "$df"
+
             # Resolve template variables
             PY=$PY_DEF; TAG=$TAG_DEF
             arg_py=$(grep -E '^ARG[[:space:]]+PYTHON_VERSION=' "$df" | tail -1 | cut -d'=' -f2)
@@ -69,26 +96,36 @@ jobs:
             base=${base//\$\{PYTHON_VERSION\}/$PY}
             base=${base//\$\{IMAGE_TAG\}/$TAG}
 
-            # Try container test mode first
-            mode="container"
-            echo "Scanning $img as container with base image: $base"
-            output=$(snyk container test --remote "$base" --file="$df" 2>&1)
+            echo "Resolved base image: $base"
+
+            # Try using Snyk official Docker image scan first (simplest approach)
+            mode="dockerfile"
+            echo "Scanning $img using dockerfile mode..."
+            output=$(snyk dockerfile test "$df" 2>&1)
             rc=$?
 
-            # If container scan bombs (rc >=2), fall back to IaC scan
+            # If that fails, try standard container scan
+            if [[ $rc -ge 2 ]]; then
+              mode="container"
+              echo "Falling back to container scan mode for $img..."
+              output=$(snyk container test "$base" --file="$df" 2>&1)
+              rc=$?
+            fi
+
+            # If container scan fails, try IaC as last resort
             if [[ $rc -ge 2 ]]; then
               mode="iac"
-              echo "Falling back to IaC scanning for $img"
-              output=$(snyk iac test "$df" --severity-threshold=high 2>&1)
+              echo "Falling back to IaC scan mode for $img..."
+              output=$(snyk iac test "$df" 2>&1)
               rc=$?
             fi
 
             # Analyze results
-            if   [[ $rc -eq 0 ]]; then 
+            if [[ $rc -eq 0 ]]; then 
               status="✅ passed"
               vulns="0"
             elif [[ $rc -eq 1 ]]; then 
-              status="❌ failed"
+              status="❌ vulnerabilities"
               # Try to extract vulnerability count
               count=$(echo "$output" | grep -o '[0-9]* vulnerable' | head -1 | cut -d' ' -f1)
               if [[ $count ]]; then
@@ -99,18 +136,15 @@ jobs:
             else
               status="⚠️ error"
               vulns="-"
+              # Print the output to help diagnose the issue
+              echo "Error output from Snyk for $img:"
+              echo "$output"
             fi
 
             echo "| $img | $mode | $status | $vulns |" >> "$GITHUB_STEP_SUMMARY"
             
-            # Save detailed output to file for debugging
-            echo "### Output for $img ($mode):" > "/tmp/${img}_output.txt"
-            echo "$output" >> "/tmp/${img}_output.txt"
-            
-            # Print status to console
-            if [[ $rc -ne 0 ]]; then
-              echo "↳ $img via $mode ended with status '$status' (exit $rc)"
-            fi
+            # Log short summary to console
+            echo "Result for $img via $mode: $status (exit $rc)"
           done
 
           exit 0  # never fail workflow; purely informational
@@ -119,3 +153,4 @@ jobs:
         run: |
           echo "**Snyk Dockerfile scan complete – see table above.**" >> "$GITHUB_STEP_SUMMARY"
           echo "Note: This workflow is in reporting mode only and will not fail PR checks." >> "$GITHUB_STEP_SUMMARY"
+          echo "If all scans failed with errors, ensure your SNYK_TOKEN is valid and has appropriate permissions." >> "$GITHUB_STEP_SUMMARY"
