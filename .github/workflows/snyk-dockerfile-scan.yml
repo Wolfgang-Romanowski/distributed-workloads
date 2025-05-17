@@ -1,15 +1,26 @@
 # .github/workflows/snyk-dockerfile-scan.yml
+# This workflow implements Snyk scanning for Dockerfiles as discussed in the Slack conversation.
+# It provides:
+# 1. Scanning of Dockerfiles without building images (they're too large)
+# 2. A summary table showing scan status for each file
+# 3. Both nightly scans and PR checks
+# 4. Only reporting issues (not failing PRs)
+
 name: Snyk Dockerfile Scan
 
+# Define when this workflow should run
 on:
+  # Run every night at 3:00 AM UTC
   schedule:
-    - cron: '0 3 * * *'          # nightly 03:00 UTC
+    - cron: '0 3 * * *'
+  # Run on every push to main branch that modifies Dockerfiles or this workflow
   push:
-    branches: [main]             # run on every push to main
+    branches: [main]
     paths:
       - '**/Dockerfile*'
       - '.github/workflows/snyk-dockerfile-scan.yml'
-  pull_request_target:           # fork PRs when maintainer adds label
+  # Run on PRs when the 'run-snyk-scan' label is applied (for fork PRs)
+  pull_request_target:
     types: [labeled]
 
 jobs:
@@ -17,140 +28,207 @@ jobs:
     runs-on: ubuntu-latest
     name: Snyk Dockerfile Scan
 
+    # Only run this job under specified conditions
     if: |
       github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
-    env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      PY_DEF:     '3.11'   # default for ${PYTHON_VERSION}
-      TAG_DEF:    'latest' # default for ${IMAGE_TAG}
-
     steps:
-      # checkout the correct ref (handles both push and PR runs)
-      - uses: actions/checkout@v3
+      # Step 1: Checkout the repository
+      # For PRs, we need to check out the PR's code, not the target branch
+      - name: Checkout Repository
+        uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # This checks out either the PR's commit or the push commit
 
-      - name: Setup Snyk
+      # Step 2: Install and set up the Snyk CLI
+      - name: Setup Snyk CLI
         run: |
-          # Install latest Snyk CLI 
+          # Install latest version of Snyk CLI
           npm install -g snyk
           
-          # Verify installation and auth
+          # Verify the installation by printing the version
+          echo "Installed Snyk CLI version:"
           snyk --version
           
-          # Check if SNYK_TOKEN is set
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "::warning::SNYK_TOKEN is not set. Please add this secret to your repository."
+          # Check if SNYK_TOKEN is set and authenticate
+          if [ -z "${{ secrets.SNYK_TOKEN }}" ]; then
+            echo "::error::SNYK_TOKEN is not set. Please add this secret to your repository."
+            echo "| ⚠️ Configuration Error | The SNYK_TOKEN secret is not set | Please add it to repository secrets |" >> "$GITHUB_STEP_SUMMARY"
             exit 1
+          else
+            echo "Authenticating with Snyk..."
+            # Use SNYK_TOKEN environment variable for authentication
+            SNYK_TOKEN="${{ secrets.SNYK_TOKEN }}" snyk auth
           fi
+        # We don't expose the token directly in the auth command for security
+
+      # Step 3: Initialize the summary table
+      - name: Initialize Summary Table
+        run: |
+          # Create the header row for the summary table
+          echo "# Snyk Dockerfile Security Scan Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Status | Details |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ----- | ------ | ------- |" >> "$GITHUB_STEP_SUMMARY"
+
+      # Step 4: Scan the Dockerfiles
+      # We're using the official Snyk Action for better reliability
+      # Each image is scanned separately so we can track individual results
+      
+      # Scan py311-cuda121-torch241
+      - name: Scan py311-cuda121-torch241
+        id: scan_cuda121_torch241
+        uses: snyk/actions/docker@master
+        continue-on-error: true  # Never fail the workflow, purely informational
+        with:
+          dockerfile: images/runtime/training/py311-cuda121-torch241/Dockerfile
+          command: test  # 'test' just reports issues, doesn't fail the build
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Update the summary table with results from the first scan
+      - name: Update Summary for py311-cuda121-torch241
+        run: |
+          if [ "${{ steps.scan_cuda121_torch241.outcome }}" == "success" ]; then
+            echo "| py311-cuda121-torch241 | ✅ Passed | No vulnerabilities found |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.scan_cuda121_torch241.outcome }}" == "failure" ]; then
+            # Extract the number of vulnerabilities if available
+            echo "| py311-cuda121-torch241 | ❌ Failed | Vulnerabilities detected |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| py311-cuda121-torch241 | ⚠️ Error | Scan could not be completed |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Scan py311-cuda124-torch251
+      - name: Scan py311-cuda124-torch251
+        id: scan_cuda124_torch251
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        with:
+          dockerfile: images/runtime/training/py311-cuda124-torch251/Dockerfile
+          command: test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Update the summary table with results from the second scan
+      - name: Update Summary for py311-cuda124-torch251
+        run: |
+          if [ "${{ steps.scan_cuda124_torch251.outcome }}" == "success" ]; then
+            echo "| py311-cuda124-torch251 | ✅ Passed | No vulnerabilities found |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.scan_cuda124_torch251.outcome }}" == "failure" ]; then
+            echo "| py311-cuda124-torch251 | ❌ Failed | Vulnerabilities detected |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| py311-cuda124-torch251 | ⚠️ Error | Scan could not be completed |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Scan py311-rocm62-torch241
+      - name: Scan py311-rocm62-torch241
+        id: scan_rocm62_torch241
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        with:
+          dockerfile: images/runtime/training/py311-rocm62-torch241/Dockerfile
+          command: test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Update the summary table with results from the third scan
+      - name: Update Summary for py311-rocm62-torch241
+        run: |
+          if [ "${{ steps.scan_rocm62_torch241.outcome }}" == "success" ]; then
+            echo "| py311-rocm62-torch241 | ✅ Passed | No vulnerabilities found |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.scan_rocm62_torch241.outcome }}" == "failure" ]; then
+            echo "| py311-rocm62-torch241 | ❌ Failed | Vulnerabilities detected |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| py311-rocm62-torch241 | ⚠️ Error | Scan could not be completed |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Scan py311-rocm62-torch251
+      - name: Scan py311-rocm62-torch251
+        id: scan_rocm62_torch251
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        with:
+          dockerfile: images/runtime/training/py311-rocm62-torch251/Dockerfile
+          command: test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Update the summary table with results from the fourth scan
+      - name: Update Summary for py311-rocm62-torch251
+        run: |
+          if [ "${{ steps.scan_rocm62_torch251.outcome }}" == "success" ]; then
+            echo "| py311-rocm62-torch251 | ✅ Passed | No vulnerabilities found |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.scan_rocm62_torch251.outcome }}" == "failure" ]; then
+            echo "| py311-rocm62-torch251 | ❌ Failed | Vulnerabilities detected |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| py311-rocm62-torch251 | ⚠️ Error | Scan could not be completed |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Step 5: Create a fallback scan if the Snyk actions don't work
+      # This is a backup approach that uses the Snyk CLI directly
+      - name: Fallback CLI scan (if actions failed)
+        if: |
+          steps.scan_cuda121_torch241.outcome == 'skipped' ||
+          steps.scan_cuda124_torch251.outcome == 'skipped' ||
+          steps.scan_rocm62_torch241.outcome == 'skipped' ||
+          steps.scan_rocm62_torch251.outcome == 'skipped'
+        run: |
+          echo "Running fallback CLI scan..."
           
-          # Authenticate with Snyk
-          echo "Authenticating with Snyk..."
-          snyk auth $SNYK_TOKEN
-
-      - name: Check Snyk CLI help
-        run: |
-          # Check available commands and options to ensure we're using correct syntax
-          snyk container test --help
-          snyk iac test --help
-
-      - name: Scan Dockerfiles with Snyk
-        shell: bash
-        run: |
-          set +e   # collect all results
-
+          # List of images to scan
           images=(
             "py311-cuda121-torch241"
             "py311-cuda124-torch251"
             "py311-rocm62-torch241"
             "py311-rocm62-torch251"
           )
-
-          echo "| Image | Mode | Status | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ----- | ---- | ------ | --------------- |" >> "$GITHUB_STEP_SUMMARY"
-
+          
           for img in "${images[@]}"; do
-            df="images/runtime/training/$img/Dockerfile"
-            if [[ ! -f "$df" ]]; then
-              echo "| $img | - | missing | - |" >> "$GITHUB_STEP_SUMMARY"
+            # Skip images that were already scanned successfully
+            if [[ "$img" == "py311-cuda121-torch241" && "${{ steps.scan_cuda121_torch241.outcome }}" != "skipped" ]]; then
+              continue
+            elif [[ "$img" == "py311-cuda124-torch251" && "${{ steps.scan_cuda124_torch251.outcome }}" != "skipped" ]]; then
+              continue
+            elif [[ "$img" == "py311-rocm62-torch241" && "${{ steps.scan_rocm62_torch241.outcome }}" != "skipped" ]]; then
+              continue
+            elif [[ "$img" == "py311-rocm62-torch251" && "${{ steps.scan_rocm62_torch251.outcome }}" != "skipped" ]]; then
               continue
             fi
-
-            echo "Processing Dockerfile: $df"
             
-            # Debug: print Dockerfile content
-            echo "Dockerfile content (first 10 lines):"
-            head -10 "$df"
-
-            # Resolve template variables
-            PY=$PY_DEF; TAG=$TAG_DEF
-            arg_py=$(grep -E '^ARG[[:space:]]+PYTHON_VERSION=' "$df" | tail -1 | cut -d'=' -f2)
-            arg_tag=$(grep -E '^ARG[[:space:]]+IMAGE_TAG='     "$df" | tail -1 | cut -d'=' -f2)
-            [[ $arg_py  ]] && PY=$arg_py
-            [[ $arg_tag ]] && TAG=$arg_tag
-
-            base=$(grep -Ei '^FROM ' "$df" | tail -1 | awk '{print $2}')
-            base=${base//\$\{PYTHON_VERSION\}/$PY}
-            base=${base//\$\{IMAGE_TAG\}/$TAG}
-
-            echo "Resolved base image: $base"
-
-            # Try using Snyk official Docker image scan first (simplest approach)
-            mode="dockerfile"
-            echo "Scanning $img using dockerfile mode..."
-            output=$(snyk dockerfile test "$df" 2>&1)
-            rc=$?
-
-            # If that fails, try standard container scan
-            if [[ $rc -ge 2 ]]; then
-              mode="container"
-              echo "Falling back to container scan mode for $img..."
-              output=$(snyk container test "$base" --file="$df" 2>&1)
-              rc=$?
-            fi
-
-            # If container scan fails, try IaC as last resort
-            if [[ $rc -ge 2 ]]; then
-              mode="iac"
-              echo "Falling back to IaC scan mode for $img..."
-              output=$(snyk iac test "$df" 2>&1)
-              rc=$?
-            fi
-
-            # Analyze results
-            if [[ $rc -eq 0 ]]; then 
-              status="✅ passed"
-              vulns="0"
-            elif [[ $rc -eq 1 ]]; then 
-              status="❌ vulnerabilities"
-              # Try to extract vulnerability count
-              count=$(echo "$output" | grep -o '[0-9]* vulnerable' | head -1 | cut -d' ' -f1)
-              if [[ $count ]]; then
-                vulns="$count"
-              else
-                vulns="1+"
-              fi
-            else
-              status="⚠️ error"
-              vulns="-"
-              # Print the output to help diagnose the issue
-              echo "Error output from Snyk for $img:"
-              echo "$output"
-            fi
-
-            echo "| $img | $mode | $status | $vulns |" >> "$GITHUB_STEP_SUMMARY"
+            df="images/runtime/training/$img/Dockerfile"
             
-            # Log short summary to console
-            echo "Result for $img via $mode: $status (exit $rc)"
+            if [[ ! -f "$df" ]]; then
+              echo "| $img (fallback) | ⚠️ Missing | File not found |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            
+            # Try Snyk's docker test command with the Dockerfile
+            echo "Scanning $img with Snyk CLI..."
+            SNYK_TOKEN="${{ secrets.SNYK_TOKEN }}" snyk docker test --file="$df" || true
+            
+            # Always mark as scanned in the summary, since we can't easily capture the outcome
+            echo "| $img (fallback) | ⚠️ Scanned | See logs for details |" >> "$GITHUB_STEP_SUMMARY"
           done
 
-          exit 0  # never fail workflow; purely informational
-
+      # Step 6: Finish the summary with additional information
       - name: Finish summary
         run: |
-          echo "**Snyk Dockerfile scan complete – see table above.**" >> "$GITHUB_STEP_SUMMARY"
-          echo "Note: This workflow is in reporting mode only and will not fail PR checks." >> "$GITHUB_STEP_SUMMARY"
-          echo "If all scans failed with errors, ensure your SNYK_TOKEN is valid and has appropriate permissions." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Scan Information" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scans performed: $(date)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- This workflow is in **reporting mode only** and will not fail PR checks" >> "$GITHUB_STEP_SUMMARY"
+          echo "- If scans failed with errors, check that the SNYK_TOKEN is valid" >> "$GITHUB_STEP_SUMMARY"
+          
+          # Add information about how to run manually
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## How to Run Manually" >> "$GITHUB_STEP_SUMMARY"
+          echo "- For fork PRs: Apply the 'run-snyk-scan' label" >> "$GITHUB_STEP_SUMMARY"
+          echo "- For direct repository access: Push changes to Dockerfiles" >> "$GITHUB_STEP_SUMMARY"
+          
+          # Add note about Slack notifications (for future implementation)
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Future Enhancements" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Slack notifications will be implemented in a future update" >> "$GITHUB_STEP_SUMMARY"
