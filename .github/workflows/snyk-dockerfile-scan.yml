@@ -47,19 +47,18 @@ jobs:
           echo "| Image | Status | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ----- | ------ | --------------- |" >> "$GITHUB_STEP_SUMMARY"
 
-      # Step 3: Use snyk/actions-scan-and-follow-workflow action which is specifically designed for scanning
-      - name: Scan Dockerfiles with Snyk
-        uses: snyk/actions-scan-and-follow-workflow@master
-        with:
-          target: '.'
-          args: --severity-threshold=high
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      # Step 4: Custom scan using docker run (which properly handles authentication)
-      - name: Scan Dockerfiles Individually
+      # Step 3: Set up Snyk using the official action
+      - name: Setup Snyk
+        uses: snyk/actions/setup@master
+      
+      # Step 4: Test each Dockerfile using Docker run to avoid token issues
+      - name: Scan Dockerfiles
         run: |
+          # List of Dockerfiles to scan
           IMAGES=("py311-cuda121-torch241" "py311-cuda124-torch251" "py311-rocm62-torch241" "py311-rocm62-torch251")
+          
+          # Pull the Snyk Docker image to use for scanning
+          docker pull snyk/snyk:docker
           
           for img in "${IMAGES[@]}"; do
             df="images/runtime/training/$img/Dockerfile"
@@ -70,32 +69,33 @@ jobs:
             
             echo "Scanning $img Dockerfile..."
             
-            # Use Docker to run Snyk CLI (this handles authentication better than direct CLI)
-            SCAN_OUTPUT=$(docker run --rm -e SNYK_TOKEN=${{ secrets.SNYK_TOKEN }} \
-              -v "$(pwd):/app" -w /app \
+            # Using Docker to run Snyk avoids token encoding issues
+            # Mount the current directory and pass the token directly
+            OUTPUT=$(docker run --rm \
+              -e SNYK_TOKEN="${{ secrets.SNYK_TOKEN }}" \
+              -v "$(pwd):/app" \
+              -w /app \
               snyk/snyk:docker \
-              test --docker --file="$df" --json || true)
+              test --file="$df" 2>&1) || SCAN_STATUS=$?
             
-            # Check if output is valid JSON (successful scan)
-            if echo "$SCAN_OUTPUT" | jq . > /dev/null 2>&1; then
+            # Process the result
+            if [[ "$SCAN_STATUS" == "0" ]]; then
+              echo "| $img | ✅ Passed | No vulnerabilities found |" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$SCAN_STATUS" == "1" ]]; then
               # Try to extract vulnerability count
-              VULN_COUNT=$(echo "$SCAN_OUTPUT" | jq '.vulnerabilities | length')
-              
-              if [[ "$VULN_COUNT" == "0" || "$VULN_COUNT" == "null" ]]; then
-                echo "| $img | ✅ Passed | No vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
-              else
-                # Extract high and critical vulnerabilities
-                HIGH_VULN=$(echo "$SCAN_OUTPUT" | jq '[.vulnerabilities[] | select(.severity == "high")] | length')
-                CRITICAL_VULN=$(echo "$SCAN_OUTPUT" | jq '[.vulnerabilities[] | select(.severity == "critical")] | length')
-                
-                if [[ "$HIGH_VULN" == "null" ]]; then HIGH_VULN=0; fi
-                if [[ "$CRITICAL_VULN" == "null" ]]; then CRITICAL_VULN=0; fi
-                
-                echo "| $img | ⚠️ Warning | $VULN_COUNT total ($HIGH_VULN high, $CRITICAL_VULN critical) |" >> "$GITHUB_STEP_SUMMARY"
+              VULN_COUNT=$(echo "$OUTPUT" | grep -o "[0-9]\+ vulnerable dependency" | head -1 | awk '{print $1}')
+              if [[ -z "$VULN_COUNT" ]]; then
+                VULN_COUNT="Unknown"
               fi
+              echo "| $img | ⚠️ Warning | $VULN_COUNT vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "| $img | ⚠️ No Results | Could not scan with Snyk |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| $img | ❌ Error | Scan failed |" >> "$GITHUB_STEP_SUMMARY"
             fi
+            
+            # Output full results to logs for reference
+            echo "=== Scan results for $img ==="
+            echo "$OUTPUT"
+            echo "==========================="
           done
 
       # Step 5: Finish summary
@@ -110,15 +110,9 @@ jobs:
           echo "## Understanding Results" >> "$GITHUB_STEP_SUMMARY"
           echo "- **✅ Passed:** No vulnerabilities or issues detected" >> "$GITHUB_STEP_SUMMARY"
           echo "- **⚠️ Warning:** Issues found but not critical for operation" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **❌ Failed:** Scan encountered errors or critical issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **❌ Error:** Scan encountered errors or critical issues" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Next Steps" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Review any warnings or failures" >> "$GITHUB_STEP_SUMMARY"
-          echo "- For detailed vulnerability information, view the job logs" >> "$GITHUB_STEP_SUMMARY"
           echo "- This workflow is in reporting mode only and will not fail PR checks" >> "$GITHUB_STEP_SUMMARY"
-          
-          # Add a placeholder for Slack integration (to be implemented later)
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Future Enhancements" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Slack notifications will be implemented to send results to a dedicated channel" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Future enhancement: Slack notifications will be implemented" >> "$GITHUB_STEP_SUMMARY"
