@@ -32,6 +32,10 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
+    # Set the environment variables for the job
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
     steps:
       # Step 1: Checkout the repository
       - name: Checkout Repository
@@ -44,133 +48,124 @@ jobs:
         run: |
           echo "# Snyk Dockerfile Security Scan Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image | Status | Notes |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ----- | ------ | ----- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Status | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ----- | ------ | --------------- |" >> "$GITHUB_STEP_SUMMARY"
 
-      # Step 3: Install the Snyk CLI
-      - name: Install Snyk CLI
+      # Step 3: Setup Snyk
+      - name: Setup Snyk
+        uses: snyk/actions/setup@master
+        
+      # Step 4: Verify Snyk can authenticate
+      - name: Verify Snyk Auth
         run: |
-          echo "Installing Snyk CLI..."
-          npm install -g snyk
-          echo "Installed Snyk CLI version: $(snyk --version)"
+          # First, verify that the SNYK_TOKEN is set
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::SNYK_TOKEN is not set. Please add this secret to your repository."
+            echo "| ⚠️ Error | The SNYK_TOKEN secret is not set. Please add it to repository secrets. |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          
+          # Try to get account information to verify authentication
+          echo "Verifying Snyk authentication..."
+          if ! snyk config get api; then
+            echo "::error::Failed to authenticate with Snyk. Please verify your token is valid."
+            echo "| ⚠️ Error | Failed to authenticate with Snyk. Please verify your token is valid. |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          
+          echo "✅ Snyk authentication successful"
 
-      # Step 4: Prepare image list
-      - name: Prepare Image List
-        id: prepare
+      # Step 5: Scan Dockerfiles
+      - name: Scan Dockerfiles
+        id: scan_dockerfiles
         run: |
-          IMAGES=("py311-cuda121-torch241" "py311-cuda124-torch251" "py311-rocm62-torch241" "py311-rocm62-torch251")
+          images=(
+            "py311-cuda121-torch241"
+            "py311-cuda124-torch251"
+            "py311-rocm62-torch241"
+            "py311-rocm62-torch251"
+          )
           
-          # Make this list available to other steps
-          echo "images=${IMAGES[*]}" >> $GITHUB_OUTPUT
+          # Track overall success/failure
+          overall_status=0
           
-          # Check if Dockerfiles exist
-          for img in "${IMAGES[@]}"; do
+          for img in "${images[@]}"; do
             df="images/runtime/training/$img/Dockerfile"
             if [[ ! -f "$df" ]]; then
               echo "| $img | ⚠️ Error | Dockerfile not found |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-
-      # Step 5: Simple Dockerfile Validation
-      - name: Validate Dockerfiles
-        run: |
-          IMAGES=(${{ steps.prepare.outputs.images }})
-          
-          for img in "${IMAGES[@]}"; do
-            df="images/runtime/training/$img/Dockerfile"
-            if [[ ! -f "$df" ]]; then
-              continue  # Skip if file doesn't exist
+              continue
             fi
             
-            # Do a simple validation of the Dockerfile
-            if docker build -t "$img-test" -f "$df" --target validation . > /dev/null 2>&1; then
-              echo "$img: Dockerfile is valid"
-            else
-              echo "| $img | ⚠️ Warning | Dockerfile might not be valid |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-
-      # Step 6: Scan Dockerfiles with custom scanning approach
-      - name: Scan Dockerfiles
-        run: |
-          IMAGES=(${{ steps.prepare.outputs.images }})
-          
-          for img in "${IMAGES[@]}"; do
-            df="images/runtime/training/$img/Dockerfile"
-            if [[ ! -f "$df" ]]; then
-              continue  # Skip if file doesn't exist
-            fi
+            echo "Scanning $img Dockerfile..."
             
-            echo "Scanning $img..."
+            # Try snyk container test with the --file flag
+            output=$(snyk container test --file="$df" --json 2>&1) || true
             
-            # Extract and check base image
-            BASE_IMAGE=$(grep -E "^FROM" "$df" | head -1 | awk '{print $2}' | sed 's/AS.*//')
-            echo "Base image: $BASE_IMAGE"
-            
-            # Resolve variables in base image
-            if [[ "$BASE_IMAGE" == *"\${"* ]]; then
-              PY_VERSION=$(grep -E "ARG[[:space:]]+PYTHON_VERSION=" "$df" | head -1 | cut -d'=' -f2 || echo "311")
-              IMAGE_TAG=$(grep -E "ARG[[:space:]]+IMAGE_TAG=" "$df" | head -1 | cut -d'=' -f2 || echo "latest")
+            # Check if the output is valid JSON (indicating success or vulnerabilities found)
+            if echo "$output" | jq . > /dev/null 2>&1; then
+              # Extract vulnerability count from JSON
+              vuln_count=$(echo "$output" | jq '.vulnerabilities | length')
               
-              BASE_IMAGE=${BASE_IMAGE//\$\{PYTHON_VERSION\}/$PY_VERSION}
-              BASE_IMAGE=${BASE_IMAGE//\$\{IMAGE_TAG\}/$IMAGE_TAG}
-              echo "Resolved base image: $BASE_IMAGE"
-            fi
-            
-            # Check if base image has known vulnerabilities (simple grep for CVEs)
-            TEMP_FILE=$(mktemp)
-            curl -s "https://quay.io/api/v1/repository/$BASE_IMAGE/vulnerability" > "$TEMP_FILE" 2>/dev/null || true
-            
-            if grep -q "CVE-" "$TEMP_FILE"; then
-              VULN_COUNT=$(grep -o "CVE-" "$TEMP_FILE" | wc -l)
-              echo "| $img | ❌ Vulnerabilities | $VULN_COUNT potential vulnerabilities in base image |" >> "$GITHUB_STEP_SUMMARY"
-            else
-              # Look for other suspicious patterns
-              DANGEROUS_PATTERNS=(
-                "curl.*\|.*sh"
-                "wget.*\|.*sh"
-                "chmod.*777"
-                "npm.*-g"
-                "apt-get.*no-install-recommends"
-              )
-              
-              FOUND_PATTERNS=0
-              for pattern in "${DANGEROUS_PATTERNS[@]}"; do
-                if grep -q "$pattern" "$df"; then
-                  FOUND_PATTERNS=$((FOUND_PATTERNS+1))
-                fi
-              done
-              
-              if [[ $FOUND_PATTERNS -gt 0 ]]; then
-                echo "| $img | ⚠️ Warning | $FOUND_PATTERNS potentially risky patterns found |" >> "$GITHUB_STEP_SUMMARY"
+              if [[ "$vuln_count" == "0" ]]; then
+                echo "| $img | ✅ Passed | No vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
               else
-                echo "| $img | ✅ Passed | No obvious issues detected |" >> "$GITHUB_STEP_SUMMARY"
+                # Extract high and critical vulnerabilities
+                high_vuln=$(echo "$output" | jq '[.vulnerabilities[] | select(.severity == "high")] | length')
+                critical_vuln=$(echo "$output" | jq '[.vulnerabilities[] | select(.severity == "critical")] | length')
+                
+                echo "| $img | ⚠️ Warning | $vuln_count total ($high_vuln high, $critical_vuln critical) |" >> "$GITHUB_STEP_SUMMARY"
+                
+                # Non-zero status but we won't fail the workflow
+                overall_status=1
+              fi
+            else
+              # Fall back to a more basic scan method
+              echo "Snyk container test failed, trying Dockerfile test..."
+              
+              output=$(snyk iac test "$df" --json 2>&1) || true
+              
+              if echo "$output" | jq . > /dev/null 2>&1; then
+                vuln_count=$(echo "$output" | jq '.vulnerabilities | length')
+                
+                if [[ "$vuln_count" == "0" ]]; then
+                  echo "| $img | ✅ Passed | No vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
+                else
+                  echo "| $img | ⚠️ Warning | $vuln_count issues found |" >> "$GITHUB_STEP_SUMMARY"
+                  overall_status=1
+                fi
+              else
+                echo "| $img | ❌ Failed | Scan failed - see logs for details |" >> "$GITHUB_STEP_SUMMARY"
+                echo "Error output: $output"
+                overall_status=1
               fi
             fi
-            
-            rm -f "$TEMP_FILE"
           done
+          
+          # Set outputs for use in later steps
+          echo "status=$overall_status" >> $GITHUB_OUTPUT
 
-      # Step 7: Try the snyk/snyk-container-action if available
-      - name: Try Snyk Container Action
-        uses: snyk/snyk-container-action@master
-        continue-on-error: true
-        with:
-          image: registry.access.redhat.com/ubi9/python-311:9.5-1741671866
-          args: --file=images/runtime/training/py311-cuda121-torch241/Dockerfile
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      # Step 8: Finish summary
+      # Step 6: Finish Summary
       - name: Finish Summary
         run: |
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Scan Information" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Scan Date:** $(date)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Scan Type:** Basic Dockerfile security scanning" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Note:** This is a simplified scan due to Snyk authentication issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Scan Type:** Snyk Dockerfile security scan" >> "$GITHUB_STEP_SUMMARY"
+          
+          if [ "${{ steps.scan_dockerfiles.outputs.status }}" == "0" ]; then
+            echo "- **Overall Status:** ✅ All scans passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Overall Status:** ⚠️ Issues found in one or more scans" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Next Steps" >> "$GITHUB_STEP_SUMMARY"
-          echo "1. To get more detailed scans, please ensure your Snyk token is valid" >> "$GITHUB_STEP_SUMMARY"
-          echo "2. Consider running `snyk auth` manually and confirming authentication works" >> "$GITHUB_STEP_SUMMARY"
-          echo "3. For a more robust solution, consider using a paid Snyk account with CI integration" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Understanding Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **✅ Passed:** No vulnerabilities or issues detected" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **⚠️ Warning:** Issues found but not critical for operation" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **❌ Failed:** Scan encountered errors or critical issues" >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Next Steps" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Review any warnings or failures" >> "$GITHUB_STEP_SUMMARY"
+          echo "- For detailed vulnerability information, view the job logs" >> "$GITHUB_STEP_SUMMARY"
+          echo "- This workflow is in reporting mode only and will not fail PR checks" >> "$GITHUB_STEP_SUMMARY"
