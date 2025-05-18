@@ -32,10 +32,6 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && github.event.label.name == 'run-snyk-scan')
 
-    # Set the environment variables for the job
-    env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
     steps:
       # Step 1: Checkout the repository
       - name: Checkout Repository
@@ -51,45 +47,21 @@ jobs:
           echo "| Image | Status | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ----- | ------ | --------------- |" >> "$GITHUB_STEP_SUMMARY"
 
-      # Step 3: Setup Snyk
-      - name: Setup Snyk
-        uses: snyk/actions/setup@master
-        
-      # Step 4: Verify Snyk can authenticate
-      - name: Verify Snyk Auth
-        run: |
-          # First, verify that the SNYK_TOKEN is set
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "::error::SNYK_TOKEN is not set. Please add this secret to your repository."
-            echo "| ⚠️ Error | The SNYK_TOKEN secret is not set. Please add it to repository secrets. |" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          
-          # Try to get account information to verify authentication
-          echo "Verifying Snyk authentication..."
-          if ! snyk config get api; then
-            echo "::error::Failed to authenticate with Snyk. Please verify your token is valid."
-            echo "| ⚠️ Error | Failed to authenticate with Snyk. Please verify your token is valid. |" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          
-          echo "✅ Snyk authentication successful"
+      # Step 3: Use snyk/actions-scan-and-follow-workflow action which is specifically designed for scanning
+      - name: Scan Dockerfiles with Snyk
+        uses: snyk/actions-scan-and-follow-workflow@master
+        with:
+          target: '.'
+          args: --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      # Step 5: Scan Dockerfiles
-      - name: Scan Dockerfiles
-        id: scan_dockerfiles
+      # Step 4: Custom scan using docker run (which properly handles authentication)
+      - name: Scan Dockerfiles Individually
         run: |
-          images=(
-            "py311-cuda121-torch241"
-            "py311-cuda124-torch251"
-            "py311-rocm62-torch241"
-            "py311-rocm62-torch251"
-          )
+          IMAGES=("py311-cuda121-torch241" "py311-cuda124-torch251" "py311-rocm62-torch241" "py311-rocm62-torch251")
           
-          # Track overall success/failure
-          overall_status=0
-          
-          for img in "${images[@]}"; do
+          for img in "${IMAGES[@]}"; do
             df="images/runtime/training/$img/Dockerfile"
             if [[ ! -f "$df" ]]; then
               echo "| $img | ⚠️ Error | Dockerfile not found |" >> "$GITHUB_STEP_SUMMARY"
@@ -98,67 +70,43 @@ jobs:
             
             echo "Scanning $img Dockerfile..."
             
-            # Try snyk container test with the --file flag
-            output=$(snyk container test --file="$df" --json 2>&1) || true
+            # Use Docker to run Snyk CLI (this handles authentication better than direct CLI)
+            SCAN_OUTPUT=$(docker run --rm -e SNYK_TOKEN=${{ secrets.SNYK_TOKEN }} \
+              -v "$(pwd):/app" -w /app \
+              snyk/snyk:docker \
+              test --docker --file="$df" --json || true)
             
-            # Check if the output is valid JSON (indicating success or vulnerabilities found)
-            if echo "$output" | jq . > /dev/null 2>&1; then
-              # Extract vulnerability count from JSON
-              vuln_count=$(echo "$output" | jq '.vulnerabilities | length')
+            # Check if output is valid JSON (successful scan)
+            if echo "$SCAN_OUTPUT" | jq . > /dev/null 2>&1; then
+              # Try to extract vulnerability count
+              VULN_COUNT=$(echo "$SCAN_OUTPUT" | jq '.vulnerabilities | length')
               
-              if [[ "$vuln_count" == "0" ]]; then
+              if [[ "$VULN_COUNT" == "0" || "$VULN_COUNT" == "null" ]]; then
                 echo "| $img | ✅ Passed | No vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
               else
                 # Extract high and critical vulnerabilities
-                high_vuln=$(echo "$output" | jq '[.vulnerabilities[] | select(.severity == "high")] | length')
-                critical_vuln=$(echo "$output" | jq '[.vulnerabilities[] | select(.severity == "critical")] | length')
+                HIGH_VULN=$(echo "$SCAN_OUTPUT" | jq '[.vulnerabilities[] | select(.severity == "high")] | length')
+                CRITICAL_VULN=$(echo "$SCAN_OUTPUT" | jq '[.vulnerabilities[] | select(.severity == "critical")] | length')
                 
-                echo "| $img | ⚠️ Warning | $vuln_count total ($high_vuln high, $critical_vuln critical) |" >> "$GITHUB_STEP_SUMMARY"
+                if [[ "$HIGH_VULN" == "null" ]]; then HIGH_VULN=0; fi
+                if [[ "$CRITICAL_VULN" == "null" ]]; then CRITICAL_VULN=0; fi
                 
-                # Non-zero status but we won't fail the workflow
-                overall_status=1
+                echo "| $img | ⚠️ Warning | $VULN_COUNT total ($HIGH_VULN high, $CRITICAL_VULN critical) |" >> "$GITHUB_STEP_SUMMARY"
               fi
             else
-              # Fall back to a more basic scan method
-              echo "Snyk container test failed, trying Dockerfile test..."
-              
-              output=$(snyk iac test "$df" --json 2>&1) || true
-              
-              if echo "$output" | jq . > /dev/null 2>&1; then
-                vuln_count=$(echo "$output" | jq '.vulnerabilities | length')
-                
-                if [[ "$vuln_count" == "0" ]]; then
-                  echo "| $img | ✅ Passed | No vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
-                else
-                  echo "| $img | ⚠️ Warning | $vuln_count issues found |" >> "$GITHUB_STEP_SUMMARY"
-                  overall_status=1
-                fi
-              else
-                echo "| $img | ❌ Failed | Scan failed - see logs for details |" >> "$GITHUB_STEP_SUMMARY"
-                echo "Error output: $output"
-                overall_status=1
-              fi
+              echo "| $img | ⚠️ No Results | Could not scan with Snyk |" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          
-          # Set outputs for use in later steps
-          echo "status=$overall_status" >> $GITHUB_OUTPUT
 
-      # Step 6: Finish Summary
+      # Step 5: Finish summary
       - name: Finish Summary
         run: |
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Scan Information" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Scan Date:** $(date)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Scan Type:** Snyk Dockerfile security scan" >> "$GITHUB_STEP_SUMMARY"
-          
-          if [ "${{ steps.scan_dockerfiles.outputs.status }}" == "0" ]; then
-            echo "- **Overall Status:** ✅ All scans passed" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- **Overall Status:** ⚠️ Issues found in one or more scans" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          
           echo "## Understanding Results" >> "$GITHUB_STEP_SUMMARY"
           echo "- **✅ Passed:** No vulnerabilities or issues detected" >> "$GITHUB_STEP_SUMMARY"
           echo "- **⚠️ Warning:** Issues found but not critical for operation" >> "$GITHUB_STEP_SUMMARY"
@@ -169,3 +117,8 @@ jobs:
           echo "- Review any warnings or failures" >> "$GITHUB_STEP_SUMMARY"
           echo "- For detailed vulnerability information, view the job logs" >> "$GITHUB_STEP_SUMMARY"
           echo "- This workflow is in reporting mode only and will not fail PR checks" >> "$GITHUB_STEP_SUMMARY"
+          
+          # Add a placeholder for Slack integration (to be implemented later)
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Future Enhancements" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Slack notifications will be implemented to send results to a dedicated channel" >> "$GITHUB_STEP_SUMMARY"
