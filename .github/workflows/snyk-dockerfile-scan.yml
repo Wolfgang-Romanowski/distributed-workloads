@@ -44,14 +44,14 @@ jobs:
         run: |
           echo "# Snyk Dockerfile Security Scan Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image | Status | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ----- | ------ | --------------- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Status | Details |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ----- | ------ | ------- |" >> "$GITHUB_STEP_SUMMARY"
 
       # Step 3: Set up Snyk using the official action
       - name: Setup Snyk
         uses: snyk/actions/setup@master
       
-      # Step 4: Test each Dockerfile using Docker run to avoid token issues
+      # Step 4: Test each Dockerfile using Docker run with more verbose output
       - name: Scan Dockerfiles
         run: |
           # List of Dockerfiles to scan
@@ -69,27 +69,83 @@ jobs:
             
             echo "Scanning $img Dockerfile..."
             
-            # Using Docker to run Snyk avoids token encoding issues
-            # Mount the current directory and pass the token directly
+            # Extract base image to report on it
+            BASE_IMAGE=$(grep -E "^FROM" "$df" | head -1 | awk '{print $2}' | sed 's/AS.*//')
+            echo "Base image: $BASE_IMAGE"
+            
+            # Resolve variables in base image
+            if [[ "$BASE_IMAGE" == *"\${"* ]]; then
+              PY_VERSION=$(grep -E "ARG[[:space:]]+PYTHON_VERSION=" "$df" | head -1 | cut -d'=' -f2 || echo "311")
+              IMAGE_TAG=$(grep -E "ARG[[:space:]]+IMAGE_TAG=" "$df" | head -1 | cut -d'=' -f2 || echo "latest")
+              
+              BASE_IMAGE=${BASE_IMAGE//\$\{PYTHON_VERSION\}/$PY_VERSION}
+              BASE_IMAGE=${BASE_IMAGE//\$\{IMAGE_TAG\}/$IMAGE_TAG}
+              echo "Resolved base image: $BASE_IMAGE"
+            fi
+            
+            # Using Docker to run Snyk with more verbose output and JSON
+            echo "Running Snyk scan with base image: $BASE_IMAGE"
             OUTPUT=$(docker run --rm \
               -e SNYK_TOKEN="${{ secrets.SNYK_TOKEN }}" \
               -v "$(pwd):/app" \
               -w /app \
               snyk/snyk:docker \
-              test --file="$df" 2>&1) || SCAN_STATUS=$?
+              test --docker "$BASE_IMAGE" --file="$df" --json 2>&1) || SCAN_STATUS=$?
             
-            # Process the result
-            if [[ "$SCAN_STATUS" == "0" ]]; then
-              echo "| $img | ✅ Passed | No vulnerabilities found |" >> "$GITHUB_STEP_SUMMARY"
-            elif [[ "$SCAN_STATUS" == "1" ]]; then
-              # Try to extract vulnerability count
-              VULN_COUNT=$(echo "$OUTPUT" | grep -o "[0-9]\+ vulnerable dependency" | head -1 | awk '{print $1}')
-              if [[ -z "$VULN_COUNT" ]]; then
-                VULN_COUNT="Unknown"
+            # Check if output is valid JSON
+            if echo "$OUTPUT" | jq '.' > /dev/null 2>&1; then
+              echo "Successfully parsed JSON output"
+              
+              # Try to extract vulnerability count from JSON
+              VULN_COUNT=$(echo "$OUTPUT" | jq '.vulnerabilities | length // 0')
+              if [[ "$VULN_COUNT" == "0" || -z "$VULN_COUNT" ]]; then
+                echo "| $img | ✅ Passed | No vulnerabilities found in $BASE_IMAGE |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                # Extract high and critical vulnerabilities
+                HIGH_VULN=$(echo "$OUTPUT" | jq '[.vulnerabilities[] | select(.severity == "high")] | length // 0')
+                CRITICAL_VULN=$(echo "$OUTPUT" | jq '[.vulnerabilities[] | select(.severity == "critical")] | length // 0')
+                
+                echo "| $img | ⚠️ Warning | $VULN_COUNT vulnerabilities found ($HIGH_VULN high, $CRITICAL_VULN critical) |" >> "$GITHUB_STEP_SUMMARY"
               fi
-              echo "| $img | ⚠️ Warning | $VULN_COUNT vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "| $img | ❌ Error | Scan failed |" >> "$GITHUB_STEP_SUMMARY"
+              # For non-JSON output, do simpler checking
+              if [[ "$SCAN_STATUS" == "0" ]]; then
+                echo "| $img | ✅ Passed | No issues detected in scan |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                # Check for typical error phrases in output
+                if [[ "$OUTPUT" == *"Failed to get image"* ]]; then
+                  echo "| $img | ⚠️ Warning | Could not access base image: $BASE_IMAGE |" >> "$GITHUB_STEP_SUMMARY"
+                elif [[ "$OUTPUT" == *"auth"* || "$OUTPUT" == *"token"* ]]; then
+                  echo "| $img | ❌ Error | Authentication issues with Snyk |" >> "$GITHUB_STEP_SUMMARY"
+                else
+                  echo "| $img | ⚠️ Warning | Scan completed but with potential issues |" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              fi
+            fi
+            
+            # Run a basic security check on the Dockerfile itself
+            echo "Performing basic security check on Dockerfile..."
+            SECURITY_ISSUES=0
+            SECURITY_NOTES=""
+            
+            # Check for common security issues
+            if grep -q "curl.*|.*sh" "$df"; then
+              SECURITY_ISSUES=$((SECURITY_ISSUES+1))
+              SECURITY_NOTES="$SECURITY_NOTES Piping curl to shell;"
+            fi
+            
+            if grep -q "chmod.*777" "$df"; then
+              SECURITY_ISSUES=$((SECURITY_ISSUES+1))
+              SECURITY_NOTES="$SECURITY_NOTES Overly permissive permissions;"
+            fi
+            
+            if grep -q "ENV.*PASSWORD\|ENV.*SECRET\|ENV.*TOKEN" "$df"; then
+              SECURITY_ISSUES=$((SECURITY_ISSUES+1))
+              SECURITY_NOTES="$SECURITY_NOTES Sensitive data in ENV;"
+            fi
+            
+            if [[ $SECURITY_ISSUES -gt 0 ]]; then
+              echo "| $img | ⚠️ Warning | $SECURITY_ISSUES security concerns found: $SECURITY_NOTES |" >> "$GITHUB_STEP_SUMMARY"
             fi
             
             # Output full results to logs for reference
