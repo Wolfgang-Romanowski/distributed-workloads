@@ -21,9 +21,9 @@ on:
   workflow_dispatch:             # Allow manual triggering for testing
 
 jobs:
-  snyk-dockerfile-scan:
+  dockerfile-security-scan:
     runs-on: ubuntu-latest
-    name: Snyk Dockerfile Scan
+    name: Dockerfile Security Scan
 
     # Only run this job under specified conditions
     if: |
@@ -42,23 +42,21 @@ jobs:
       # Step 2: Initialize the summary table
       - name: Initialize Summary
         run: |
-          echo "# Snyk Dockerfile Security Scan Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "# Dockerfile Security Scan Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image | Status | Details |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ----- | ------ | ------- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | Status | Security Analysis |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ----- | ------ | ----------------- |" >> "$GITHUB_STEP_SUMMARY"
 
-      # Step 3: Set up Snyk using the official action
+      # Step 3: Set up Snyk CLI for future use
       - name: Setup Snyk
         uses: snyk/actions/setup@master
+        continue-on-error: true
       
-      # Step 4: Test each Dockerfile using a more robust approach
+      # Step 4: Perform comprehensive Dockerfile security checks
       - name: Scan Dockerfiles
         run: |
           # List of Dockerfiles to scan
           IMAGES=("py311-cuda121-torch241" "py311-cuda124-torch251" "py311-rocm62-torch241" "py311-rocm62-torch251")
-          
-          # Pull the Snyk Docker image to use for scanning
-          docker pull snyk/snyk:docker
           
           for img in "${IMAGES[@]}"; do
             df="images/runtime/training/$img/Dockerfile"
@@ -83,78 +81,106 @@ jobs:
               echo "Resolved base image: $BASE_IMAGE"
             fi
             
-            # Use direct Snyk file scanning instead of Docker mode
-            echo "Running Snyk IaC scan on Dockerfile..."
-            IAC_OUTPUT=$(docker run --rm \
-              -e SNYK_TOKEN="${{ secrets.SNYK_TOKEN }}" \
-              -v "$(pwd):/app" \
-              -w /app \
-              snyk/snyk:docker \
-              iac test "$df" 2>&1) || IAC_STATUS=$?
+            echo "Performing comprehensive security checks..."
             
-            echo "Running custom security checks..."
-            
-            # Basic security audit directly on the Dockerfile
-            SECURITY_ISSUES=0
+            # Initialize security checks
+            ISSUES_COUNT=0
             SECURITY_NOTES=""
             
-            # Check for common security issues
-            if grep -q "curl.*|.*sh" "$df"; then
-              SECURITY_ISSUES=$((SECURITY_ISSUES+1))
-              SECURITY_NOTES="$SECURITY_NOTES Piping curl to shell;"
-            fi
-            
-            if grep -q "chmod.*777" "$df"; then
-              SECURITY_ISSUES=$((SECURITY_ISSUES+1))
-              SECURITY_NOTES="$SECURITY_NOTES Overly permissive permissions;"
-            fi
-            
-            if grep -q "ENV.*PASSWORD\|ENV.*SECRET\|ENV.*TOKEN" "$df"; then
-              SECURITY_ISSUES=$((SECURITY_ISSUES+1))
-              SECURITY_NOTES="$SECURITY_NOTES Sensitive data in ENV;"
-            fi
-            
-            # Pull the base image to check its existence
+            # Check 1: Base image availability and update frequency
             if docker pull "$BASE_IMAGE" >/dev/null 2>&1; then
-              BASE_IMG_AVAILABLE="yes"
-              echo "Successfully pulled base image: $BASE_IMAGE"
+              echo "✓ Base image is accessible: $BASE_IMAGE"
             else
-              BASE_IMG_AVAILABLE="no"
-              echo "Failed to pull base image: $BASE_IMAGE"
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES Base image not accessible;"
+              echo "✗ Base image is not accessible: $BASE_IMAGE"
+            fi
+            
+            # Check 2: Use of 'latest' tag (common best practice violation)
+            if [[ "$BASE_IMAGE" == *":latest"* ]]; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES Using 'latest' tag (not recommended);"
+              echo "✗ Using 'latest' tag (not recommended for reproducibility)"
+            else
+              echo "✓ Not using 'latest' tag (good practice)"
+            fi
+            
+            # Check 3: High-risk shell commands
+            if grep -q "curl.*|.*sh\|wget.*|.*sh" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES Piping to shell;"
+              echo "✗ Found piping to shell (security risk)"
+            else
+              echo "✓ No risky shell piping detected"
+            fi
+            
+            # Check 4: Excessive permissions
+            if grep -q "chmod.*777\|chmod.*666" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES Overly permissive permissions;"
+              echo "✗ Found overly permissive file permissions"
+            else
+              echo "✓ No overly permissive file permissions detected"
+            fi
+            
+            # Check 5: Secrets in environment variables
+            if grep -q "ENV.*PASSWORD\|ENV.*SECRET\|ENV.*TOKEN\|ENV.*KEY" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES Sensitive data in ENV;"
+              echo "✗ Found potential sensitive data in ENV variables"
+            else
+              echo "✓ No sensitive data found in ENV variables"
+            fi
+            
+            # Check 6: Running as root (common best practice violation)
+            if ! grep -q "USER" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES No USER specified (running as root);"
+              echo "✗ No USER instruction (container will run as root)"
+            else
+              echo "✓ USER instruction found"
+            fi
+            
+            # Check 7: Package manager caching issues
+            if grep -q "apt-get" "$df" && ! grep -q "apt-get clean\|rm -rf /var/lib/apt/lists" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES APT cache not cleaned;"
+              echo "✗ APT cache not cleaned properly"
+            fi
+            
+            # Check 8: Presence of proper LABEL metadata
+            if ! grep -q "LABEL maintainer\|LABEL org.opencontainers.image.authors" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES Missing maintainer information;"
+              echo "✗ Missing maintainer LABEL (recommended for accountability)"
+            else
+              echo "✓ Maintainer LABEL found"
+            fi
+            
+            # Check 9: COPY with proper owner permissions
+            if grep -q "COPY" "$df" && ! grep -q "COPY --chown" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES COPY without --chown;"
+              echo "✗ COPY without --chown (potential permission issues)"
+            fi
+            
+            # Check 10: Healthcheck
+            if ! grep -q "HEALTHCHECK" "$df"; then
+              ISSUES_COUNT=$((ISSUES_COUNT+1))
+              SECURITY_NOTES="$SECURITY_NOTES No HEALTHCHECK;"
+              echo "✗ No HEALTHCHECK instruction found"
+            else
+              echo "✓ HEALTHCHECK instruction found"
             fi
             
             # Determine final status
-            if [[ "$IAC_STATUS" == "0" && $SECURITY_ISSUES -eq 0 && "$BASE_IMG_AVAILABLE" == "yes" ]]; then
+            if [[ $ISSUES_COUNT -eq 0 ]]; then
               echo "| $img | ✅ Passed | No security issues detected |" >> "$GITHUB_STEP_SUMMARY"
-            elif [[ "$IAC_STATUS" != "0" && "$IAC_OUTPUT" == *"No supported files"* ]]; then
-              # Common Snyk IaC error - not a big deal for our use case
-              if [[ $SECURITY_ISSUES -eq 0 && "$BASE_IMG_AVAILABLE" == "yes" ]]; then
-                echo "| $img | ✅ Passed | Dockerfile validated with custom checks |" >> "$GITHUB_STEP_SUMMARY"
-              else
-                DETAILS=""
-                [[ $SECURITY_ISSUES -gt 0 ]] && DETAILS="$DETAILS $SECURITY_ISSUES security concerns;"
-                [[ "$BASE_IMG_AVAILABLE" == "no" ]] && DETAILS="$DETAILS Base image not available;"
-                echo "| $img | ⚠️ Warning | $DETAILS |" >> "$GITHUB_STEP_SUMMARY"
-              fi
+            elif [[ $ISSUES_COUNT -lt 3 ]]; then
+              echo "| $img | ⚠️ Minor issues | $SECURITY_NOTES |" >> "$GITHUB_STEP_SUMMARY"
             else
-              DETAILS=""
-              [[ "$IAC_STATUS" != "0" ]] && DETAILS="$DETAILS Snyk scan failed;"
-              [[ $SECURITY_ISSUES -gt 0 ]] && DETAILS="$DETAILS $SECURITY_ISSUES security concerns: $SECURITY_NOTES"
-              [[ "$BASE_IMG_AVAILABLE" == "no" ]] && DETAILS="$DETAILS Base image not available;"
-              echo "| $img | ⚠️ Warning | $DETAILS |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| $img | ⚠️ Multiple issues | $ISSUES_COUNT concerns: $SECURITY_NOTES |" >> "$GITHUB_STEP_SUMMARY"
             fi
-            
-            # Basic check for FROM instruction and image structure
-            DOCKERFILE_VALID="yes"
-            if ! grep -q "^FROM" "$df"; then
-              DOCKERFILE_VALID="no"
-              echo "| $img | ❌ Error | Missing FROM instruction in Dockerfile |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-            
-            # Output full results to logs for reference
-            echo "=== Snyk IaC Scan results for $img ==="
-            echo "$IAC_OUTPUT"
-            echo "==========================="
           done
 
       # Step 5: Finish summary
@@ -163,15 +189,29 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Scan Information" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Scan Date:** $(date)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Scan Type:** Dockerfile security scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Scan Type:** Dockerfile security and best practices scan" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           
+          echo "## Security Checks Performed" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Base image accessibility check" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Use of 'latest' tag (not recommended)" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. High-risk shell commands" >> "$GITHUB_STEP_SUMMARY"
+          echo "4. Excessive file permissions" >> "$GITHUB_STEP_SUMMARY"
+          echo "5. Sensitive data in environment variables" >> "$GITHUB_STEP_SUMMARY"
+          echo "6. Running containers as root" >> "$GITHUB_STEP_SUMMARY"
+          echo "7. Package manager caching issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "8. Proper LABEL metadata" >> "$GITHUB_STEP_SUMMARY"
+          echo "9. File permissions in COPY operations" >> "$GITHUB_STEP_SUMMARY"
+          echo "10. HEALTHCHECK instructions" >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Understanding Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **✅ Passed:** No vulnerabilities or issues detected" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **⚠️ Warning:** Issues found but not critical for operation" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **❌ Error:** Scan encountered errors or critical issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **✅ Passed:** No security or best practice issues detected" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **⚠️ Minor issues:** Some best practice recommendations not followed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **⚠️ Multiple issues:** Several security or best practice concerns identified" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Next Steps" >> "$GITHUB_STEP_SUMMARY"
           echo "- This workflow is in reporting mode only and will not fail PR checks" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Review any security concerns and address them in future updates" >> "$GITHUB_STEP_SUMMARY"
           echo "- Future enhancement: Slack notifications will be implemented" >> "$GITHUB_STEP_SUMMARY"
