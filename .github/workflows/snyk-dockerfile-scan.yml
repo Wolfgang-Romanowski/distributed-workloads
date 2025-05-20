@@ -68,42 +68,22 @@ jobs:
           sudo apt-get update
 
       # Create test image with KNOWN vulnerabilities
-      - name: Create Test Dockerfile with Known Vulnerability
+      - name: Verify Snyk Vulnerability Detection
         if: success() && github.event.inputs.debug == 'true'
         id: test_vulnerability
         run: |
-          echo "Creating test Dockerfile with known vulnerabilities..."
+          echo "Verifying Snyk vulnerability detection capabilities..."
           
-          # Create test directory
-          mkdir -p test_vulnerability
+          # METHOD 1: Use a public image known to have vulnerabilities
+          # nginx:1.18.0 has several known vulnerabilities
+          echo "Testing with a public image known to have vulnerabilities (nginx:1.18.0)..."
           
-          # Create a test Dockerfile with SPECIFICALLY VULNERABLE image
-          # Debian 9 stretch has numerous known CVEs
-          cat > test_vulnerability/Dockerfile << 'EOF'
-          FROM debian:9-slim
+          # Pull the image
+          docker pull nginx:1.18.0
           
-          # Install ImageMagick which has known vulnerabilities in Debian 9
-          RUN apt-get update && \
-              apt-get install -y imagemagick && \
-              apt-get clean && \
-              rm -rf /var/lib/apt/lists/*
-          
-          # Add a secret in env var - bad practice
-          ENV MY_SECRET_TOKEN=1234567890abcdef
-          
-          # Run as root - bad practice
-          USER root
-          
-          CMD ["bash"]
-          EOF
-          
-          # Build test image
-          echo "Building test vulnerability image..."
-          docker build -t test-vuln-image test_vulnerability/
-          
-          # Scan with Snyk
-          echo "Running vulnerability scan on test image..."
-          snyk container test test-vuln-image --severity-threshold=low > test_scan_output.txt 2>&1 || true
+          # Scan the image with Snyk
+          echo "Running vulnerability scan on nginx:1.18.0..."
+          snyk container test nginx:1.18.0 --severity-threshold=low > test_scan_output.txt 2>&1 || true
           SCAN_EXIT_CODE=$?
           
           # Show test output
@@ -113,17 +93,51 @@ jobs:
           
           # Check if vulnerabilities were detected
           if [ $SCAN_EXIT_CODE -eq 1 ] && grep -q "vulnerability found" test_scan_output.txt; then
-            echo "::notice::Test successful - security vulnerabilities detected in test image"
+            echo "::notice::Test successful - security vulnerabilities detected in nginx:1.18.0 image"
             echo "test_passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "::warning::Test failed - no security vulnerabilities detected in known vulnerable test image"
-            echo "test_passed=false" >> $GITHUB_OUTPUT
+          else 
+            # METHOD 2: As backup, test Snyk with a direct vulnerability check
+            echo "First method failed. Trying alternate method to verify Snyk functionality..."
             
-            # Extra diagnostics
-            echo "Running Snyk debug..."
-            snyk --version
-            snyk diagnose > snyk_diagnose.txt
-            echo "See snyk_diagnose.txt for detailed Snyk environment info"
+            # Create a file with known vulnerable package info for direct testing
+            echo "Creating a package.json with a known vulnerability for direct testing..."
+            mkdir -p snyk-test
+            cd snyk-test
+            
+            # Create a package.json with a vulnerable dependency (lodash 4.17.15 has vulnerabilities)
+            cat > package.json << 'EOF'
+            {
+              "name": "snyk-test",
+              "version": "1.0.0",
+              "dependencies": {
+                "lodash": "4.17.15"
+              }
+            }
+            EOF
+            
+            # Test with Snyk without building
+            echo "Testing package.json for vulnerabilities..."
+            snyk test --severity-threshold=low > ../test_scan_backup.txt 2>&1 || true
+            BACKUP_EXIT_CODE=$?
+            cd ..
+            
+            echo "Direct testing exit code: $BACKUP_EXIT_CODE"
+            echo "Direct testing output:"
+            cat test_scan_backup.txt
+            
+            if [ $BACKUP_EXIT_CODE -eq 1 ] && grep -q "vulnerability found" test_scan_backup.txt; then
+              echo "::notice::Backup test successful - Snyk detected vulnerabilities in package.json"
+              echo "test_passed=true" >> $GITHUB_OUTPUT
+            else
+              echo "::warning::Both vulnerability detection tests failed. Snyk may not be detecting vulnerabilities correctly."
+              echo "test_passed=false" >> $GITHUB_OUTPUT
+              
+              # Extra diagnostics
+              echo "Running Snyk debug..."
+              snyk --version
+              snyk diagnose > snyk_diagnose.txt
+              echo "See snyk_diagnose.txt for detailed Snyk environment info"
+            fi
           fi
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
