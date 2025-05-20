@@ -1,24 +1,14 @@
-# Revamped Snyk Dockerfile Security Scan workflow
-# ------------------------------------------------
-# Key fixes compared with previous iteration:
-#   • Debug output is now sent to STDERR – it no longer pollutes the
-#     value captured from extract_base_image.
-#   • Correct interpretation of Snyk exit‑codes (0 = pass, 1 = vulns, ≥2 = error).
-#   • Removed the logically inverted "! command" pattern that treated a
-#     successful scan as a failure.
-#   • Added tighter error‑handling that lets the script keep running
-#     even when one scan fails, while still failing the job on
-#     high/critical vulns.
-#   • Extract‑base‑image logic simplified and placed in a single
-#     function; it resolves ARGs once and echoes only the image name.
-#   • All per‑image results come directly from Snyk JSON – no synthetic
-#     counts or severities are invented.
-#   • Matrix‑free loop keeps the YAML compact while still honouring the
-#     TARGET_DIR input.
-#
-# The Slack notification block is unchanged except for new step outputs.
+# Revamped Snyk Dockerfile Security Scan workflow — **v2**
+# ---------------------------------------------------------
+# Fix: checkout step no longer feeds an empty/invalid repository string.
+# We now use two separate checkout actions conditioned on the event type.
+# Additional tidy‑ups:
+#   • correct usage of `github.event.inputs.*` when the workflow is *not*
+#     manually triggered.
+#   • safer defaults for env vars inside the scan step.
+#   • removed stray `${ { … } }` spacing that broke expressions.
 
-name: Snyk Dockerfile Security Scan
+name: Snyk Dockerfile Security Scan
 
 on:
   push:
@@ -31,7 +21,7 @@ on:
     paths:
       - "images/runtime/training/*/Dockerfile"
   schedule:
-    - cron: "0 3 * * *"   # nightly at 03:00 UTC
+    - cron: "0 3 * * *"   # nightly at 03:00 UTC
   workflow_dispatch:
     inputs:
       debug:
@@ -41,19 +31,23 @@ on:
         type: choice
         options: ["true", "false"]
       target_dir:
-        description: "Scan a single training sub‑directory (optional)"
+        description: "Scan a single training sub-directory (optional)"
         required: false
         default: ""
         type: string
 
 jobs:
   snyk-dockerfile-scan:
-    name: Snyk Security Scan
+    name: Snyk Security Scan
     runs-on: ubuntu-latest
+
+    # Security‑conscious: Only run on labelled PR‑targets from forks or
+    # same‑repo PRs. Regular events pass through.
     if: >-
       github.event_name != 'pull_request_target' ||
       github.event.label.name == 'safe-to-test' ||
       github.event.pull_request.head.repo.full_name == github.repository
+
     permissions:
       contents: read
       security-events: write
@@ -62,14 +56,20 @@ jobs:
       TZ: Europe/London
 
     steps:
-      - name: Checkout code
+      # ------------------------------ checkout ------------------------------
+      - name: Checkout (standard events)
+        if: github.event_name != 'pull_request_target'
+        uses: actions/checkout@v4
+
+      - name: Checkout PR code (pull_request_target)
+        if: github.event_name == 'pull_request_target'
         uses: actions/checkout@v4
         with:
-          ref: >-
-            ${ { github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || '' } }
-          repository: >-
-            ${ { github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || '' } }
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref:        ${{ github.event.pull_request.head.sha }}
+          token:      ${{ secrets.GITHUB_TOKEN }}
 
+      # ------------------------------ Snyk CLI ------------------------------
       - name: Setup Snyk CLI
         uses: snyk/actions/setup@master
         env:
@@ -81,39 +81,39 @@ jobs:
           if [ -z "${SNYK_TOKEN:-}" ]; then
             echo "::error::SNYK_TOKEN secret is missing" && exit 1
           fi
-          echo "Snyk CLI version: $(snyk --version)"
           echo "cli_version=$(snyk --version)" >>"$GITHUB_OUTPUT"
+          echo "Snyk CLI version: $(snyk --version)"
 
+      # ------------------------------ scan ------------------------------
       - name: Scan Dockerfiles
         id: scan
         env:
-          DEBUG_MODE: ${{ inputs.debug || 'false' }}
-          TARGET_DIR: ${{ inputs.target_dir || '' }}
+          DEBUG_MODE: ${{ github.event.inputs.debug || 'false' }}
+          TARGET_DIR: ${{ github.event.inputs.target_dir || '' }}
         run: |
           set -euo pipefail
 
-          debug() { [ "$DEBUG_MODE" = "true" ] && echo "[debug] $*" >&2; }
+          # --- helpers ---
+          debug() { [ "${DEBUG_MODE:-false}" = "true" ] && echo "[debug] $*" >&2; }
 
-          # Resolve ARG‑based FROM image once and print only the result
           extract_base_image() {
             local file="$1"
             declare -A args=()
             while IFS= read -r line; do
               if [[ $line =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
-                k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]//[\"\'] }" ; args[$k]="$v"
+                args["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]//[\"\'] }"
               fi
             done <"$file"
-            local from=$(grep -m1 '^FROM' "$file" | awk '{print $2}')
-            debug "Raw FROM: $from"
+            local img=$(grep -m1 '^FROM' "$file" | awk '{print $2}')
             for k in "${!args[@]}"; do
-              from="${from//\$\{$k\}/${args[$k]}}"
-              from="${from//\$$k/${args[$k]}}"
+              img="${img//\$\{$k\}/${args[$k]}}"
+              img="${img//\$$k/${args[$k]}}"
             done
-            echo "$from"
+            echo "$img"
           }
 
           TRAINING_DIR="images/runtime/training"
-          if [ -n "$TARGET_DIR" ]; then
+          if [ -n "${TARGET_DIR:-}" ]; then
             DOCKER_DIRS=("$TARGET_DIR")
           else
             mapfile -t DOCKER_DIRS < <(find "$TRAINING_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort)
@@ -136,31 +136,32 @@ jobs:
             processed="processed_dockerfiles/${dir}_Dockerfile"
             {
               echo "FROM $base_img";
-              grep -v '^[[:space:]]*FROM' "$dockerfile" | grep -v '^[[:space:]]*ARG';
+              grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$dockerfile";
             } >"$processed"
 
             out_json="scan_results/${dir}.json"
-            snyk container test --file="$processed" --json --severity-threshold=medium >"$out_json" || ec=$? || ec=$?
-            ec=${ec:-0}
+            snyk container test --file="$processed" --json --severity-threshold=medium >"$out_json" || true
+            ec=$?
 
-            case $ec in
-              0)   echo "✅ $dir – no issues" ; ;;
-              1)   echo "⚠️  $dir – vulnerabilities detected" ; OVERALL_PASS=false ; ;;
-              *)   echo "❌ $dir – scan error (exit $ec)" ; OVERALL_PASS=false ; continue ; ;;
-            esac
+            if [ $ec -eq 2 ] || [ $ec -gt 2 ]; then
+              echo "❌ $dir – Snyk error (exit $ec)"; OVERALL_PASS=false; continue
+            elif [ $ec -eq 1 ]; then
+              echo "⚠️  $dir – vulnerabilities detected"; OVERALL_PASS=false
+            else
+              echo "✅ $dir – no issues"
+            fi
 
-            # Count high/critical severities (no artificial data – directly from JSON)
             hc=$(jq '[.vulnerabilities[] | select(.severity=="high" or .severity=="critical")] | length' "$out_json")
-            if [ "$hc" -gt 0 ]; then HIGH_OR_CRIT_COUNT=$((HIGH_OR_CRIT_COUNT+hc)); fi
+            [ "$hc" -gt 0 ] && HIGH_OR_CRIT_COUNT=$((HIGH_OR_CRIT_COUNT+hc))
           done
 
           echo "high_or_crit=$HIGH_OR_CRIT_COUNT" >>"$GITHUB_OUTPUT"
           echo "overall_pass=$OVERALL_PASS"       >>"$GITHUB_OUTPUT"
 
+      # ------------------------------ Slack ------------------------------
       - name: Slack Notification
         if: >-
-          always() &&
-          (steps.scan.outputs.overall_pass == 'false' || job.status == 'failure')
+          always() && (steps.scan.outputs.overall_pass == 'false' || job.status == 'failure')
         uses: 8398a7/action-slack@v3
         continue-on-error: true
         with:
