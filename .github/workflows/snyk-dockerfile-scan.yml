@@ -1,69 +1,63 @@
-# Snyk Dockerfile Security Scan — v8
-# ---------------------------------------------------------------------------
-#  ✅  Fork‑safe auth & branch triggers  
-#  ✅  Rich HTML summary table in step output  
-#  ✅  Robust JSON‑error handling (no more jq parse crashes)
+# Snyk Dockerfile Security Scan — v10 (YAML‑validated)
+# ------------------------------------------------------------
+#  • Fork‑safe auth / branch triggers
+#  • Rich HTML summary via echo (no YAML bleed‑through)
+#  • Robust JSON error handling
 
 name: Snyk Dockerfile Security Scan
 
 on:
   push:
-    branches: ["*snyk*"]           # run on any branch that contains "snyk"
+    branches: ["*snyk*"]
     paths:
-      - "images/runtime/training/*/Dockerfile"
+      - images/runtime/training/*/Dockerfile
 
   pull_request_target:
     types: [labeled]
 
   pull_request:
     paths:
-      - "images/runtime/training/*/Dockerfile"
+      - images/runtime/training/*/Dockerfile
 
   schedule:
-    - cron: "0 3 * * *"            # nightly at 03:00 UTC
+    - cron: "0 3 * * *"
 
   workflow_dispatch:
     inputs:
       debug:
-        description: "Enable debug mode"
+        description: Enable debug mode
         type: choice
-        options: ["true", "false"]
-        default: "false"
+        options: [true, false]
+        default: false
       target_dir:
-        description: "Scan only this training sub‑directory (optional)"
-        default: ""
+        description: Scan only this training sub‑directory (optional)
         type: string
+        default: ""
 
 jobs:
-  snyk:
+  scan:
     name: Snyk Dockerfile Security Scan
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-      security-events: write
 
     if: >-
       github.event_name != 'pull_request_target' ||
       github.event.label.name == 'safe-to-test' ||
       github.event.pull_request.head.repo.full_name == github.repository
 
+    permissions:
+      contents: read
+      security-events: write
+
     env:
       TZ: Europe/London
 
     steps:
       # ---------------- checkout ----------------
-      - name: Checkout code
-        if: github.event_name != 'pull_request_target'
-        uses: actions/checkout@v4
-
-      - name: Checkout PR code (pull_request_target)
-        if: github.event_name == 'pull_request_target'
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref:        ${{ github.event.pull_request.head.sha }}
-          token:      ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.ref_name }}
 
       # ---------------- Snyk CLI ----------------
       - name: Setup Snyk CLI
@@ -71,136 +65,140 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Verify token & write configstore file
+      - name: Verify Snyk token
         id: cli
         shell: bash
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           if [[ -z "${SNYK_TOKEN:-}" ]]; then
-            echo "token_present=false" >>"$GITHUB_OUTPUT"
-            echo "::warning::SNYK_TOKEN is missing – scan will be skipped."
+            echo "token_present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SNYK_TOKEN is missing – skipping scan"
             exit 0
           fi
-
           mkdir -p ~/.config/configstore
           printf '{"api":"%s"}\n' "$SNYK_TOKEN" > ~/.config/configstore/snyk.json
           chmod 600 ~/.config/configstore/snyk.json
-
-          echo "token_present=true"  >>"$GITHUB_OUTPUT"
-          echo "cli_version=$(snyk --version)" >>"$GITHUB_OUTPUT"
+          echo "token_present=true" >> "$GITHUB_OUTPUT"
+          echo "cli_version=$(snyk --version)" >> "$GITHUB_OUTPUT"
 
       # ---------------- scan ----------------
       - name: Scan Dockerfiles
-        if: steps.cli.outputs.token_present == 'true'
         id: scan
+        if: steps.cli.outputs.token_present == 'true'
         shell: bash
         env:
-          DEBUG_MODE: ${{ github.event_name == 'push' && 'true' || github.event_name == 'workflow_dispatch' && github.event.inputs.debug || 'false' }}
-          TARGET_DIR: ${{ github.event.inputs.target_dir || '' }}
+          DEBUG_MODE: ${{ (github.event_name == 'push') && 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.debug) || 'false' }}
+          TARGET_DIR: ${{ github.event.inputs.target_dir }}
         run: |
           set -euo pipefail
-          DEBUG="${DEBUG_MODE}"
+          DEBUG="$DEBUG_MODE"
           TRAINING_DIR="images/runtime/training"
 
-          declare -A IMAGE_TYPES=(
-            [py311-cuda121-torch241]="CUDA 12.1 + PyTorch 2.4.1"
-            [py311-cuda124-torch251]="CUDA 12.4 + PyTorch 2.5.1"
-            [py311-rocm62-torch241]="ROCm 6.2 + PyTorch 2.4.1"
-            [py311-rocm62-torch251]="ROCm 6.2 + PyTorch 2.5.1"
+          DIRS=(
+            py311-cuda121-torch241
+            py311-cuda124-torch251
+            py311-rocm62-torch241
+            py311-rocm62-torch251
           )
+          if [[ -n "$TARGET_DIR" ]]; then DIRS=("$TARGET_DIR"); fi
 
-          if [[ -n "$TARGET_DIR" ]]; then
-            DOCKER_DIRS=("$TARGET_DIR")
-          else
-            DOCKER_DIRS=("${!IMAGE_TYPES[@]}")
-          fi
-
-          mkdir -p scan_results processed_dockerfiles
-          PASS=0; ISSUE=0; HIGH=0; FAIL=0; REPORT=()
-
-          extract_base() {
-            local f="$1"; local img=$(grep -m1 '^FROM' "$f" | awk '{print $2}')
-            while IFS= read -r line; do
-              [[ $line =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]] || continue
-              k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]//["'] }"
-              img="${img//\$\{$k\}/$v}"; img="${img//\$$k/$v}"
-            done <"$f"; echo "$img"
+          image_type() {
+            case "$1" in
+              py311-cuda121-torch241) echo "CUDA 12.1 + PyTorch 2.4.1" ;;
+              py311-cuda124-torch251) echo "CUDA 12.4 + PyTorch 2.5.1" ;;
+              py311-rocm62-torch241)  echo "ROCm 6.2 + PyTorch 2.4.1" ;;
+              py311-rocm62-torch251) echo "ROCm 6.2 + PyTorch 2.5.1" ;;
+              *) echo "Unknown" ;;
+            esac
           }
 
-          for dir in "${DOCKER_DIRS[@]}"; do
+          extract_base() {
+            local f="$1"; local img
+            img=$(grep -m1 '^FROM' "$f" | awk '{print $2}' || true)
+            while IFS= read -r line; do
+              if [[ $line =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
+                k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]//["' ]}"
+                img="${img//\$\{$k\}/$v}"
+                img="${img//\$$k/$v}"
+              fi
+            done < "$f"
+            echo "$img"
+          }
+
+          mkdir -p scan_results processed_dockerfiles
+          PASS=0 ISSUE=0 HIGH=0 FAIL=0
+          REPORT=()
+
+          for dir in "${DIRS[@]}"; do
+            typ=$(image_type "$dir")
             df="$TRAINING_DIR/$dir/Dockerfile"
             if [[ ! -f "$df" ]]; then
-              REPORT+=("$dir|${IMAGE_TYPES[$dir]}|❌ Fail|Not found|-"); FAIL=$((FAIL+1)); continue
+              REPORT+=("$dir|$typ|❌ Fail|Not found|-")
+              FAIL=$((FAIL+1))
+              continue
             fi
 
             base=$(extract_base "$df")
             proc="processed_dockerfiles/${dir}.Dockerfile"
-            { echo "FROM $base"; grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$df"; } >"$proc"
+            { echo "FROM $base"; grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$df"; } > "$proc"
 
             out="scan_results/${dir}.json"; err="scan_results/${dir}.stderr"
-            snyk container test --file "$proc" --severity-threshold=medium --json >"$out" 2>"$err" || true; code=$?
+            snyk container test --file "$proc" --severity-threshold=medium --json > "$out" 2> "$err" || code=$?
+            code=${code:-0}
 
             if ! jq -e . "$out" >/dev/null 2>&1; then
-              REPORT+=("$dir|${IMAGE_TYPES[$dir]}|❌ Fail|Invalid JSON|See stderr"); FAIL=$((FAIL+1)); [[ $DEBUG == true ]] && cat "$err"; continue
+              REPORT+=("$dir|$typ|❌ Fail|Invalid JSON|See stderr")
+              FAIL=$((FAIL+1))
+              continue
             fi
 
             if [[ $code -ge 2 ]]; then
-              REPORT+=("$dir|${IMAGE_TYPES[$dir]}|❌ Fail|Snyk error ($code)|See stderr"); FAIL=$((FAIL+1)); continue
+              REPORT+=("$dir|$typ|❌ Fail|Snyk error ($code)|See stderr")
+              FAIL=$((FAIL+1))
+              continue
             fi
 
             total=$(jq '.vulnerabilities|length' "$out")
             high=$(jq '[.vulnerabilities[]|select(.severity=="high" or .severity=="critical")]|length' "$out")
             if [[ $total -eq 0 ]]; then
-              REPORT+=("$dir|${IMAGE_TYPES[$dir]}|✅ Pass|None|-"); PASS=$((PASS+1))
+              REPORT+=("$dir|$typ|✅ Pass|None|-")
+              PASS=$((PASS+1))
             else
-              sev="Medium/Low"; [[ $high -gt 0 ]] && sev="High" && HIGH=$((HIGH+high))
-              REPORT+=("$dir|${IMAGE_TYPES[$dir]}|⚠️ Warning|$sev ($total)|-"); ISSUE=$((ISSUE+1))
+              sev="Medium/Low"
+              if [[ $high -gt 0 ]]; then sev="High"; HIGH=$((HIGH+high)); fi
+              REPORT+=("$dir|$typ|⚠️ Warning|$sev ($total)|-")
+              ISSUE=$((ISSUE+1))
             fi
           done
 
-          # summary
+          summary="scan_results/summary.txt"
+          printf '%s\n' "${REPORT[@]}" > "$summary"
+
+          # GitHub summary
           {
-            echo "# Dockerfile Security Scan Results";
-            echo "\n## Summary Overview\n";
-            echo "| Metric | Value |";
-            echo "|:-------|:------|";
-            echo "| **Scan Date** | $(date '+%Y-%m-%d %H:%M %Z') |";
-            echo "| **Passed** | $PASS |";
-            echo "| **Issues** | $ISSUE |";
-            echo "| **High/Critical** | $HIGH |";
-            echo "| **Scan Failures** | $FAIL |";
-            echo "\n## Detailed Scan Results\n";
-            echo "<table><tr><th>Dockerfile</th><th>Image</th><th>Status</th><th>Issues</th><th>Notes</th></tr>";
-            for r in "${REPORT[@]}"; do IFS='|' read -r a b c d e <<<"$r"; echo "<tr><td>$a</td><td>$b</td><td align='center'>$c</td><td>$d</td><td>$e</td></tr>"; done;
-            echo "</table>";
-          } >"$GITHUB_STEP_SUMMARY"
+            echo "# Dockerfile Security Scan Results" && echo
+            echo "## Summary Overview" && echo
+            echo "| Metric | Value |" && echo "|:-------|:------|"
+            echo "| **Scan Date** | $(date '+%Y-%m-%d %H:%M %Z') |"
+            echo "| **Passed** | $PASS |"
+            echo "| **Issues** | $ISSUE |"
+            echo "| **High/Critical** | $HIGH |"
+            echo "| **Scan Failures** | $FAIL |" && echo
+            echo "## Detailed Scan Results" && echo
+            echo "<table>" && echo "  <tr><th>Dockerfile</th><th>Image</th><th>Status</th><th>Issues</th><th>Notes</th></tr>"
+            while IFS='|' read -r a b c d e; do
+              echo "  <tr><td>$a</td><td>$b</td><td align=\"center\">$c</td><td>$d</td><td>$e</td></tr>"
+            done < "$summary"
+            echo "</table>"
+          } > "$GITHUB_STEP_SUMMARY"
 
-          printf '%s\n' "${REPORT[@]}" > scan_results/summary.txt
-          echo "results<<EOF" >>"$GITHUB_OUTPUT"; cat scan_results/summary.txt >>"$GITHUB_OUTPUT"; echo "EOF" >>"$GITHUB_OUTPUT"
-          echo "scan_failures=$FAIL" >>"$GITHUB_OUTPUT"
-          echo "status=$([[ $HIGH -gt 0 ]] && echo high_severity || [[ $ISSUE -gt 0 ]] && echo issues_found || echo secure)" >>"$GITHUB_OUTPUT"
+          echo "results<<EOF" >> "$GITHUB_OUTPUT"
+          cat "$summary" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-      # ---------------- Slack ----------------
-      - name: Slack Notification
-        if: >-
-          always() && (steps.cli.outputs.token_present == 'false' || steps.scan.outputs.status != 'secure' || job.status == 'failure')
-        uses: 8398a7/action-slack@v3
-        continue-on-error: true
-        with:
-          status: custom
-          fields: repo,workflow
-          custom_payload: |
-            {
-              "attachments": [
-                {
-                  "color": "${{ steps.cli.outputs.token_present == 'false' && 'warning' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
-                  "title": "Dockerfile Security Scan",
-                  "text": "Status: ${{ steps.scan.outputs.status }}\n${{ steps.scan.outputs.results }}",
-                  "mrkdwn_in": ["text"],
-                  "footer": "Snyk CLI ${{ steps.cli.outputs.cli_version }} – $(date '+%d-%m-%Y %H:%M %Z')"
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          echo "scan_failures=$FAIL" >> "$GITHUB_OUTPUT"
+          if [[ $HIGH -gt 0 ]]; then
+            echo "status=high_severity" >> "$GITHUB_OUTPUT"
+          elif [[ $ISSUE -gt 0 ]]; then
+            echo "status=issues_found" >> "$GITHUB
