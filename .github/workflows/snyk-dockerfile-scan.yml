@@ -1,12 +1,11 @@
-# Revamped Snyk Dockerfile Security Scan workflow — **v2**
+# Revamped Snyk Dockerfile Security Scan workflow — **v3**
 # ---------------------------------------------------------
-# Fix: checkout step no longer feeds an empty/invalid repository string.
-# We now use two separate checkout actions conditioned on the event type.
-# Additional tidy‑ups:
-#   • correct usage of `github.event.inputs.*` when the workflow is *not*
-#     manually triggered.
-#   • safer defaults for env vars inside the scan step.
-#   • removed stray `${ { … } }` spacing that broke expressions.
+# New: Graceful handling when `SNYK_TOKEN` is missing.
+#   • The job now *skips* the scan (and posts a Slack reminder) instead
+#     of hard‑failing.
+#   • `cli-info` step sets an output `token_present` (true/false).
+#   • All downstream steps are `if:`‑guarded on that flag.
+#   • A friendly notice is written to the GitHub summary.
 
 name: Snyk Dockerfile Security Scan
 
@@ -41,7 +40,7 @@ jobs:
     name: Snyk Security Scan
     runs-on: ubuntu-latest
 
-    # Security‑conscious: Only run on labelled PR‑targets from forks or
+    # Security‑conscious: only run on labelled PR‑targets from forks or
     # same‑repo PRs. Regular events pass through.
     if: >-
       github.event_name != 'pull_request_target' ||
@@ -78,14 +77,21 @@ jobs:
       - name: Verify token & CLI
         id: cli-info
         run: |
+          token_present=true
           if [ -z "${SNYK_TOKEN:-}" ]; then
-            echo "::error::SNYK_TOKEN secret is missing" && exit 1
+            echo "::warning::SNYK_TOKEN secret is missing – security scan will be skipped."
+            token_present=false
           fi
+
           echo "cli_version=$(snyk --version)" >>"$GITHUB_OUTPUT"
+          echo "token_present=$token_present"    >>"$GITHUB_OUTPUT"
+
+          # Still print CLI version for traceability
           echo "Snyk CLI version: $(snyk --version)"
 
       # ------------------------------ scan ------------------------------
       - name: Scan Dockerfiles
+        if: steps.cli-info.outputs.token_present == 'true'
         id: scan
         env:
           DEBUG_MODE: ${{ github.event.inputs.debug || 'false' }}
@@ -161,7 +167,10 @@ jobs:
       # ------------------------------ Slack ------------------------------
       - name: Slack Notification
         if: >-
-          always() && (steps.scan.outputs.overall_pass == 'false' || job.status == 'failure')
+          always() && (
+            steps.cli-info.outputs.token_present == 'false' ||
+            steps.scan.outputs.overall_pass == 'false' ||
+            job.status == 'failure')
         uses: 8398a7/action-slack@v3
         continue-on-error: true
         with:
@@ -171,9 +180,9 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ steps.scan.outputs.overall_pass == 'true' && 'good' || steps.scan.outputs.high_or_crit != '0' && 'danger' || 'warning' }}",
+                  "color": "${{ steps.cli-info.outputs.token_present == 'false' && 'warning' || steps.scan.outputs.overall_pass == 'true' && 'good' || steps.scan.outputs.high_or_crit != '0' && 'danger' || 'warning' }}",
                   "title": "Dockerfile security scan results",
-                  "text": "${{ steps.scan.outputs.overall_pass == 'true' && '✅ All clear' || steps.scan.outputs.high_or_crit != '0' && '🚨 High/Critical vulnerabilities found' || '⚠️ Vulnerabilities detected' }} | Run: ${{ github.run_id }}",
+                  "text": "${{ steps.cli-info.outputs.token_present == 'false' && '⚠️ SNYK_TOKEN is missing – scan skipped' || steps.scan.outputs.overall_pass == 'true' && '✅ All clear' || steps.scan.outputs.high_or_crit != '0' && '🚨 High/Critical vulnerabilities found' || '⚠️ Vulnerabilities detected' }} | Run: ${{ github.run_id }}",
                   "footer": "Snyk CLI ${{ steps.cli-info.outputs.cli_version }} – $(date '+%d-%m-%Y %H:%M %Z')"
                 }
               ]
