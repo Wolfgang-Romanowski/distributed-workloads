@@ -78,17 +78,56 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
+      - name: Create Test Dockerfile with Known Vulnerability
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true'
+        id: test_vulnerability
+        run: |
+          echo "Creating test Dockerfile with known vulnerabilities..."
+          
+          # Create a test Dockerfile with a known vulnerable base image
+          cat > test_vuln.Dockerfile << 'EOF'
+          FROM debian:8.0
+          RUN apt-get update && apt-get install -y openssl
+          EOF
+          
+          echo "Running test scan..."
+          snyk container test --file=test_vuln.Dockerfile > test_vuln_output.txt 2>&1 || true
+          TEST_EXIT_CODE=$?
+          
+          echo "Test scan exit code: $TEST_EXIT_CODE"
+          echo "Test scan output:"
+          cat test_vuln_output.txt
+          
+          # Check if vulnerabilities were detected
+          if grep -q "Vulnerability" test_vuln_output.txt || grep -q "vulnerability" test_vuln_output.txt; then
+            echo "::notice::Test successful - vulnerabilities detected in test Dockerfile"
+            echo "test_passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Test failed - no vulnerabilities detected in known vulnerable Dockerfile"
+            echo "test_passed=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
       - name: Scan Dockerfiles
         id: scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' }}
+          TEST_PASSED: ${{ steps.test_vulnerability.outputs.test_passed }}
         run: |
           set -euo pipefail
           
           if [ "$DEBUG_MODE" = "true" ]; then
             set -x
             echo "Running in debug mode"
+            # If we ran the test vulnerability check, report the result
+            if [ -n "${TEST_PASSED:-}" ]; then
+              echo "Vulnerability test scan result: $TEST_PASSED"
+              if [ "$TEST_PASSED" != "true" ]; then
+                echo "::warning::Vulnerability detection test failed. Snyk may not be detecting vulnerabilities correctly."
+              fi
+            fi
           fi
           
           HAS_HIGH_SEVERITY=false
@@ -136,49 +175,51 @@ jobs:
             VULN_ISSUES="None"
             CONFIG_ISSUES=()
             SCAN_OUTPUT="${DIR}_snyk_output.txt"
+            ERROR_OUTPUT="${DIR}_snyk_error.txt"
             
-            # Run Snyk with detailed output for debugging
+            # Run Snyk with text output instead of JSON
             echo "Running Snyk container test on ${DOCKERFILE_PATH}..."
-            snyk container test --file="$DOCKERFILE_PATH" --severity-threshold=medium --docker-skip-base-image-check --json > "$SCAN_OUTPUT" 2>&1 || true
+            snyk container test --file="$DOCKERFILE_PATH" --severity-threshold=medium --docker-skip-base-image-check > "$SCAN_OUTPUT" 2> "$ERROR_OUTPUT" || true
             SCAN_EXIT_CODE=$?
             
             # Print Snyk output for debugging
             if [ "$DEBUG_MODE" = "true" ]; then
               echo "Snyk exit code: $SCAN_EXIT_CODE"
-              echo "Snyk output (first 20 lines):"
-              head -n 20 "$SCAN_OUTPUT"
+              echo "Snyk stdout (first 20 lines):"
+              head -n 20 "$SCAN_OUTPUT" || true
+              echo "Snyk stderr (first 20 lines):"
+              head -n 20 "$ERROR_OUTPUT" || true
             fi
             
-            # Check if scan output contains valid JSON (indicates proper scan)
-            if jq empty "$SCAN_OUTPUT" 2>/dev/null; then
-              echo "Scan produced valid JSON output."
-              VALID_SCAN=true
-            else
-              echo "::warning::Scan did not produce valid JSON. This might indicate Snyk is not functioning properly."
-              VALID_SCAN=false
-            fi
-            
+            # Now parse the text output instead of trying to use JSON
             if [ $SCAN_EXIT_CODE -eq 0 ]; then
               echo "✅ Snyk scan passed with no vulnerabilities above threshold"
-            elif [ $SCAN_EXIT_CODE -eq 1 ] && grep -q "vulnerabilities" "$SCAN_OUTPUT"; then
-              if jq -e '.vulnerabilities[] | select(.severity == "high" or .severity == "critical")' "$SCAN_OUTPUT" >/dev/null 2>&1; then
-                if jq -e '.vulnerabilities[] | select(.severity == "high")' "$SCAN_OUTPUT" >/dev/null 2>&1; then
-                  VULN_ISSUES="High severity"
-                fi
-                if jq -e '.vulnerabilities[] | select(.severity == "critical")' "$SCAN_OUTPUT" >/dev/null 2>&1; then
-                  VULN_ISSUES="Critical severity"
-                fi
+            elif [ $SCAN_EXIT_CODE -eq 1 ]; then
+              # Check for different vulnerability severities in the output
+              if grep -i "critical severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Critical severity"
                 HAS_HIGH_SEVERITY=true
                 HIGH_COUNT=$((HIGH_COUNT + 1))
-              elif jq -e '.vulnerabilities[] | select(.severity == "medium")' "$SCAN_OUTPUT" >/dev/null 2>&1; then
+              elif grep -i "high severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="High severity"
+                HAS_HIGH_SEVERITY=true
+                HIGH_COUNT=$((HIGH_COUNT + 1))
+              elif grep -i "medium severity" "$SCAN_OUTPUT" >/dev/null; then
                 VULN_ISSUES="Medium severity"
+                HAS_ISSUES=true
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              elif grep -i "low severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Low severity"
               fi
             else
-              if [ "$VALID_SCAN" = "false" ]; then
+              # Check if there was an authentication error
+              if grep -i "authentication failed" "$SCAN_OUTPUT" >/dev/null || grep -i "not authorized" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Authentication error"
+                echo "::warning::Snyk authentication error detected during scan"
+              else
+                # Fallback to IaC test
                 snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "${DIR}_iac_output.txt" 2>&1 || true
                 VULN_ISSUES="Unknown (variables in base image)"
-              else
-                VULN_ISSUES="Scan error (see logs)"
               fi
             fi
             
@@ -218,6 +259,12 @@ jobs:
             OVERALL_STATUS="✅ All Secure"
           fi
 
+          # If test vulnerability detection failed, but we're passing everything, add a warning
+          if [ "$DEBUG_MODE" = "true" ] && [ -n "${TEST_PASSED:-}" ] && [ "$TEST_PASSED" != "true" ] && [ "$OVERALL_STATUS" = "✅ All Secure" ]; then
+            OVERALL_STATUS="✅ All Secure ⚠️ (Verification Failed)"
+            echo "::warning::All images passed, but Snyk failed to detect vulnerabilities in the test file. Results may be unreliable."
+          fi
+
           TZ=Europe/London
           export TZ
           LON_DATE="$(date '+%a %d %b %Y %T %Z')"
@@ -230,6 +277,12 @@ jobs:
           echo "|:-------|:------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Scan Date** | $LON_DATE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
+          
+          # If in debug mode and we ran the test, add the test result
+          if [ "$DEBUG_MODE" = "true" ] && [ -n "${TEST_PASSED:-}" ]; then
+            echo "| **Test Vulnerability Detection** | ${TEST_PASSED} |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
           echo "| **Total Images** | 4 |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Passed** | $PASSED_COUNT |" >> "$GITHUB_STEP_SUMMARY" 
           echo "| **Issues** | $ISSUES_COUNT |" >> "$GITHUB_STEP_SUMMARY"
@@ -310,6 +363,11 @@ jobs:
             echo "debug_mode=false" >> $GITHUB_OUTPUT
           fi
           
+          # Add test_passed output if available
+          if [ -n "${TEST_PASSED:-}" ]; then
+            echo "test_passed=${TEST_PASSED}" >> $GITHUB_OUTPUT
+          fi
+          
           if $HAS_HIGH_SEVERITY; then
             echo "❌ High/Critical vulnerabilities detected — failing the workflow."
             exit 1
@@ -333,7 +391,7 @@ jobs:
                 {
                   "color": "${{ job.status == 'failure' && 'danger' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
                   "title": "Dockerfile Security Scan Results",
-                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed: Snyk authentication or scanning issue' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || '⚠️ Security issues detected' }}\n${{ steps.scan.outputs.results }}",
+                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed: Snyk authentication or scanning issue' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || '⚠️ Security issues detected' }}${{ steps.scan.outputs.test_passed == 'false' && ' (⚠️ Vulnerability detection verification failed)' || '' }}\n${{ steps.scan.outputs.results }}",
                   "mrkdwn_in": ["text"],
                   "footer": "Snyk Dockerfile Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
                 }
