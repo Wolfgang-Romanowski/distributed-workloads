@@ -24,8 +24,8 @@ on:
         required: false
         default: ''
         type: string
-      force_container_scan:
-        description: 'Force container scanning even if verification fails'
+      use_container_scan:
+        description: 'Try to build and scan images (not recommended for large images)'
         required: false
         default: 'false'
         type: choice
@@ -179,7 +179,7 @@ jobs:
           DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
           TEST_PASSED: ${{ steps.test_vulnerability.outputs.test_passed || 'unknown' }}
           TARGET_DIR: ${{ github.event.inputs.target_dir }}
-          FORCE_CONTAINER_SCAN: ${{ github.event.inputs.force_container_scan || 'false' }}
+          USE_CONTAINER_SCAN: ${{ github.event.inputs.use_container_scan || 'false' }}
         run: |
           set -euo pipefail
           
@@ -225,16 +225,14 @@ jobs:
           # Create results directory for scans
           mkdir -p scan_results
           
-          # Check if we should skip building and use direct file scanning
-          # Note: This is a fallback in case Docker builds fail
-          if [ "$FORCE_CONTAINER_SCAN" = "true" ]; then
-            echo "::notice::Forcing container scanning mode as requested"
+          # Determine whether to use container scanning or file scanning
+          # Default to file scanning unless specifically requested
+          if [ "$USE_CONTAINER_SCAN" = "true" ]; then
+            echo "::notice::Using container scanning mode as explicitly requested"
             USE_DIRECT_SCANNING=false
-          elif [ "$TEST_PASSED" != "true" ]; then
-            echo "::notice::Using Snyk file scanning mode since test verification failed"
-            USE_DIRECT_SCANNING=true
           else
-            USE_DIRECT_SCANNING=false
+            echo "::notice::Using file scanning mode (recommended for large images)"
+            USE_DIRECT_SCANNING=true
           fi
           
           for DIR in "${DOCKERFILE_DIRS[@]}"; do
@@ -478,7 +476,7 @@ jobs:
           echo "| **Scan Date** | $LON_DATE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Snyk Version** | $SNYK_VERSION |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scanner Mode** | $([ "$USE_DIRECT_SCANNING" = "true" ] && echo "File Analysis" || echo "Container") |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Scanner Mode** | File Analysis (Dockerfile only) |" >> "$GITHUB_STEP_SUMMARY"
           
           # If in debug mode and we ran the test, add the test result
           if [ "$TEST_PASSED" != "unknown" ]; then
@@ -529,10 +527,10 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Workflow fails only on High or Critical security issues" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Medium and Low severity issues are reported but don't cause failure" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Missing USER instruction indicates container runs as root (security risk)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- When Docker builds fail, file analysis is used as a fallback (less comprehensive)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Workflow uses file analysis only to avoid building large images" >> "$GITHUB_STEP_SUMMARY"
+          echo "- File scanning checks for Dockerfile best practices and common security issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Setting a specific USER in Dockerfiles is recommended (avoids running as root)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Always pin package versions for better security and reproducibility" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -541,7 +539,7 @@ jobs:
           echo "<details>" >> "$GITHUB_STEP_SUMMARY"
           echo "<summary>Technical Scan Information</summary>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Scanner:** Snyk $([ "$USE_DIRECT_SCANNING" = "true" ] && echo "IaC/File Analysis" || echo "Container")" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Scanner:** Snyk IaC/File Analysis" >> "$GITHUB_STEP_SUMMARY"
           echo "**Version:** $SNYK_VERSION" >> "$GITHUB_STEP_SUMMARY"
           echo "**Scan Parameters:** \`--severity-threshold=medium\`" >> "$GITHUB_STEP_SUMMARY"
           echo "**Workflow Run ID:** \`${{ github.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
@@ -565,7 +563,7 @@ jobs:
           echo "debug_mode=$DEBUG_MODE" >> $GITHUB_OUTPUT
           echo "snyk_version=$SNYK_VERSION" >> $GITHUB_OUTPUT
           echo "failed_scans=$FAILED_SCANS" >> $GITHUB_OUTPUT
-          echo "scanner_mode=$([ "$USE_DIRECT_SCANNING" = "true" ] && echo "file" || echo "container")" >> $GITHUB_OUTPUT
+          echo "scanner_mode=file" >> $GITHUB_OUTPUT
           
           if [ "$TEST_PASSED" != "unknown" ]; then
             echo "test_passed=${TEST_PASSED}" >> $GITHUB_OUTPUT
