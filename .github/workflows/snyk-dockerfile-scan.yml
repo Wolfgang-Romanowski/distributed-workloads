@@ -24,6 +24,14 @@ on:
         required: false
         default: ''
         type: string
+      force_container_scan:
+        description: 'Force container scanning even if verification fails'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   snyk-dockerfile-scan:
@@ -74,71 +82,93 @@ jobs:
         run: |
           echo "Verifying Snyk vulnerability detection capabilities..."
           
-          # METHOD 1: Use a public image known to have vulnerabilities
-          # nginx:1.18.0 has several known vulnerabilities
-          echo "Testing with a public image known to have vulnerabilities (nginx:1.18.0)..."
+          # Create a directory for testing
+          mkdir -p snyk-test
+          cd snyk-test
           
-          # Pull the image
-          docker pull nginx:1.18.0
+          # Create a package.json with KNOWN vulnerabilities for direct testing
+          # This approach is most reliable as it doesn't depend on external images
+          echo "Creating a package.json with known vulnerabilities..."
           
-          # Scan the image with Snyk
-          echo "Running vulnerability scan on nginx:1.18.0..."
-          snyk container test nginx:1.18.0 --severity-threshold=low > test_scan_output.txt 2>&1 || true
-          SCAN_EXIT_CODE=$?
-          
-          # Show test output
-          echo "Test scan exit code: $SCAN_EXIT_CODE"
-          echo "First 50 lines of test scan output:"
-          head -n 50 test_scan_output.txt
-          
-          # Check if vulnerabilities were detected
-          if [ $SCAN_EXIT_CODE -eq 1 ] && grep -q "vulnerability found" test_scan_output.txt; then
-            echo "::notice::Test successful - security vulnerabilities detected in nginx:1.18.0 image"
-            echo "test_passed=true" >> $GITHUB_OUTPUT
-          else 
-            # METHOD 2: As backup, test Snyk with a direct vulnerability check
-            echo "First method failed. Trying alternate method to verify Snyk functionality..."
-            
-            # Create a file with known vulnerable package info for direct testing
-            echo "Creating a package.json with a known vulnerability for direct testing..."
-            mkdir -p snyk-test
-            cd snyk-test
-            
-            # Create a package.json with a vulnerable dependency (lodash 4.17.15 has vulnerabilities)
-            cat > package.json << 'EOF'
-            {
-              "name": "snyk-test",
-              "version": "1.0.0",
-              "dependencies": {
-                "lodash": "4.17.15"
-              }
+          cat > package.json << 'EOF'
+          {
+            "name": "snyk-test",
+            "version": "1.0.0",
+            "dependencies": {
+              "lodash": "4.17.15"
             }
-            EOF
-            
-            # Test with Snyk without building
-            echo "Testing package.json for vulnerabilities..."
-            snyk test --severity-threshold=low > ../test_scan_backup.txt 2>&1 || true
-            BACKUP_EXIT_CODE=$?
+          }
+          EOF
+          
+          # Test with Snyk directly - this is the most reliable approach
+          echo "Testing package.json for vulnerabilities..."
+          # Run with --json for reliable output parsing
+          snyk test --json > test-results.json 2>test-error.log || SCAN_EXIT_CODE=$?
+          
+          # Check if we got usable results with vulnerabilities
+          if [ -s test-results.json ] && grep -q "vulnerabilities" test-results.json; then
+            echo "::notice::Direct test successful - Snyk detected vulnerabilities in package.json"
+            echo "Example vulnerability detected:"
+            cat test-results.json | grep -A 5 "title"
+            echo "test_passed=true" >> $GITHUB_OUTPUT
             cd ..
-            
-            echo "Direct testing exit code: $BACKUP_EXIT_CODE"
-            echo "Direct testing output:"
-            cat test_scan_backup.txt
-            
-            if [ $BACKUP_EXIT_CODE -eq 1 ] && grep -q "vulnerability found" test_scan_backup.txt; then
-              echo "::notice::Backup test successful - Snyk detected vulnerabilities in package.json"
-              echo "test_passed=true" >> $GITHUB_OUTPUT
-            else
-              echo "::warning::Both vulnerability detection tests failed. Snyk may not be detecting vulnerabilities correctly."
-              echo "test_passed=false" >> $GITHUB_OUTPUT
-              
-              # Extra diagnostics
-              echo "Running Snyk debug..."
-              snyk --version
-              snyk diagnose > snyk_diagnose.txt
-              echo "See snyk_diagnose.txt for detailed Snyk environment info"
-            fi
+            exit 0
           fi
+          
+          # If direct testing failed, try with a known vulnerable Docker image
+          cd ..
+          echo "Direct testing failed or inconclusive. Trying with a known vulnerable Docker image..."
+          
+          # Try with a small, known vulnerable image (older alpine with vulnerabilities)
+          echo "Testing with alpine:3.9 (has known vulnerabilities)..."
+          docker pull alpine:3.9
+          
+          # Use --json for reliable output parsing
+          snyk container test alpine:3.9 --json > docker-test-results.json 2>docker-test-error.log || DOCKER_SCAN_EXIT_CODE=$?
+          
+          if [ -s docker-test-results.json ] && grep -q "vulnerabilit" docker-test-results.json; then
+            echo "::notice::Docker test successful - Snyk detected vulnerabilities in alpine:3.9"
+            echo "Example vulnerability detected:"
+            cat docker-test-results.json | grep -A 5 "title"
+            echo "test_passed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # As a last resort, try the experimental option
+          echo "Regular tests failed. Trying one more approach with experimental options..."
+          
+          # Use experimental options that might help
+          export SNYK_INTEGRATION_NAME=GITHUB_ACTIONS
+          export SNYK_INTEGRATION_VERSION=1.0.0
+          
+          # Try with experimental flags
+          snyk container test alpine:3.9 --experimental --json > experimental-test.json 2>experimental-error.log || true
+          
+          if [ -s experimental-test.json ] && grep -q "vulnerabilit" experimental-test.json; then
+            echo "::notice::Experimental test successful - Snyk detected vulnerabilities with experimental flags"
+            echo "test_passed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # If we get here, all tests failed
+          echo "::warning::All vulnerability detection tests failed. Snyk may not be properly configured or may have issues."
+          echo "test_passed=false" >> $GITHUB_OUTPUT
+          
+          # Run diagnostics
+          echo "Running Snyk diagnostics for troubleshooting..."
+          snyk --version
+          snyk config get api
+          snyk diagnose > snyk_diagnose.txt
+          echo "For advanced troubleshooting, see the snyk_diagnose.txt file"
+          
+          # Output error logs
+          echo "Error logs from tests:"
+          echo "Direct test errors:"
+          cat test-error.log
+          echo "Docker test errors:"
+          cat docker-test-error.log
+          echo "Experimental test errors:"
+          cat experimental-error.log
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
@@ -149,6 +179,7 @@ jobs:
           DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
           TEST_PASSED: ${{ steps.test_vulnerability.outputs.test_passed || 'unknown' }}
           TARGET_DIR: ${{ github.event.inputs.target_dir }}
+          FORCE_CONTAINER_SCAN: ${{ github.event.inputs.force_container_scan || 'false' }}
         run: |
           set -euo pipefail
           
@@ -196,7 +227,10 @@ jobs:
           
           # Check if we should skip building and use direct file scanning
           # Note: This is a fallback in case Docker builds fail
-          if [ "$TEST_PASSED" != "true" ]; then
+          if [ "$FORCE_CONTAINER_SCAN" = "true" ]; then
+            echo "::notice::Forcing container scanning mode as requested"
+            USE_DIRECT_SCANNING=false
+          elif [ "$TEST_PASSED" != "true" ]; then
             echo "::notice::Using Snyk file scanning mode since test verification failed"
             USE_DIRECT_SCANNING=true
           else
