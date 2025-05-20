@@ -157,23 +157,29 @@ jobs:
                 var_value="${var_value//\"/}"
                 var_value="${var_value//\'/}"
                 arg_values["$var_name"]="$var_value"
-                echo "Extracted ARG $var_name = ${arg_values[$var_name]}"
+                if [ "$DEBUG_MODE" = "true" ]; then
+                  echo "Extracted ARG $var_name = ${arg_values[$var_name]}"
+                fi
               fi
             done < "$dockerfile"
             
             # Extract the FROM line
             from_line=$(grep -m 1 "^FROM" "$dockerfile" || echo "FROM ubuntu:latest")
-            echo "Original FROM line: $from_line"
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Original FROM line: $from_line"
+            fi
             
             # Extract base image with potential variables
             base_image=$(echo "$from_line" | awk '{print $2}')
-            echo "Base image with variables: $base_image"
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Base image with variables: $base_image"
+            fi
             
             # Replace variables in base image
             resolved_image="$base_image"
             for var_name in "${!arg_values[@]}"; do
               resolved_image="${resolved_image//\$\{$var_name\}/${arg_values[$var_name]}}"
-              resolved_image="${resolved_image//\$$var_name/${arg_values[$var_name]}}"
+              resolved_image="${resolved_image//\$var_name/${arg_values[$var_name]}}"
             done
             
             # Special case: Fixed replacements for the known directory structure
@@ -205,7 +211,11 @@ jobs:
                 ;;
             esac
             
-            echo "Resolved base image: $resolved_image"
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Resolved base image: $resolved_image"
+            fi
+            
+            # Return only the resolved image name without debug info
             echo "$resolved_image"
           }
           
