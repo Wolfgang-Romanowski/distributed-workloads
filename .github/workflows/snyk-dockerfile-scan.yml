@@ -1,5 +1,4 @@
 # Dockerfile security best practices scan
-# push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
 # Checks for Docker security best practices
 name: Dockerfile Security Scan
 on:
@@ -34,87 +33,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install Security Tools
-        run: |
-          # Install tools for security checking
-          sudo apt-get update
-          sudo apt-get install -y jq
-          
-          # Create simple test script for verification
-          echo "Creating test script..."
-          cat > docker-security-check.sh << 'EOF'
-          #!/bin/bash
-          
-          # Check a Dockerfile for security best practices
-          # Usage: ./docker-security-check.sh [Dockerfile path]
-          
-          DOCKERFILE="$1"
-          
-          if [ ! -f "$DOCKERFILE" ]; then
-            echo "Error: Dockerfile not found at $DOCKERFILE"
-            exit 1
-          fi
-          
-          ISSUES=()
-          HIGH_SEVERITY=false
-          
-          # Check for latest tag (high severity)
-          if grep -E "FROM\s+\S+:latest" "$DOCKERFILE" > /dev/null; then
-            ISSUES+=("HIGH: Using 'latest' tag - creates non-deterministic builds")
-            HIGH_SEVERITY=true
-          fi
-          
-          # Check for missing USER instruction (medium severity)
-          if ! grep -q "USER" "$DOCKERFILE"; then
-            ISSUES+=("MEDIUM: Missing USER instruction - container runs as root")
-          fi
-          
-          # Check for secrets in ENV (medium severity)
-          if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE" > /dev/null; then
-            ISSUES+=("MEDIUM: Potential secrets in ENV variables")
-          fi
-          
-          # Check for curl with insecure flag (medium severity)
-          if grep -E "curl\s+.*(-k|--insecure)" "$DOCKERFILE" > /dev/null; then
-            ISSUES+=("MEDIUM: Using curl with insecure flag (-k or --insecure)")
-          fi
-          
-          # Check for ADD instead of COPY (low severity)
-          if grep -q "ADD" "$DOCKERFILE"; then
-            ISSUES+=("LOW: Using ADD instead of COPY - COPY is more transparent")
-          fi
-          
-          # Output results in JSON format
-          echo "{"
-          echo "  \"dockerfile\": \"$DOCKERFILE\","
-          echo "  \"high_severity\": $HIGH_SEVERITY,"
-          echo "  \"issue_count\": ${#ISSUES[@]},"
-          if [ ${#ISSUES[@]} -gt 0 ]; then
-            echo "  \"issues\": ["
-            for i in "${!ISSUES[@]}"; do
-              echo "    \"${ISSUES[$i]}\""
-              if [ $i -lt $((${#ISSUES[@]} - 1)) ]; then
-                echo "    ,"
-              fi
-            done
-            echo "  ]"
-          else
-            echo "  \"issues\": []"
-          fi
-          echo "}"
-          
-          # Return exit code based on findings
-          if $HIGH_SEVERITY; then
-            exit 2  # High severity issues
-          elif [ ${#ISSUES[@]} -gt 0 ]; then
-            exit 1  # Medium/low severity issues
-          else
-            exit 0  # No issues
-          fi
-          EOF
-          
-          chmod +x docker-security-check.sh
-
       - name: Create Test Dockerfile with Known Issues
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true'
         id: test_dockerfile
@@ -141,20 +59,32 @@ jobs:
           EOF
           
           echo "Running test scan..."
-          ./docker-security-check.sh test_insecure.Dockerfile > test_scan_output.json
-          TEST_EXIT_CODE=$?
           
-          echo "Test scan exit code: $TEST_EXIT_CODE"
-          echo "Test scan output:"
-          cat test_scan_output.json
+          # Check security issues using simple grep commands
+          ISSUES=()
           
-          # Check if issues were detected
-          ISSUE_COUNT=$(jq '.issue_count' test_scan_output.json)
-          if [ "$ISSUE_COUNT" -gt 0 ]; then
-            echo "::notice::Test successful - $ISSUE_COUNT security issues detected in test Dockerfile"
+          # Check for latest tag (high severity)
+          if grep -E "FROM\s+\S+:latest" test_insecure.Dockerfile > /dev/null; then
+            ISSUES+=("Latest tag detected")
+          fi
+          
+          # Check for missing USER instruction
+          if ! grep -q "USER" test_insecure.Dockerfile; then
+            ISSUES+=("Missing USER instruction")
+          fi
+          
+          # Check for secrets in ENV
+          if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" test_insecure.Dockerfile > /dev/null; then
+            ISSUES+=("Secrets in ENV variables")
+          fi
+          
+          # Check if any issues were found
+          if [ ${#ISSUES[@]} -gt 0 ]; then
+            echo "Test scan results: Found ${#ISSUES[@]} issues"
+            echo "Issues detected: ${ISSUES[*]}"
             echo "test_passed=true" >> $GITHUB_OUTPUT
           else
-            echo "::warning::Test failed - no security issues detected in Dockerfile with known issues"
+            echo "Test scan results: No issues found"
             echo "test_passed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -213,45 +143,36 @@ jobs:
               continue
             fi
             
-            # Run our custom Docker security check
-            SCAN_OUTPUT="${DIR}_scan_output.json"
-            ./docker-security-check.sh "$DOCKERFILE_PATH" > "$SCAN_OUTPUT" 2>/dev/null || true
-            SCAN_EXIT_CODE=$?
-            
-            # Print output for debugging
-            if [ "$DEBUG_MODE" = "true" ]; then
-              echo "Scan exit code: $SCAN_EXIT_CODE"
-              echo "Scan output:"
-              cat "$SCAN_OUTPUT"
-            fi
-            
-            # Parse the JSON output
-            ISSUES_FOUND=$(jq '.issue_count' "$SCAN_OUTPUT")
             SECURITY_ISSUES="None"
             CONFIG_ISSUES=()
             
-            # Check for high severity issues
-            if [ $SCAN_EXIT_CODE -eq 2 ]; then
-              HIGH_SEVERITY_ISSUES=$(jq -r '.issues[] | select(startswith("HIGH:"))' "$SCAN_OUTPUT" | sed 's/^HIGH: //')
-              if [ -n "$HIGH_SEVERITY_ISSUES" ]; then
-                SECURITY_ISSUES="High: $HIGH_SEVERITY_ISSUES"
-                HAS_HIGH_SEVERITY=true
-                HIGH_COUNT=$((HIGH_COUNT + 1))
-              fi
-            # Check for medium/low severity issues
-            elif [ $SCAN_EXIT_CODE -eq 1 ]; then
-              MEDIUM_ISSUES=$(jq -r '.issues[] | select(startswith("MEDIUM:"))' "$SCAN_OUTPUT" | sed 's/^MEDIUM: //')
-              LOW_ISSUES=$(jq -r '.issues[] | select(startswith("LOW:"))' "$SCAN_OUTPUT" | sed 's/^LOW: //')
-              
-              if [ -n "$MEDIUM_ISSUES" ]; then
-                CONFIG_ISSUES+=("$MEDIUM_ISSUES")
-                HAS_ISSUES=true
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              fi
-              
-              if [ -n "$LOW_ISSUES" ]; then
-                CONFIG_ISSUES+=("$LOW_ISSUES")
-              fi
+            # Perform security checks directly
+            
+            # Check for latest tag (high severity)
+            if grep -E "FROM\s+\S+:latest" "$DOCKERFILE_PATH" > /dev/null; then
+              SECURITY_ISSUES="High: Using 'latest' tag"
+              HAS_HIGH_SEVERITY=true
+              HIGH_COUNT=$((HIGH_COUNT + 1))
+            fi
+            
+            # Check for missing USER instruction (medium severity)
+            if ! grep -q "USER" "$DOCKERFILE_PATH"; then
+              CONFIG_ISSUES+=("Missing USER instruction (runs as root)")
+            fi
+            
+            # Check for secrets in ENV (medium severity)
+            if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" > /dev/null; then
+              CONFIG_ISSUES+=("Potential secrets in ENV variables")
+            fi
+            
+            # Check for curl with insecure flag (medium severity)
+            if grep -E "curl\s+.*(-k|--insecure)" "$DOCKERFILE_PATH" > /dev/null; then
+              CONFIG_ISSUES+=("Using curl with insecure flag")
+            fi
+            
+            # Check for ADD instead of COPY (low severity)
+            if grep -q "ADD" "$DOCKERFILE_PATH"; then
+              CONFIG_ISSUES+=("Using ADD instead of COPY")
             fi
             
             # Generate the configuration issues string
@@ -259,6 +180,8 @@ jobs:
               CONFIG_ISSUES_STR="None"
             else
               CONFIG_ISSUES_STR=$(IFS=", "; echo "${CONFIG_ISSUES[*]}")
+              HAS_ISSUES=true
+              ISSUES_COUNT=$((ISSUES_COUNT + 1))
             fi
             
             # Set status based on findings
@@ -267,14 +190,19 @@ jobs:
               PASSED_COUNT=$((PASSED_COUNT + 1))
             elif [[ "$SECURITY_ISSUES" == High* ]]; then
               STATUS="❌ Fail"
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
             else
               STATUS="⚠️ Warning"
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
             fi
             
             REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${SECURITY_ISSUES}|${CONFIG_ISSUES_STR}")
             ROWS+=$'\n'"• ${DIR}: ${STATUS}"
+            
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Results for $DIR:"
+              echo "  Status: $STATUS"
+              echo "  Security Issues: $SECURITY_ISSUES"
+              echo "  Config Issues: $CONFIG_ISSUES_STR"
+            fi
           done
 
           # Set overall status
