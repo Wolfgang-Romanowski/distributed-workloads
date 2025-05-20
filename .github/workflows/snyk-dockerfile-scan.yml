@@ -97,6 +97,7 @@ jobs:
           PASSED_COUNT=0
           ISSUES_COUNT=0
           HIGH_COUNT=0
+          SCAN_FAILURES=0
           
           # Define image types for reporting
           declare -A IMAGE_TYPES
@@ -131,6 +132,12 @@ jobs:
             echo "============================================================"
             echo "  $1"
             echo "============================================================"
+          }
+          
+          # Function to extract base image from Dockerfile
+          extract_base_image() {
+            local dockerfile="$1"
+            grep "^FROM" "$dockerfile" | head -1 | awk '{print $2}'
           }
           
           # Scan each Dockerfile
@@ -172,57 +179,86 @@ jobs:
               echo "..."
             fi
             
-            echo "Running Snyk container test without build..."
+            # Extract the base image from the Dockerfile
+            BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH")
+            if [ -z "$BASE_IMAGE" ]; then
+              echo "Could not determine base image from Dockerfile. Using 'ubuntu:latest' as fallback."
+              BASE_IMAGE="ubuntu:latest"
+            else
+              echo "Detected base image: $BASE_IMAGE"
+            fi
             
-            # Use snyk container test with --file option to scan without building
-            # This aligns with the Slack conversation: "github actions would check out the dockerfile content on runner, 
-            # then snyk container test would analyze locally, only small manifests would be sent to snyk"
-            for ATTEMPT in {1..2}; do
-              echo "Scan attempt $ATTEMPT of 2..."
-              # Use --file option to tell Snyk to scan the Dockerfile without building
-              snyk container test --file="$DOCKERFILE_PATH" --app --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
-              SCAN_EXIT_CODE=$?
+            echo "Running Snyk container test..."
+            
+            # Method 1: Use snyk iac test for Dockerfile analysis (recommended for Dockerfiles)
+            echo "Using snyk iac test for Dockerfile analysis..."
+            snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
+            IAC_SCAN_EXIT_CODE=$?
+            
+            # Check if IaC scan worked or failed
+            if [ $IAC_SCAN_EXIT_CODE -gt 1 ] || grep -q "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
+              echo "IaC scan failed. Trying container test method..."
               
-              # Snyk's exit codes: 0=no issues, 1=issues found, >1=error
-              if [ $SCAN_EXIT_CODE -eq 0 ] || [ $SCAN_EXIT_CODE -eq 1 ]; then
-                if ! grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt" && ! grep -q "Failed to scan" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
-                  echo "Scan completed successfully"
-                  break
+              # Method 2: Use snyk container test with base image reference and file
+              echo "Using snyk container test with base image reference and file..."
+              snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --app --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
+              CONTAINER_SCAN_EXIT_CODE=$?
+              
+              # Check if container scan worked or failed
+              if [ $CONTAINER_SCAN_EXIT_CODE -gt 1 ] || grep -q "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
+                echo "Both scanning methods failed. Performing basic Dockerfile analysis."
+                
+                # Method 3: Basic Dockerfile analysis
+                echo "Performing basic Dockerfile analysis..."
+                
+                {
+                  echo "Manual Dockerfile Analysis:"
+                  echo ""
+                  echo "Base image: $BASE_IMAGE"
+                  echo ""
+                  
+                  # Check for common security issues
+                  if grep -i "FROM.*latest" "$DOCKERFILE_PATH" >/dev/null; then
+                    echo "WARNING: Using 'latest' tag (use specific versions)"
+                    CONFIG_ISSUES+=("Using 'latest' tag (use specific versions)")
+                  fi
+                  
+                  if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" >/dev/null; then
+                    echo "WARNING: Potential secrets in ENV"
+                    CONFIG_ISSUES+=("Potential secrets in ENV")
+                  fi
+                  
+                  if ! grep -q "USER" "$DOCKERFILE_PATH" >/dev/null; then
+                    echo "WARNING: Missing USER instruction (runs as root)"
+                    CONFIG_ISSUES+=("Missing USER instruction (runs as root)")
+                  fi
+                  
+                  echo ""
+                  echo "NOTE: This is a basic analysis performed because Snyk scanning failed."
+                } > "${SCAN_RESULTS_DIR}/scan_results.txt"
+                
+                # Set the status for manual scan
+                if [ ${#CONFIG_ISSUES[@]} -gt 0 ]; then
+                  VULN_ISSUES="Manual scan found issues"
                 else
-                  echo "Scan had errors, will retry or try alternative approach"
+                  VULN_ISSUES="Scan failed, basic check passed"
                 fi
-              fi
-              
-              if [ $ATTEMPT -eq 1 ]; then
-                sleep 2
-              fi
-            done
-            
-            # Check if scan failed and try alternative approach
-            if [ $SCAN_EXIT_CODE -gt 1 ] || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "Failed to scan" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
-              echo "Primary scan method failed, trying alternative Snyk approach..."
-              
-              # Alternative: Use Snyk IaC test for Dockerfile (still uses Snyk, not custom logic)
-              snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
-              SCAN_EXIT_CODE=$?
-              
-              if [ $SCAN_EXIT_CODE -gt 1 ] || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "Failed to scan" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
-                echo "Both scanning methods failed. Marking as issue."
-                VULN_ISSUES="Scan failed"
-                CONFIG_ISSUES+=("Snyk scan failed - check logs for details")
+                
+                # Mark as an issue
                 HAS_ISSUES=true
                 ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                SCAN_FAILURES=$((SCAN_FAILURES + 1))
               fi
             fi
             
             # Show scan output in debug mode or on failure
-            if [ "$DEBUG_MODE" = "true" ] || [ "$VULN_ISSUES" = "Scan failed" ]; then
+            if [ "$DEBUG_MODE" = "true" ] || [ "$VULN_ISSUES" = "Scan failed" ] || [ "$SCAN_FAILURES" -gt 0 ]; then
               echo "Scan output (first 15 lines):"
               head -n 15 "${SCAN_RESULTS_DIR}/scan_results.txt" || true
               echo "..."
             fi
             
-            # Parse Snyk results to determine severity (using only Snyk's output)
+            # Parse Snyk results to determine severity
             if grep -qi "critical vulnerability" "${SCAN_RESULTS_DIR}/scan_results.txt" 2>/dev/null; then
               VULN_ISSUES="Critical severity"
               HAS_HIGH_SEVERITY=true
@@ -237,9 +273,18 @@ jobs:
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
             elif grep -qi "low severity" "${SCAN_RESULTS_DIR}/scan_results.txt" 2>/dev/null; then
               VULN_ISSUES="Low severity"
+            elif grep -qi "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -qi "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
+              # Mark scanning errors if not already set
+              if [ "$VULN_ISSUES" = "None" ]; then
+                VULN_ISSUES="Scan failed"
+                CONFIG_ISSUES+=("Snyk scan failed - check logs")
+                HAS_ISSUES=true
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                SCAN_FAILURES=$((SCAN_FAILURES + 1))
+              fi
             fi
             
-            # Get configuration issues from Snyk results only
+            # Get configuration issues from Snyk results
             if grep -q "Recommendations for base image" "${SCAN_RESULTS_DIR}/scan_results.txt" 2>/dev/null; then
               CONFIG_ISSUES+=("Base image recommendations available")
             fi
@@ -279,6 +324,17 @@ jobs:
           print_section "Scan Summary"
           
           # Determine overall status
+          if [ $SCAN_FAILURES -gt 0 ]; then
+            SCAN_STATUS="⚠️ Scan failures: $SCAN_FAILURES"
+            HAS_ISSUES=true
+          elif $HAS_HIGH_SEVERITY; then
+            SCAN_STATUS="❌ Security issues found"
+          elif $HAS_ISSUES; then 
+            SCAN_STATUS="⚠️ Issues found"
+          else
+            SCAN_STATUS="✅ All secure"
+          fi
+          
           if $HAS_HIGH_SEVERITY; then
             OVERALL_STATUS="❌ Failed"
           elif $HAS_ISSUES; then 
@@ -301,12 +357,14 @@ jobs:
           echo "|:-------|:------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Scan Date** | $LON_DATE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Scan Status** | $SCAN_STATUS |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Snyk Version** | ${{ steps.snyk_version.outputs.version }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Scanner Mode** | Dockerfile Analysis (no build) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Total Images** | ${#DOCKERFILE_DIRS[@]} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Passed** | $PASSED_COUNT |" >> "$GITHUB_STEP_SUMMARY" 
           echo "| **Issues** | $ISSUES_COUNT |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Critical/High** | $HIGH_COUNT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Scan Failures** | $SCAN_FAILURES |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           
           echo "## Detailed Scan Results" >> "$GITHUB_STEP_SUMMARY"
@@ -339,16 +397,20 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Dockerfile Analysis** | Snyk container scan with --file option (no build) | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Base Image** | Scans base image for vulnerabilities | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **IaC Analysis** | Snyk IaC test for Dockerfile analysis | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Container Analysis** | Snyk container test with base image reference | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Best Practices** | Identifies Dockerfile best practices issues | Warning |" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Workflow uses Snyk container testing with --file option to avoid building large images" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Workflow avoids building Docker images but still performs security scanning" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
           echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> "$GITHUB_STEP_SUMMARY"
+          
+          if [ $SCAN_FAILURES -gt 0 ]; then
+            echo "- **⚠️ Some scans failed.** Basic analysis was performed instead." >> "$GITHUB_STEP_SUMMARY"
+          fi
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "---" >> "$GITHUB_STEP_SUMMARY"
@@ -356,9 +418,10 @@ jobs:
           echo "<details>" >> "$GITHUB_STEP_SUMMARY"
           echo "<summary>Technical Scan Information</summary>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scanner:** Snyk Container Test" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Primary Command:** \`snyk container test --file=Dockerfile --app --severity-threshold=medium\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Fallback Command:** \`snyk iac test Dockerfile --severity-threshold=medium\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Scanner:** Snyk" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Primary Method:** \`snyk iac test Dockerfile\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Secondary Method:** \`snyk container test <base-image> --file=Dockerfile\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Fallback Method:** Basic Dockerfile pattern analysis" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Workflow Run ID:** \`${{ github.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
@@ -392,6 +455,7 @@ jobs:
           echo "debug_mode=$DEBUG_MODE" >> $GITHUB_OUTPUT
           echo "snyk_version=${{ steps.snyk_version.outputs.version }}" >> $GITHUB_OUTPUT
           echo "scanner_mode=dockerfile" >> $GITHUB_OUTPUT
+          echo "scan_failures=$SCAN_FAILURES" >> $GITHUB_OUTPUT
           
           # Print final scan summary to logs
           print_section "Final Results"
@@ -400,6 +464,7 @@ jobs:
           echo "Passed: $PASSED_COUNT"
           echo "Issues: $ISSUES_COUNT"
           echo "Critical/High: $HIGH_COUNT"
+          echo "Scan Failures: $SCAN_FAILURES"
           
           # Fail the workflow if high severity issues are found
           if $HAS_HIGH_SEVERITY; then
@@ -436,7 +501,7 @@ jobs:
                   head -n 10 "$DIR/scan_results.txt"
                   
                   # Check for specific patterns
-                  if grep -q "ERROR" "$DIR/scan_results.txt"; then
+                  if grep -q "FATAL" "$DIR/scan_results.txt" || grep -q "ERROR" "$DIR/scan_results.txt"; then
                     echo "⚠️ ERROR found in scan output"
                   elif grep -q "vulnerability" "$DIR/scan_results.txt"; then
                     echo "🔍 Vulnerabilities found in scan output"
@@ -464,7 +529,8 @@ jobs:
           (steps.scan.outputs.status != 'secure' || 
           github.event.inputs.debug == 'true' || 
           github.event_name == 'schedule' ||
-          job.status == 'failure')
+          job.status == 'failure' ||
+          steps.scan.outputs.scan_failures != '0')
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
@@ -476,7 +542,7 @@ jobs:
                 {
                   "color": "${{ job.status == 'failure' && 'danger' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
                   "title": "Dockerfile Security Scan Results",
-                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || '⚠️ Security issues detected' }}\n${{ steps.scan.outputs.results }}\n\n*Scanner:* Snyk Container Test | *Version:* ${{ steps.scan.outputs.snyk_version || 'Unknown' }}",
+                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || steps.scan.outputs.scan_failures != '0' && '⚠️ Some scans failed' || '⚠️ Security issues detected' }}\n${{ steps.scan.outputs.results }}\n\n*Scanner:* Snyk | *Version:* ${{ steps.scan.outputs.snyk_version || 'Unknown' }}",
                   "mrkdwn_in": ["text"],
                   "footer": "Snyk Dockerfile Security Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
                 }
