@@ -1,20 +1,20 @@
-# Snyk Dockerfile Security Scan — **v4**
+# Snyk Dockerfile Security Scan — **v5**
 # -------------------------------------------------------------
-#  • Runs automatically on any branch whose name contains "snyk" in forks
-#    (push trigger) so you can iterate freely.
-#  • Keeps nightly run & manual dispatch.
-#  • Debug mode is ON for push events by default; can still be toggled in
+#  • Auth step now *mirrors the original script*: writes
+#    `~/.config/configstore/snyk.json` with the token so every CLI call
+#    is definitely authenticated (important in forks).
+#  • Branch filter changed to `"*snyk*"` — matches any branch containing
+#    the word `snyk` (e.g. `feature/snyk-test`).
+#  • Job display‑name aligned with workflow name.
+#  • Debug always **true** on push events; flag still respected for
 #    workflow‑dispatch.
-#  • Duplicate `schedule` and `workflow_dispatch` blocks removed.
 
 name: Snyk Dockerfile Security Scan
 
 on:
-  # Test automatically on branches that include "snyk" in their name
-  # when you push in your fork.
   push:
     branches:
-      - "**snyk**"
+      - "*snyk*"          # auto‑test snyk branches in forks
     paths:
       - "images/runtime/training/*/Dockerfile"
 
@@ -44,7 +44,7 @@ on:
 
 jobs:
   snyk-dockerfile-scan:
-    name: Snyk Security Scan
+    name: Snyk Dockerfile Security Scan
     runs-on: ubuntu-latest
 
     if: >-
@@ -79,13 +79,18 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Verify token & CLI
+      - name: Verify token & create config
         id: cli-info
         run: |
           token_present=true
           if [ -z "${SNYK_TOKEN:-}" ]; then
             echo "::warning::SNYK_TOKEN secret is missing – security scan will be skipped."
             token_present=false
+          else
+            # Replicate original auth method: write configstore file
+            mkdir -p ~/.config/configstore
+            echo "{\"api\": \"$SNYK_TOKEN\"}" > ~/.config/configstore/snyk.json
+            chmod 600 ~/.config/configstore/snyk.json
           fi
 
           echo "cli_version=$(snyk --version)" >>"$GITHUB_OUTPUT"
@@ -102,15 +107,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          debug() { [ "${DEBUG_MODE}" = "true" ] && echo "[debug] $*" >&2; }
+          debug() { [ "$DEBUG_MODE" = "true" ] && echo "[debug] $*" >&2; }
 
           extract_base_image() {
             local file="$1"; declare -A args=()
             while IFS= read -r line; do
               if [[ $line =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
-                args["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]//["'] }"
+                args["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]//[\"\'] }"
               fi
-            done <"$file"
+            done < "$file"
             local img=$(grep -m1 '^FROM' "$file" | awk '{print $2}')
             for k in "${!args[@]}"; do
               img="${img//\$\{$k\}/${args[$k]}}"; img="${img//\$$k/${args[$k]}}"
@@ -119,7 +124,7 @@ jobs:
           }
 
           TRAINING_DIR="images/runtime/training"
-          if [ -n "${TARGET_DIR}" ]; then
+          if [ -n "$TARGET_DIR" ]; then
             DOCKER_DIRS=("$TARGET_DIR")
           else
             mapfile -t DOCKER_DIRS < <(find "$TRAINING_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort)
@@ -134,10 +139,10 @@ jobs:
 
             base_img=$(extract_base_image "$dockerfile"); debug "$dir base => $base_img"
             processed="processed_dockerfiles/${dir}_Dockerfile"
-            { echo "FROM $base_img"; grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$dockerfile"; } >"$processed"
+            { echo "FROM $base_img"; grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$dockerfile"; } > "$processed"
 
             out_json="scan_results/${dir}.json"
-            snyk container test --file="$processed" --json --severity-threshold=medium >"$out_json" || true; ec=$?
+            snyk container test --file="$processed" --json --severity-threshold=medium > "$out_json" || true; ec=$?
 
             if [ $ec -ge 2 ]; then echo "❌ $dir – Snyk error ($ec)"; OVERALL_PASS=false; continue; fi
             [ $ec -eq 1 ] && echo "⚠️  $dir – vulnerabilities detected" && OVERALL_PASS=false || echo "✅ $dir – clean"
@@ -145,8 +150,8 @@ jobs:
             hc=$(jq '[.vulnerabilities[] | select(.severity=="high" or .severity=="critical")] | length' "$out_json"); [ "$hc" -gt 0 ] && HIGH_OR_CRIT_COUNT=$((HIGH_OR_CRIT_COUNT+hc))
           done
 
-          echo "overall_pass=$OVERALL_PASS" >>"$GITHUB_OUTPUT"
-          echo "high_or_crit=$HIGH_OR_CRIT_COUNT" >>"$GITHUB_OUTPUT"
+          echo "overall_pass=$OVERALL_PASS" >> "$GITHUB_OUTPUT"
+          echo "high_or_crit=$HIGH_OR_CRIT_COUNT" >> "$GITHUB_OUTPUT"
 
       # ------------------------------ Slack ------------------------------
       - name: Slack Notification
