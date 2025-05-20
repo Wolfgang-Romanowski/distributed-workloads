@@ -1,5 +1,5 @@
 # Snyk scan for training‑runtime Dockerfiles
-# push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
+# push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
 # Fails on High/Critical CVEs
 name: Snyk Dockerfile Scan
 on:
@@ -39,17 +39,105 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
+      - name: Verify Snyk Authentication
+        id: auth_check
+        run: |
+          # Check if SNYK_TOKEN is set
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::warning::SNYK_TOKEN environment variable is not set"
+            echo "token_present=false" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::SNYK_TOKEN environment variable is set"
+            echo "token_present=true" >> $GITHUB_OUTPUT
+          fi
+          
+          # Try to authenticate and check account details
+          echo "Attempting to authenticate with Snyk..."
+          SNYK_OUTPUT=$(snyk auth || echo "Authentication failed")
+          
+          if echo "$SNYK_OUTPUT" | grep -q "Authentication failed"; then
+            echo "::error::Snyk authentication failed"
+            echo "authenticated=false" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Snyk authentication successful"
+            echo "authenticated=true" >> $GITHUB_OUTPUT
+            
+            # Get account info to verify authentication
+            ACCOUNT_INFO=$(snyk config get api || echo "Failed to get API info")
+            if echo "$ACCOUNT_INFO" | grep -q "Failed"; then
+              echo "::warning::Could not verify account information"
+              echo "account_verified=false" >> $GITHUB_OUTPUT
+            else
+              echo "::notice::Account information verified"
+              echo "account_verified=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Create Test Dockerfile with Known Vulnerability
+        run: |
+          # Only create test file if we're in debug mode
+          if [ "$DEBUG_MODE" = "true" ]; then
+            # Create a test Dockerfile with a known vulnerable base image
+            echo "FROM debian:8.0" > test_vulnerable.Dockerfile
+            echo "RUN apt-get update && apt-get install -y openssl=1.0.1t-1+deb8u7" >> test_vulnerable.Dockerfile
+            echo "::notice::Created test Dockerfile with known vulnerabilities"
+          fi
+        env:
+          DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' }}
+
+      - name: Test Scan with Known Vulnerability
+        id: test_scan
+        if: env.DEBUG_MODE == 'true'
+        run: |
+          echo "Testing Snyk with a known vulnerable Dockerfile..."
+          VULN_OUTPUT=$(snyk container test --file=test_vulnerable.Dockerfile --json || echo '{"ok": false, "error": "Scan failed"}')
+          
+          # Check if vulnerabilities were detected as expected
+          if echo "$VULN_OUTPUT" | grep -q "vulnerability" || echo "$VULN_OUTPUT" | grep -q "vulnerabilities"; then
+            echo "::notice::Test successful - vulnerabilities detected in test Dockerfile"
+            echo "test_passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Test failed - no vulnerabilities detected in known vulnerable Dockerfile"
+            echo "test_passed=false" >> $GITHUB_OUTPUT
+            echo "$VULN_OUTPUT" > test_scan_output.txt
+          fi
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' }}
+
       - name: Scan Dockerfiles
         id: scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' }}
+          AUTH_STATUS: ${{ steps.auth_check.outputs.authenticated }}
+          TEST_STATUS: ${{ steps.test_scan.outputs.test_passed }}
         run: |
           set -euo pipefail
           
           if [ "$DEBUG_MODE" = "true" ]; then
             set -x
             echo "Running in debug mode"
+          fi
+          
+          # Print authentication status
+          if [ "$AUTH_STATUS" = "true" ]; then
+            echo "Snyk authentication verified ✅"
+          else
+            echo "::warning::Snyk is NOT properly authenticated ⚠️"
+            echo "::warning::Scan results may be inaccurate or incomplete"
+          fi
+          
+          # Print test scan status if in debug mode
+          if [ "$DEBUG_MODE" = "true" ]; then
+            if [ "$TEST_STATUS" = "true" ]; then
+              echo "Test scan correctly detected vulnerabilities ✅"
+            else
+              echo "::warning::Test scan failed to detect known vulnerabilities ⚠️"
+              echo "::warning::This indicates Snyk is not working properly"
+            fi
           fi
           
           HAS_HIGH_SEVERITY=false
@@ -75,6 +163,13 @@ jobs:
           
           REPORT_ROWS=()
           
+          # Add a notice about authentication status to the report
+          if [ "$AUTH_STATUS" != "true" ]; then
+            AUTH_WARNING="⚠️ WARNING: Snyk authentication failed. Scan results may be incomplete."
+          else
+            AUTH_WARNING=""
+          fi
+          
           for DIR in "${DOCKERFILE_DIRS[@]}"; do
             DOCKERFILE_PATH="images/runtime/training/${DIR}/Dockerfile"
             echo "Scanning ${DIR} Dockerfile..."
@@ -90,8 +185,16 @@ jobs:
             VULN_ISSUES="None"
             CONFIG_ISSUES=()
             SCAN_OUTPUT="${DIR}_snyk_output.txt"
+            
+            # Log detailed output for debugging
+            echo "Running: snyk container test --file=$DOCKERFILE_PATH --severity-threshold=medium --docker-skip-base-image-check"
+            
             snyk container test --file="$DOCKERFILE_PATH" --severity-threshold=medium --docker-skip-base-image-check > "$SCAN_OUTPUT" 2>&1 || true
             SCAN_EXIT_CODE=$?
+            
+            # Save first 50 lines of output for debugging
+            echo "First 50 lines of Snyk output:"
+            head -n 50 "$SCAN_OUTPUT"
             
             if [ $SCAN_EXIT_CODE -eq 0 ]; then
               echo "✅ Snyk scan passed with no vulnerabilities above threshold"
@@ -109,8 +212,13 @@ jobs:
                 VULN_ISSUES="Medium severity"
               fi
             else
-              snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "${DIR}_iac_output.txt" 2>&1 || true
-              VULN_ISSUES="Unknown (variables in base image)"
+              # Check if the failure was due to authentication
+              if grep -q "Authentication failed" "$SCAN_OUTPUT" || grep -q "Not authorized" "$SCAN_OUTPUT"; then
+                VULN_ISSUES="Cannot verify - authentication failed"
+              else
+                snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "${DIR}_iac_output.txt" 2>&1 || true
+                VULN_ISSUES="Unknown (variables in base image)"
+              fi
             fi
             
             if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" >/dev/null; then
@@ -149,11 +257,23 @@ jobs:
             OVERALL_STATUS="✅ All Secure"
           fi
 
+          # Add authentication warning to status if needed
+          if [ "$AUTH_STATUS" != "true" ]; then
+            OVERALL_STATUS="$OVERALL_STATUS ⚠️ (Authentication Failed)"
+          fi
+
           TZ=Europe/London
           export TZ
           LON_DATE="$(date '+%a %d %b %Y %T %Z')"
           
           echo "# Dockerfile Security Scan Results" > "$GITHUB_STEP_SUMMARY"
+
+          # Add authentication warning if needed
+          if [ "$AUTH_STATUS" != "true" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **WARNING: Snyk authentication failed. Scan results may be incomplete or inaccurate.**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           echo "## Summary Overview" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -161,6 +281,7 @@ jobs:
           echo "|:-------|:------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Scan Date** | $LON_DATE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Snyk Authenticated** | $AUTH_STATUS |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Total Images** | 4 |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Passed** | $PASSED_COUNT |" >> "$GITHUB_STEP_SUMMARY" 
           echo "| **Issues** | $ISSUES_COUNT |" >> "$GITHUB_STEP_SUMMARY"
@@ -218,6 +339,10 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Scanner:** Snyk Container + Dockerfile best-practices  " >> "$GITHUB_STEP_SUMMARY"
           echo "**Version:** Latest  " >> "$GITHUB_STEP_SUMMARY"
+          echo "**Authentication Status:** $AUTH_STATUS  " >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DEBUG_MODE" = "true" ]; then
+            echo "**Test Scan Status:** $TEST_STATUS  " >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "**Scan Parameters:** \`--severity-threshold=medium --docker-skip-base-image-check\`  " >> "$GITHUB_STEP_SUMMARY"
           echo "**Workflow Run ID:** \`${{ github.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -227,6 +352,8 @@ jobs:
           echo -e "${ROWS}" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+          echo "auth_status=$AUTH_STATUS" >> $GITHUB_OUTPUT
+          
           if $HAS_HIGH_SEVERITY; then
             echo "status=high_severity" >> $GITHUB_OUTPUT
           elif $HAS_ISSUES; then
@@ -250,7 +377,8 @@ jobs:
         if: >
           steps.scan.outputs.status != 'secure' || 
           steps.scan.outputs.debug_mode == 'true' || 
-          github.event_name == 'schedule'
+          github.event_name == 'schedule' ||
+          steps.scan.outputs.auth_status != 'true'
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
@@ -260,11 +388,11 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
+                  "color": "${{ steps.scan.outputs.auth_status != 'true' && 'danger' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
                   "title": "Dockerfile Security Scan Results",
-                  "text": "${{ steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || '⚠️ Security issues detected' }}\n${{ steps.scan.outputs.results }}",
+                  "text": "${{ steps.scan.outputs.auth_status != 'true' && '🚨 Snyk authentication failed - results unreliable' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || '⚠️ Security issues detected' }}\n${{ steps.scan.outputs.results }}",
                   "mrkdwn_in": ["text"],
-                  "footer": "Snyk Dockerfile Security Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
+                  "footer": "Snyk Dockerfile Scan | Auth: ${{ steps.scan.outputs.auth_status }} | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
                 }
               ]
             }
