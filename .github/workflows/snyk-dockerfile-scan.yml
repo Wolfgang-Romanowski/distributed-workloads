@@ -50,11 +50,8 @@ jobs:
 
       - name: Setup Snyk
         uses: snyk/actions/setup@master
-        env:
-          # Explicitly pass token to prevent browser-based auth
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Configure Snyk Token
+      - name: Configure Snyk
         id: verify_token
         run: |
           # Check if SNYK_TOKEN is set
@@ -75,6 +72,8 @@ jobs:
       # Check that Snyk CLI works properly
       - name: Test Snyk CLI
         id: snyk_version
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           SNYK_VERSION=$(snyk --version || echo "Unknown")
           echo "version=$SNYK_VERSION" >> $GITHUB_OUTPUT
@@ -82,6 +81,7 @@ jobs:
           
           # Verify authentication by testing a command
           echo "Verifying Snyk authentication..."
+          snyk auth "${{ secrets.SNYK_TOKEN }}"
           snyk --version
 
       - name: Scan Dockerfiles
@@ -138,7 +138,6 @@ jobs:
           
           # Create results directory for scans
           mkdir -p scan_results
-          mkdir -p processed_dockerfiles
           
           # Function to print section headers for better readability in logs
           print_section() {
@@ -147,16 +146,24 @@ jobs:
             echo "============================================================"
           }
           
-          # Function to extract and resolve base image from Dockerfile
-          # Properly separates debug output from actual return value
+          # Improved function to extract base image from Dockerfile
           extract_base_image() {
             local dockerfile="$1"
-            local dir_name="$2"
             
-            # Extract all ARG definitions and their values
+            # First try to get the FROM line and extract just the base image
+            base_image=$(grep -m 1 "^FROM" "$dockerfile" | awk '{print $2}' || echo "")
+            
+            # Handle multi-stage builds by removing stage name if present
+            base_image=$(echo "$base_image" | sed 's/ AS .*//g')
+            
+            # If empty, use a default
+            if [ -z "$base_image" ]; then
+              echo "ubuntu:latest"
+              return
+            fi
+            
+            # Extract ARG values from Dockerfile
             declare -A arg_values
-            
-            # Extract all ARG definitions with default values
             while IFS= read -r line; do
               if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
                 var_name="${BASH_REMATCH[1]}"
@@ -166,87 +173,35 @@ jobs:
                 var_value="${var_value//\'/}"
                 arg_values["$var_name"]="$var_value"
                 if [ "$DEBUG_MODE" = "true" ]; then
-                  # Debug output to stderr so it doesn't get captured
                   echo "Extracted ARG $var_name = ${arg_values[$var_name]}" >&2
                 fi
               fi
             done < "$dockerfile"
             
-            # Extract the FROM line
-            from_line=$(grep -m 1 "^FROM" "$dockerfile" || echo "FROM ubuntu:latest")
-            if [ "$DEBUG_MODE" = "true" ]; then
-              echo "Original FROM line: $from_line" >&2
-            fi
-            
-            # Extract base image with potential variables
-            base_image=$(echo "$from_line" | awk '{print $2}')
-            if [ "$DEBUG_MODE" = "true" ]; then
-              echo "Base image with variables: $base_image" >&2
-            fi
-            
             # Replace variables in base image
-            resolved_image="$base_image"
             for var_name in "${!arg_values[@]}"; do
-              resolved_image="${resolved_image//\$\{$var_name\}/${arg_values[$var_name]}}"
-              resolved_image="${resolved_image//\$$var_name/${arg_values[$var_name]}}"
+              base_image="${base_image//\$\{$var_name\}/${arg_values[$var_name]}}"
+              base_image="${base_image//\$$var_name/${arg_values[$var_name]}}"
             done
             
-            # Special case: Fixed replacements for known directories
-            case "$dir_name" in
-              py311-cuda121-torch241)
-                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  if [ "$DEBUG_MODE" = "true" ]; then
-                    echo "Falling back to known base image for $dir_name" >&2
-                  fi
-                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
-                fi
-                ;;
-              py311-cuda124-torch251)
-                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  if [ "$DEBUG_MODE" = "true" ]; then
-                    echo "Falling back to known base image for $dir_name" >&2
-                  fi
-                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
-                fi
-                ;;
-              py311-rocm62-torch241)
-                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  if [ "$DEBUG_MODE" = "true" ]; then
-                    echo "Falling back to known base image for $dir_name" >&2
-                  fi
-                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
-                fi
-                ;;
-              py311-rocm62-torch251)
-                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  if [ "$DEBUG_MODE" = "true" ]; then
-                    echo "Falling back to known base image for $dir_name" >&2
-                  fi
-                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
-                fi
-                ;;
-            esac
-            
-            if [ "$DEBUG_MODE" = "true" ]; then
-              echo "Resolved base image: $resolved_image" >&2
-            fi
-            
-            # Only output the resolved image name, with no debug info
-            echo "$resolved_image"
+            # Return resolved image
+            echo "$base_image"
           }
           
-          # Fix for Snyk API connectivity issues
+          # Function to check Snyk API connectivity
           test_snyk_connectivity() {
-            # Test API connectivity
+            echo "Testing Snyk API connectivity..."
             if ! curl -s -o /dev/null -w "%{http_code}" -X GET "https://api.snyk.io/v1/user/me" -H "Authorization: token $SNYK_TOKEN"; then
-              echo "Warning: Snyk API connectivity test failed. Continuing anyway..."
+              echo "Warning: Snyk API connectivity test failed. Will retry authentication."
+              # Try re-authenticating
+              snyk auth "$SNYK_TOKEN"
             fi
           }
           
           # Test connectivity before starting
           test_snyk_connectivity
           
-          # Scan each Dockerfile
+          # For each Dockerfile directory
           for DIR in "${DOCKERFILE_DIRS[@]}"; do
             DOCKERFILE_PATH="$TRAINING_DIR/${DIR}/Dockerfile"
             print_section "Scanning ${DIR} Dockerfile"
@@ -275,88 +230,87 @@ jobs:
             CONFIG_ISSUES=()
             SCAN_RESULTS_FILE="scan_results/${DIR}-results.json"
             
-            # Extract the base image from Dockerfile (getting only the image name)
-            # This time we make sure to only get the actual image name
-            BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH" "$DIR")
+            # Extract the base image from Dockerfile
+            BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH")
             echo "Identified base image: $BASE_IMAGE"
             
             # Check if base image still contains variables
             if [[ "$BASE_IMAGE" == *"\$"* ]] || [[ "$BASE_IMAGE" == *"{"* ]]; then
-              echo "Warning: Base image still contains unresolved variables - using ubuntu:latest"
-              BASE_IMAGE="ubuntu:latest"
+              echo "Warning: Base image still contains unresolved variables: $BASE_IMAGE"
+              echo "Using fallback base image based on directory name."
+              
+              # Use known base images for specific directories
+              case "$DIR" in
+                py311-cuda*)
+                  BASE_IMAGE="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                  ;;
+                py311-rocm*)
+                  BASE_IMAGE="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                  ;;
+                *)
+                  BASE_IMAGE="ubuntu:latest"
+                  ;;
+              esac
+              echo "Using fallback base image: $BASE_IMAGE"
             fi
             
-            # Create a processed Dockerfile with the resolved base image
-            PROCESSED_DOCKERFILE="processed_dockerfiles/${DIR}_Dockerfile"
+            echo "Running Snyk container test on base image $BASE_IMAGE..."
             
-            # Create a simplified Dockerfile with the resolved base image
-            {
-              echo "FROM $BASE_IMAGE"
-              echo "# The rest of the Dockerfile is included below but simplified for scanning"
-              grep -v "^FROM" "$DOCKERFILE_PATH" | grep -v "^ARG" >> "$PROCESSED_DOCKERFILE"
-            }
-            
-            echo "Created processed Dockerfile at $PROCESSED_DOCKERFILE for scanning"
-            
-            # Run Snyk container test on the processed Dockerfile
-            echo "Running Snyk container test on processed Dockerfile..."
-            HAS_VULNS=false
-            
-            # First try: scan the processed Dockerfile
-            if snyk container test --file="$PROCESSED_DOCKERFILE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
+            # First: Try running Snyk's test with --file-path option which is better for Dockerfiles
+            if snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
               echo "Scan completed successfully without vulnerabilities for $DIR"
               VULN_ISSUES="No vulnerabilities"
               PASSED_COUNT=$((PASSED_COUNT + 1))
             else
               SNYK_EXIT_CODE=$?
               
-              # Exit code 1 means vulnerabilities were found (this is actually "successful")
               if [ $SNYK_EXIT_CODE -eq 1 ]; then
+                # Exit code 1 means vulnerabilities were found (this is actually "successful")
                 echo "Vulnerabilities found in $DIR (exit code 1)"
                 HAS_VULNS=true
                 HAS_ISSUES=true
-              else
-                echo "Snyk scan failed for $DIR with exit code $SNYK_EXIT_CODE"
-                if [ "$DEBUG_MODE" = "true" ]; then
-                  cat scan_results/${DIR}-error.log
-                fi
+              elif [ $SNYK_EXIT_CODE -eq 2 ]; then
+                # Exit code 2 is a Snyk error - try fallback to just the base image
+                echo "Snyk scan with --file failed with exit code 2. Trying just the base image..."
                 
-                # Try scanning just the base image if it doesn't have variables
-                if [[ "$BASE_IMAGE" != *"\$"* ]] && [[ "$BASE_IMAGE" != *"{"* ]]; then
-                  echo "Trying to scan just the base image as fallback..."
-                  
-                  # Second try: scan just the base image
-                  if snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
-                    echo "Base image scan succeeded without vulnerabilities"
-                    VULN_ISSUES="No vulnerabilities (base image only)"
-                    PASSED_COUNT=$((PASSED_COUNT + 1))
-                  elif [ $? -eq 1 ]; then
-                    echo "Base image scan found vulnerabilities"
-                    HAS_VULNS=true
-                    HAS_ISSUES=true
-                  else
-                    SCAN_FAILURES=$((SCAN_FAILURES + 1))
-                    echo "Base image scan also failed"
-                    VULN_ISSUES="Scan failed"
-                    CONFIG_ISSUES+=("Snyk scan failed - check logs")
-                    REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs")
-                    ROWS+=$'\n'"• ${DIR}: ❌ Failed (scan error)"
-                    HAS_ISSUES=true
-                    ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                    continue
-                  fi
+                if snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
+                  echo "Base image scan succeeded without vulnerabilities"
+                  VULN_ISSUES="No vulnerabilities (base image only)"
+                  PASSED_COUNT=$((PASSED_COUNT + 1))
+                elif [ $? -eq 1 ]; then
+                  # Vulnerabilities found
+                  echo "Base image scan found vulnerabilities"
+                  HAS_VULNS=true
+                  HAS_ISSUES=true
                 else
-                  # Base image has unresolved variables - can't scan it
+                  # Scanning failed completely
                   SCAN_FAILURES=$((SCAN_FAILURES + 1))
-                  echo "Base image has unresolved variables - can't scan it"
+                  echo "Base image scan also failed - check scan_results/${DIR}-error.log for details"
+                  if [ "$DEBUG_MODE" = "true" ]; then
+                    cat scan_results/${DIR}-error.log
+                  fi
                   VULN_ISSUES="Scan failed"
-                  CONFIG_ISSUES+=("Base image has unresolved variables")
-                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Base image has unresolved variables")
-                  ROWS+=$'\n'"• ${DIR}: ❌ Failed (unresolved variables)"
+                  CONFIG_ISSUES+=("Snyk scan failed - check logs")
+                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs")
+                  ROWS+=$'\n'"• ${DIR}: ❌ Failed (scan error)"
                   HAS_ISSUES=true
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
                   continue
                 fi
+              else
+                # Other error code
+                SCAN_FAILURES=$((SCAN_FAILURES + 1))
+                echo "Snyk scan failed with unexpected exit code: $SNYK_EXIT_CODE"
+                if [ "$DEBUG_MODE" = "true" ]; then
+                  cat scan_results/${DIR}-error.log
+                fi
+                VULN_ISSUES="Scan failed"
+                CONFIG_ISSUES+=("Snyk scan failed with code $SNYK_EXIT_CODE")
+                REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Unexpected error (code $SNYK_EXIT_CODE)")
+                ROWS+=$'\n'"• ${DIR}: ❌ Failed (unexpected error)"
+                HAS_ISSUES=true
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                continue
               fi
             fi
             
@@ -381,7 +335,7 @@ jobs:
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
                 elif jq -e '.vulnerabilities[] | select(.severity == "low")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
                   VULN_ISSUES="Low severity" 
-                elif $HAS_VULNS; then
+                elif [ "${HAS_VULNS:-false}" = "true" ]; then
                   # Fallback if there are vulnerabilities but we couldn't detect them
                   VULN_ISSUES="Unknown severity"
                   HAS_ISSUES=true
@@ -414,7 +368,7 @@ jobs:
                   cat "$SCAN_RESULTS_FILE" | head -n 20
                 fi
                 
-                if $HAS_VULNS; then
+                if [ "${HAS_VULNS:-false}" = "true" ]; then
                   VULN_ISSUES="Issues found (details unavailable)"
                   HAS_ISSUES=true
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -447,7 +401,12 @@ jobs:
               echo "Scan completed for $DIR with status: $STATUS"
               
               # Save human-readable results as well
-              snyk container test --file="$PROCESSED_DOCKERFILE" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null || true
+              if [ "$STATUS" = "❌ Fail" ] || [ "$STATUS" = "⚠️ Warning" ] || [ "$DEBUG_MODE" = "true" ]; then
+                echo "Saving human-readable results for $DIR"
+                snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null || 
+                snyk container test "$BASE_IMAGE" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null || 
+                echo "Failed to generate human-readable results" > "scan_results/${DIR}-readable.txt"
+              fi
             else
               echo "No scan results file found for $DIR"
               REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|No scan results|Snyk scan failed to produce results")
@@ -534,8 +493,8 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Container Analysis** | Snyk container test with Dockerfile | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Base Image Fallback** | Snyk container test on base image | Used when Dockerfile scan fails |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Dockerfile Analysis** | Snyk container test with --file option | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Base Image Analysis** | Snyk container test on base image | Used when Dockerfile scan fails |" >> "$GITHUB_STEP_SUMMARY"
           
           # If debug mode is enabled, add detailed output of scan results
           if [ "$DEBUG_MODE" = "true" ]; then
@@ -561,9 +520,9 @@ jobs:
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run directly using Snyk's container test functionality" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Preprocesses Dockerfiles to resolve variables in base images" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
           echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> "$GITHUB_STEP_SUMMARY"
+          echo "- No container images are built during this process" >> "$GITHUB_STEP_SUMMARY"
           
           if [ $SCAN_FAILURES -gt 0 ]; then
             echo "- **⚠️ Some scans failed.** Check the logs for details." >> "$GITHUB_STEP_SUMMARY"
