@@ -664,15 +664,8 @@ jobs:
             exit 1
           fi
 
-      - name: Archive Scan Results
-        if: always()
-        uses: actions/upload-artifact@v2
-        with:
-          name: snyk-scan-results
-          path: |
-            test_results/
-            scan_results/
-          retention-days: 7
+      # Note: Artifact upload step has been removed due to compatibility issues
+      # Results are still available in the job summary and Slack notifications
 
       - name: Slack Notification
         if: >
