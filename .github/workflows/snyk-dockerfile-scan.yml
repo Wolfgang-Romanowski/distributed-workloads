@@ -73,6 +73,12 @@ jobs:
           echo "version=$SNYK_VERSION" >> $GITHUB_OUTPUT
           echo "Snyk Version: $SNYK_VERSION"
 
+      - name: Verify Snyk Authentication
+        run: |
+          echo "Verifying Snyk authentication..."
+          snyk auth || echo "Snyk authentication may not be properly configured"
+          snyk config get api || echo "Failed to get Snyk API configuration"
+
       - name: Scan Dockerfiles
         id: scan
         env:
@@ -134,11 +140,115 @@ jobs:
             echo "============================================================"
           }
           
-          # Function to extract base image from Dockerfile
+          # Function to extract and interpolate base image from Dockerfile
           extract_base_image() {
             local dockerfile="$1"
-            grep "^FROM" "$dockerfile" | head -1 | awk '{print $2}'
+            local dir_name="$2"
+            
+            # Extract all ARG definitions and their values
+            declare -A arg_values
+            
+            # First path: extract all ARG definitions with default values
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
+                var_name="${BASH_REMATCH[1]}"
+                var_value="${BASH_REMATCH[2]}"
+                # Remove any quotes from value
+                var_value="${var_value//\"/}"
+                var_value="${var_value//\'/}"
+                arg_values["$var_name"]="$var_value"
+                echo "Extracted ARG $var_name = ${arg_values[$var_name]}"
+              fi
+            done < "$dockerfile"
+            
+            # Extract the FROM line
+            from_line=$(grep -m 1 "^FROM" "$dockerfile" || echo "FROM ubuntu:latest")
+            echo "Original FROM line: $from_line"
+            
+            # Extract base image with potential variables
+            base_image=$(echo "$from_line" | awk '{print $2}')
+            echo "Base image with variables: $base_image"
+            
+            # Replace variables in base image
+            resolved_image="$base_image"
+            for var_name in "${!arg_values[@]}"; do
+              resolved_image="${resolved_image//\$\{$var_name\}/${arg_values[$var_name]}}"
+              resolved_image="${resolved_image//\$$var_name/${arg_values[$var_name]}}"
+            done
+            
+            # Special case: Fixed replacements for the known directory structure
+            # This ensures we get useful known base images even if ARG extraction fails
+            case "$dir_name" in
+              py311-cuda121-torch241)
+                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
+                  echo "Falling back to known base image for $dir_name"
+                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                fi
+                ;;
+              py311-cuda124-torch251)
+                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
+                  echo "Falling back to known base image for $dir_name"
+                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                fi
+                ;;
+              py311-rocm62-torch241)
+                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
+                  echo "Falling back to known base image for $dir_name"
+                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                fi
+                ;;
+              py311-rocm62-torch251)
+                if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
+                  echo "Falling back to known base image for $dir_name"
+                  resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                fi
+                ;;
+            esac
+            
+            echo "Resolved base image: $resolved_image"
+            echo "$resolved_image"
           }
+          
+          # Function to check for common security issues in Dockerfile
+          check_dockerfile_security() {
+            local dockerfile="$1"
+            local issues=()
+            
+            # Check for 'latest' tag in FROM
+            if grep -i "FROM.*latest" "$dockerfile" >/dev/null; then
+              issues+=("Using 'latest' tag (use specific versions)")
+            fi
+            
+            # Check for potential secrets in ENV
+            if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$dockerfile" >/dev/null; then
+              issues+=("Potential secrets in ENV")
+            fi
+            
+            # Check for missing USER instruction
+            if ! grep -q "USER" "$dockerfile" >/dev/null; then
+              issues+=("Missing USER instruction (runs as root)")
+            fi
+            
+            # Check for insecure downloads
+            if grep -i "RUN.*curl.*http:" "$dockerfile" >/dev/null || grep -i "RUN.*wget.*http:" "$dockerfile" >/dev/null; then
+              issues+=("Insecure downloads (HTTP)")
+            fi
+            
+            # Check for missing cleanup after package install
+            if grep -i "RUN.*apt-get.*-y" "$dockerfile" >/dev/null && ! grep -i "apt-get clean" "$dockerfile" >/dev/null; then
+              issues+=("Missing cleanup after package install")
+            fi
+            
+            # Check for unpinned pip packages
+            if grep -i "RUN.*pip install" "$dockerfile" >/dev/null && ! grep -i "pip install.*==.*" "$dockerfile" >/dev/null; then
+              issues+=("Unpinned pip packages")
+            fi
+            
+            echo "${issues[@]}"
+          }
+          
+          # Create a temporary directory to store processed Dockerfiles
+          mkdir -p "processed_dockerfiles"
           
           # Scan each Dockerfile
           for DIR in "${DOCKERFILE_DIRS[@]}"; do
@@ -175,73 +285,98 @@ jobs:
             if [ "$DEBUG_MODE" = "true" ]; then
               echo "Dockerfile path: $DOCKERFILE_PATH"
               echo "First few lines of Dockerfile:"
-              head -n 5 "$DOCKERFILE_PATH"
+              head -n 10 "$DOCKERFILE_PATH"
               echo "..."
             fi
             
-            # Extract the base image from the Dockerfile
-            BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH")
-            if [ -z "$BASE_IMAGE" ]; then
-              echo "Could not determine base image from Dockerfile. Using 'ubuntu:latest' as fallback."
+            # Extract and resolve the base image with variables
+            BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH" "$DIR")
+            if [[ "$BASE_IMAGE" == *"\$"* ]] || [[ "$BASE_IMAGE" == *"{"* ]]; then
+              echo "Warning: Base image still contains unresolved variables: $BASE_IMAGE"
+              echo "Using ubuntu:latest as fallback"
               BASE_IMAGE="ubuntu:latest"
-            else
-              echo "Detected base image: $BASE_IMAGE"
             fi
+            
+            # Create a processed Dockerfile for scanning
+            PROCESSED_DOCKERFILE="processed_dockerfiles/${DIR}_Dockerfile"
+            
+            # Create a simplified Dockerfile with the resolved base image
+            {
+              echo "FROM $BASE_IMAGE"
+              echo "# The rest of the Dockerfile is included below but simplified for scanning"
+              grep -v "^FROM" "$DOCKERFILE_PATH" | grep -v "^ARG" >> "$PROCESSED_DOCKERFILE"
+            }
+            
+            echo "Created processed Dockerfile at $PROCESSED_DOCKERFILE for scanning"
             
             echo "Running Snyk container test..."
             
-            # Method 1: Use snyk iac test for Dockerfile analysis (recommended for Dockerfiles)
-            echo "Using snyk iac test for Dockerfile analysis..."
-            snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
-            IAC_SCAN_EXIT_CODE=$?
+            # Method 1: Use snyk container test with file
+            echo "Using Snyk container test with processed Dockerfile..."
+            snyk container test "$BASE_IMAGE" --file="$PROCESSED_DOCKERFILE" --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
+            CONTAINER_SCAN_EXIT_CODE=$?
             
-            # Check if IaC scan worked or failed
-            if [ $IAC_SCAN_EXIT_CODE -gt 1 ] || grep -q "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
-              echo "IaC scan failed. Trying container test method..."
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Snyk container test exit code: $CONTAINER_SCAN_EXIT_CODE"
+              echo "First 20 lines of container test output:"
+              head -n 20 "${SCAN_RESULTS_DIR}/scan_results.txt"
+              echo "..."
+            fi
+            
+            # Check if container scan worked or failed
+            if [ $CONTAINER_SCAN_EXIT_CODE -gt 1 ] || grep -q "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
+              echo "Container scan failed. Trying IaC scan method..."
               
-              # Method 2: Use snyk container test with base image reference and file
-              echo "Using snyk container test with base image reference and file..."
-              snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --app --severity-threshold=medium > "${SCAN_RESULTS_DIR}/scan_results.txt" 2>&1 || true
-              CONTAINER_SCAN_EXIT_CODE=$?
+              # Method 2: Use snyk iac test for Dockerfile analysis
+              echo "Using snyk iac test for Dockerfile analysis..."
+              snyk iac test "$PROCESSED_DOCKERFILE" --severity-threshold=medium > "${SCAN_RESULTS_DIR}/iac_scan.txt" 2>&1 || true
+              IAC_SCAN_EXIT_CODE=$?
               
-              # Check if container scan worked or failed
-              if [ $CONTAINER_SCAN_EXIT_CODE -gt 1 ] || grep -q "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -q "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
-                echo "Both scanning methods failed. Performing basic Dockerfile analysis."
+              if [ "$DEBUG_MODE" = "true" ]; then
+                echo "Snyk IaC test exit code: $IAC_SCAN_EXIT_CODE"
+                echo "First 20 lines of IaC test output:"
+                head -n 20 "${SCAN_RESULTS_DIR}/iac_scan.txt"
+                echo "..."
+              fi
+              
+              # If IaC scan worked, use its results
+              if [ $IAC_SCAN_EXIT_CODE -eq 0 ] || [ $IAC_SCAN_EXIT_CODE -eq 1 ] && ! grep -q "FATAL" "${SCAN_RESULTS_DIR}/iac_scan.txt" && ! grep -q "ERROR" "${SCAN_RESULTS_DIR}/iac_scan.txt"; then
+                echo "IaC scan successful, using results"
+                cp "${SCAN_RESULTS_DIR}/iac_scan.txt" "${SCAN_RESULTS_DIR}/scan_results.txt"
+              else
+                echo "Both scanning methods failed. Performing enhanced Dockerfile analysis."
                 
-                # Method 3: Basic Dockerfile analysis
-                echo "Performing basic Dockerfile analysis..."
+                # Method 3: Enhanced Dockerfile analysis
+                echo "Performing enhanced Dockerfile analysis..."
+                
+                # Get security issues from custom function
+                security_issues=($(check_dockerfile_security "$DOCKERFILE_PATH"))
                 
                 {
-                  echo "Manual Dockerfile Analysis:"
+                  echo "Enhanced Dockerfile Analysis:"
                   echo ""
                   echo "Base image: $BASE_IMAGE"
                   echo ""
+                  echo "Security findings:"
                   
-                  # Check for common security issues
-                  if grep -i "FROM.*latest" "$DOCKERFILE_PATH" >/dev/null; then
-                    echo "WARNING: Using 'latest' tag (use specific versions)"
-                    CONFIG_ISSUES+=("Using 'latest' tag (use specific versions)")
-                  fi
-                  
-                  if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" >/dev/null; then
-                    echo "WARNING: Potential secrets in ENV"
-                    CONFIG_ISSUES+=("Potential secrets in ENV")
-                  fi
-                  
-                  if ! grep -q "USER" "$DOCKERFILE_PATH" >/dev/null; then
-                    echo "WARNING: Missing USER instruction (runs as root)"
-                    CONFIG_ISSUES+=("Missing USER instruction (runs as root)")
+                  if [ ${#security_issues[@]} -eq 0 ]; then
+                    echo "No security issues found in basic analysis."
+                  else
+                    for issue in "${security_issues[@]}"; do
+                      echo "- WARNING: $issue"
+                      CONFIG_ISSUES+=("$issue")
+                    done
                   fi
                   
                   echo ""
-                  echo "NOTE: This is a basic analysis performed because Snyk scanning failed."
+                  echo "NOTE: This is an enhanced analysis performed because Snyk scanning failed."
                 } > "${SCAN_RESULTS_DIR}/scan_results.txt"
                 
-                # Set the status for manual scan
+                # Set the status for enhanced scan
                 if [ ${#CONFIG_ISSUES[@]} -gt 0 ]; then
-                  VULN_ISSUES="Manual scan found issues"
+                  VULN_ISSUES="Enhanced scan found issues"
                 else
-                  VULN_ISSUES="Scan failed, basic check passed"
+                  VULN_ISSUES="Scan failed, enhanced check passed"
                 fi
                 
                 # Mark as an issue
@@ -273,6 +408,8 @@ jobs:
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
             elif grep -qi "low severity" "${SCAN_RESULTS_DIR}/scan_results.txt" 2>/dev/null; then
               VULN_ISSUES="Low severity"
+            elif grep -qi "no vulnerable paths found" "${SCAN_RESULTS_DIR}/scan_results.txt" 2>/dev/null || grep -qi "no issues found" "${SCAN_RESULTS_DIR}/scan_results.txt" 2>/dev/null; then
+              VULN_ISSUES="No vulnerabilities"
             elif grep -qi "FATAL" "${SCAN_RESULTS_DIR}/scan_results.txt" || grep -qi "ERROR" "${SCAN_RESULTS_DIR}/scan_results.txt"; then
               # Mark scanning errors if not already set
               if [ "$VULN_ISSUES" = "None" ]; then
@@ -304,7 +441,7 @@ jobs:
               CONFIG_ISSUES_STR=$(printf "%s; " "${CONFIG_ISSUES[@]}" | sed 's/; $//')
             fi
             
-            if [ "$VULN_ISSUES" = "None" ] && [ "$CONFIG_ISSUES_STR" = "None" ]; then
+            if [ "$VULN_ISSUES" = "None" ] || [ "$VULN_ISSUES" = "No vulnerabilities" ] && [ "$CONFIG_ISSUES_STR" = "None" ]; then
               STATUS="✅ Pass"
               PASSED_COUNT=$((PASSED_COUNT + 1))
             elif [ "$VULN_ISSUES" = "Critical severity" ] || [ "$VULN_ISSUES" = "High severity" ] || [ "$VULN_ISSUES" = "Scan failed" ]; then
@@ -397,19 +534,21 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **IaC Analysis** | Snyk IaC test for Dockerfile analysis | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Container Analysis** | Snyk container test with base image reference | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Container Analysis** | Snyk container test with resolved base image | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **IaC Analysis** | Snyk IaC test for processed Dockerfile | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Best Practices** | Identifies Dockerfile best practices issues | Warning |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Enhanced Analysis** | Custom security pattern detection | Warning |" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Workflow avoids building Docker images but still performs security scanning" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Workflow resolves base image variables before scanning to handle ARG/ENV usage" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Avoids building Docker images while still performing security scanning" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
           echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> "$GITHUB_STEP_SUMMARY"
           
           if [ $SCAN_FAILURES -gt 0 ]; then
-            echo "- **⚠️ Some scans failed.** Basic analysis was performed instead." >> "$GITHUB_STEP_SUMMARY"
+            echo "- **⚠️ Some scans failed.** Enhanced analysis was performed instead." >> "$GITHUB_STEP_SUMMARY"
           fi
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -419,15 +558,26 @@ jobs:
           echo "<summary>Technical Scan Information</summary>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Scanner:** Snyk" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Primary Method:** \`snyk iac test Dockerfile\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Secondary Method:** \`snyk container test <base-image> --file=Dockerfile\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Fallback Method:** Basic Dockerfile pattern analysis" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Primary Method:** \`snyk container test <resolved-base-image> --file=Dockerfile\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Secondary Method:** \`snyk iac test Dockerfile\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Fallback Method:** Enhanced Dockerfile pattern analysis" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Workflow Run ID:** \`${{ github.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
           
           # If debug mode is enabled, print detailed logs
           if [ "$DEBUG_MODE" = "true" ]; then
+            print_section "Debug: Processed Dockerfiles"
+            echo "Contents of processed Dockerfiles:"
+            for DIR in "${DOCKERFILE_DIRS[@]}"; do
+              PROCESSED_DOCKERFILE="processed_dockerfiles/${DIR}_Dockerfile"
+              if [ -f "$PROCESSED_DOCKERFILE" ]; then
+                echo "Processed Dockerfile for $DIR:"
+                cat "$PROCESSED_DOCKERFILE"
+                echo ""
+              fi
+            done
+            
             print_section "Debug: Scan Results Details"
             for DIR in "${DOCKERFILE_DIRS[@]}"; do
               if [ -f "scan_results/${DIR}/scan_results.txt" ]; then
@@ -488,6 +638,10 @@ jobs:
             echo "Scan directories:"
             ls -la scan_results/
             
+            # List processed Dockerfiles
+            echo "Processed Dockerfiles:"
+            ls -la processed_dockerfiles/
+            
             # Show brief summary of each scan result
             for DIR in scan_results/*; do
               if [ -d "$DIR" ]; then
@@ -505,7 +659,7 @@ jobs:
                     echo "⚠️ ERROR found in scan output"
                   elif grep -q "vulnerability" "$DIR/scan_results.txt"; then
                     echo "🔍 Vulnerabilities found in scan output"
-                  elif grep -q "No vulnerabilities" "$DIR/scan_results.txt"; then
+                  elif grep -q "No vulnerabilities" "$DIR/scan_results.txt" || grep -q "no vulnerable paths found" "$DIR/scan_results.txt"; then
                     echo "✅ No vulnerabilities found"
                   fi
                 else
