@@ -72,20 +72,17 @@ jobs:
           echo "{\"api\": \"${{ secrets.SNYK_TOKEN }}\"}" > ~/.config/configstore/snyk.json
           chmod 600 ~/.config/configstore/snyk.json
 
+      # We don't need a separate auth step since we've configured the token in config file
       - name: Get Snyk Version
         id: snyk_version
         run: |
           SNYK_VERSION=$(snyk --version || echo "Unknown")
           echo "version=$SNYK_VERSION" >> $GITHUB_OUTPUT
           echo "Snyk Version: $SNYK_VERSION"
-
-      - name: Verify Snyk Authentication
-        run: |
+          
+          # Verify configuration worked by testing a command
           echo "Verifying Snyk authentication..."
-          # Use the token directly - don't try interactive browser auth
-          snyk auth ${{ secrets.SNYK_TOKEN }}
-          # Verify auth worked by checking the API endpoint
-          snyk config get api || echo "API config check failed but continuing"
+          snyk --version
 
       - name: Scan Dockerfiles
         id: scan
@@ -141,6 +138,7 @@ jobs:
           
           # Create results directory for scans
           mkdir -p scan_results
+          mkdir -p processed_dockerfiles
           
           # Function to print section headers for better readability in logs
           print_section() {
@@ -157,7 +155,7 @@ jobs:
             # Extract all ARG definitions and their values
             declare -A arg_values
             
-            # Extract all ARG definitions with default values
+            # First path: extract all ARG definitions with default values
             while IFS= read -r line; do
               if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
                 var_name="${BASH_REMATCH[1]}"
@@ -188,11 +186,10 @@ jobs:
             resolved_image="$base_image"
             for var_name in "${!arg_values[@]}"; do
               resolved_image="${resolved_image//\$\{$var_name\}/${arg_values[$var_name]}}"
-              resolved_image="${resolved_image//\$var_name/${arg_values[$var_name]}}"
+              resolved_image="${resolved_image//\$$var_name/${arg_values[$var_name]}}"
             done
             
-            # Special case: Fixed replacements for the known directory structure
-            # This ensures we get useful known base images even if ARG extraction fails
+            # Special case: Fixed replacements for known directories
             case "$dir_name" in
               py311-cuda121-torch241)
                 if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
@@ -260,17 +257,8 @@ jobs:
             BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH" "$DIR")
             echo "Identified base image: $BASE_IMAGE"
             
-            # Check if base image still contains variables
-            if [[ "$BASE_IMAGE" == *"\$"* ]] || [[ "$BASE_IMAGE" == *"{"* ]]; then
-              echo "Warning: Base image still contains unresolved variables: $BASE_IMAGE"
-              echo "Using ubuntu:latest as fallback"
-              BASE_IMAGE="ubuntu:latest"
-            fi
-            
             # Create a processed Dockerfile with the resolved base image
-            PROCESSED_DIR="processed_dockerfiles"
-            mkdir -p "$PROCESSED_DIR"
-            PROCESSED_DOCKERFILE="$PROCESSED_DIR/${DIR}_Dockerfile"
+            PROCESSED_DOCKERFILE="processed_dockerfiles/${DIR}_Dockerfile"
             
             # Create a simplified Dockerfile with the resolved base image
             {
@@ -295,16 +283,28 @@ jobs:
                 cat scan_results/${DIR}-error.log
                 SCAN_FAILURES=$((SCAN_FAILURES + 1))
                 
-                # Try scanning just the base image as fallback if it's a valid image without variables
+                # Try scanning just the base image as fallback if variables are resolved
                 if [[ "$BASE_IMAGE" != *"\$"* ]] && [[ "$BASE_IMAGE" != *"{"* ]]; then
                   echo "Trying to scan just the base image as fallback..."
                   if ! snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
+                    SCAN_FAILURES=$((SCAN_FAILURES + 1))
+                    echo "Base image scan also failed"
+                    VULN_ISSUES="Scan failed"
+                    CONFIG_ISSUES+=("Snyk scan failed - check logs")
+                    REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs")
+                    ROWS+=$'\n'"• ${DIR}: ❌ Failed (scan error)"
+                    HAS_ISSUES=true
+                    ISSUES_COUNT=$((ISSUES_COUNT + 1))
+                    continue
+                  fi
+                else
+                  # Base image has unresolved variables - can't scan it
                   SCAN_FAILURES=$((SCAN_FAILURES + 1))
-                  echo "Base image scan also failed"
+                  echo "Base image has unresolved variables - can't scan it"
                   VULN_ISSUES="Scan failed"
-                  CONFIG_ISSUES+=("Snyk scan failed - check logs")
-                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs")
-                  ROWS+=$'\n'"• ${DIR}: ❌ Failed (scan error)"
+                  CONFIG_ISSUES+=("Base image has unresolved variables")
+                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Base image has unresolved variables")
+                  ROWS+=$'\n'"• ${DIR}: ❌ Failed (unresolved variables)"
                   HAS_ISSUES=true
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
                   continue
@@ -490,6 +490,7 @@ jobs:
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run directly using Snyk's container test functionality" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Preprocesses Dockerfiles to resolve variables in base images" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
           echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> "$GITHUB_STEP_SUMMARY"
           
