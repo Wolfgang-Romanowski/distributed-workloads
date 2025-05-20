@@ -1,42 +1,33 @@
-# Revamped Snyk Dockerfile Security Scan workflow — **v3**
-# ---------------------------------------------------------
-# New: Graceful handling when `SNYK_TOKEN` is missing.
-#   • The job now *skips* the scan (and posts a Slack reminder) instead
-#     of hard‑failing.
-#   • `cli-info` step sets an output `token_present` (true/false).
-#   • All downstream steps are `if:`‑guarded on that flag.
-#   • A friendly notice is written to the GitHub summary.
+# Snyk Dockerfile Security Scan — **v4**
+# -------------------------------------------------------------
+#  • Runs automatically on any branch whose name contains "snyk" in forks
+#    (push trigger) so you can iterate freely.
+#  • Keeps nightly run & manual dispatch.
+#  • Debug mode is ON for push events by default; can still be toggled in
+#    workflow‑dispatch.
+#  • Duplicate `schedule` and `workflow_dispatch` blocks removed.
 
 name: Snyk Dockerfile Security Scan
 
 on:
-  # Run on *any* branch in personal forks so you can iterate freely.
-  # In the upstream repo this also means feature branches will be scanned —
-  # if that’s undesirable tighten the pattern to e.g. "feature/**".
+  # Test automatically on branches that include "snyk" in their name
+  # when you push in your fork.
   push:
+    branches:
+      - "**snyk**"
     paths:
       - "images/runtime/training/*/Dockerfile"
+
   pull_request_target:
     types: [labeled]
+
   pull_request:
     paths:
       - "images/runtime/training/*/Dockerfile"
+
   schedule:
     - cron: "0 3 * * *"   # nightly at 03:00 UTC
-  workflow_dispatch:
-    inputs:
-      debug:
-        description: "Enable debug mode"
-        required: false
-        default: "false"
-        type: choice
-        options: ["true", "false"]
-      target_dir:
-        description: "Scan a single training sub-directory (optional)"
-        required: false
-        default: ""
-        type: string
-    - cron: "0 3 * * *"   # nightly at 03:00 UTC
+
   workflow_dispatch:
     inputs:
       debug:
@@ -56,8 +47,6 @@ jobs:
     name: Snyk Security Scan
     runs-on: ubuntu-latest
 
-    # Security‑conscious: only run on labelled PR‑targets from forks or
-    # same‑repo PRs. Regular events pass through.
     if: >-
       github.event_name != 'pull_request_target' ||
       github.event.label.name == 'safe-to-test' ||
@@ -101,8 +90,6 @@ jobs:
 
           echo "cli_version=$(snyk --version)" >>"$GITHUB_OUTPUT"
           echo "token_present=$token_present"    >>"$GITHUB_OUTPUT"
-
-          # Still print CLI version for traceability
           echo "Snyk CLI version: $(snyk --version)"
 
       # ------------------------------ scan ------------------------------
@@ -110,75 +97,56 @@ jobs:
         if: steps.cli-info.outputs.token_present == 'true'
         id: scan
         env:
-          DEBUG_MODE: ${{ github.event.inputs.debug || 'false' }}
+          DEBUG_MODE: ${{ github.event_name == 'push' && 'true' || github.event_name == 'workflow_dispatch' && github.event.inputs.debug || 'false' }}
           TARGET_DIR: ${{ github.event.inputs.target_dir || '' }}
         run: |
           set -euo pipefail
 
-          # --- helpers ---
-          debug() { [ "${DEBUG_MODE:-false}" = "true" ] && echo "[debug] $*" >&2; }
+          debug() { [ "${DEBUG_MODE}" = "true" ] && echo "[debug] $*" >&2; }
 
           extract_base_image() {
-            local file="$1"
-            declare -A args=()
+            local file="$1"; declare -A args=()
             while IFS= read -r line; do
               if [[ $line =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
-                args["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]//[\"\'] }"
+                args["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]//["'] }"
               fi
             done <"$file"
             local img=$(grep -m1 '^FROM' "$file" | awk '{print $2}')
             for k in "${!args[@]}"; do
-              img="${img//\$\{$k\}/${args[$k]}}"
-              img="${img//\$$k/${args[$k]}}"
+              img="${img//\$\{$k\}/${args[$k]}}"; img="${img//\$$k/${args[$k]}}"
             done
             echo "$img"
           }
 
           TRAINING_DIR="images/runtime/training"
-          if [ -n "${TARGET_DIR:-}" ]; then
+          if [ -n "${TARGET_DIR}" ]; then
             DOCKER_DIRS=("$TARGET_DIR")
           else
             mapfile -t DOCKER_DIRS < <(find "$TRAINING_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort)
           fi
 
           mkdir -p scan_results processed_dockerfiles
-
-          OVERALL_PASS=true
-          HIGH_OR_CRIT_COUNT=0
+          OVERALL_PASS=true; HIGH_OR_CRIT_COUNT=0
 
           for dir in "${DOCKER_DIRS[@]}"; do
             dockerfile="$TRAINING_DIR/$dir/Dockerfile"
-            if [ ! -f "$dockerfile" ]; then
-              echo "::warning::$dir – Dockerfile not found, skipped" && continue
-            fi
+            [ ! -f "$dockerfile" ] && echo "::warning::$dir – Dockerfile not found, skipped" && continue
 
-            base_img=$(extract_base_image "$dockerfile")
-            debug "$dir – resolved base image: $base_img"
-
+            base_img=$(extract_base_image "$dockerfile"); debug "$dir base => $base_img"
             processed="processed_dockerfiles/${dir}_Dockerfile"
-            {
-              echo "FROM $base_img";
-              grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$dockerfile";
-            } >"$processed"
+            { echo "FROM $base_img"; grep -vE '^[[:space:]]*(FROM|ARG)[[:space:]]' "$dockerfile"; } >"$processed"
 
             out_json="scan_results/${dir}.json"
-            snyk container test --file="$processed" --json --severity-threshold=medium >"$out_json" || true
-            ec=$?
+            snyk container test --file="$processed" --json --severity-threshold=medium >"$out_json" || true; ec=$?
 
-            if [ $ec -eq 2 ] || [ $ec -gt 2 ]; then
-              echo "❌ $dir – Snyk error (exit $ec)"; OVERALL_PASS=false; continue
-            elif [ $ec -eq 1 ]; then
-              echo "⚠️  $dir – vulnerabilities detected"; OVERALL_PASS=false
-            else
-              echo "✅ $dir – no issues"
-            fi
+            if [ $ec -ge 2 ]; then echo "❌ $dir – Snyk error ($ec)"; OVERALL_PASS=false; continue; fi
+            [ $ec -eq 1 ] && echo "⚠️  $dir – vulnerabilities detected" && OVERALL_PASS=false || echo "✅ $dir – clean"
 
-            hc=$(jq '[.vulnerabilities[] | select(.severity=="high" or .severity=="critical")] | length' "$out_json")
-            [ "$hc" -gt 0 ] && HIGH_OR_CRIT_COUNT=$((HIGH_OR_CRIT_COUNT+hc))
+            hc=$(jq '[.vulnerabilities[] | select(.severity=="high" or .severity=="critical")] | length' "$out_json"); [ "$hc" -gt 0 ] && HIGH_OR_CRIT_COUNT=$((HIGH_OR_CRIT_COUNT+hc))
           done
 
+          echo "overall_pass=$OVERALL_PASS" >>"$GITHUB_OUTPUT"
           echo "high_or_crit=$HIGH_OR_CRIT_COUNT" >>"$GITHUB_OUTPUT"
-          echo "overall_pass=$OVERALL_PASS"       >>"$GITHUB_OUTPUT"
 
       # ------------------------------ Slack ------------------------------
       - name: Slack Notification
