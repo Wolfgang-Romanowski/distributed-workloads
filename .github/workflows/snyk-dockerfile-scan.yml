@@ -155,7 +155,7 @@ jobs:
             # Extract all ARG definitions and their values
             declare -A arg_values
             
-            # First path: extract all ARG definitions with default values
+            # Extract all ARG definitions with default values
             while IFS= read -r line; do
               if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
                 var_name="${BASH_REMATCH[1]}"
@@ -193,25 +193,33 @@ jobs:
             case "$dir_name" in
               py311-cuda121-torch241)
                 if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  echo "Falling back to known base image for $dir_name"
+                  if [ "$DEBUG_MODE" = "true" ]; then
+                    echo "Falling back to known base image for $dir_name"
+                  fi
                   resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
                 fi
                 ;;
               py311-cuda124-torch251)
                 if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  echo "Falling back to known base image for $dir_name"
+                  if [ "$DEBUG_MODE" = "true" ]; then
+                    echo "Falling back to known base image for $dir_name"
+                  fi
                   resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
                 fi
                 ;;
               py311-rocm62-torch241)
                 if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  echo "Falling back to known base image for $dir_name"
+                  if [ "$DEBUG_MODE" = "true" ]; then
+                    echo "Falling back to known base image for $dir_name"
+                  fi
                   resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
                 fi
                 ;;
               py311-rocm62-torch251)
                 if [[ "$resolved_image" == *"\$"* ]] || [[ "$resolved_image" == *"{"* ]]; then
-                  echo "Falling back to known base image for $dir_name"
+                  if [ "$DEBUG_MODE" = "true" ]; then
+                    echo "Falling back to known base image for $dir_name"
+                  fi
                   resolved_image="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
                 fi
                 ;;
@@ -221,6 +229,7 @@ jobs:
               echo "Resolved base image: $resolved_image"
             fi
             
+            # Only output the resolved image, not the debug info
             echo "$resolved_image"
           }
           
@@ -253,9 +262,15 @@ jobs:
             CONFIG_ISSUES=()
             SCAN_RESULTS_FILE="scan_results/${DIR}-results.json"
             
-            # Extract the base image from Dockerfile
+            # Extract the base image from Dockerfile (getting only the image name)
             BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH" "$DIR")
             echo "Identified base image: $BASE_IMAGE"
+            
+            # Check if base image still contains variables
+            if [[ "$BASE_IMAGE" == *"\$"* ]] || [[ "$BASE_IMAGE" == *"{"* ]]; then
+              echo "Warning: Base image still contains unresolved variables - using ubuntu:latest"
+              BASE_IMAGE="ubuntu:latest"
+            fi
             
             # Create a processed Dockerfile with the resolved base image
             PROCESSED_DOCKERFILE="processed_dockerfiles/${DIR}_Dockerfile"
@@ -283,7 +298,7 @@ jobs:
                 cat scan_results/${DIR}-error.log
                 SCAN_FAILURES=$((SCAN_FAILURES + 1))
                 
-                # Try scanning just the base image as fallback if variables are resolved
+                # Try scanning just the base image if it doesn't have variables
                 if [[ "$BASE_IMAGE" != *"\$"* ]] && [[ "$BASE_IMAGE" != *"{"* ]]; then
                   echo "Trying to scan just the base image as fallback..."
                   if ! snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
@@ -315,19 +330,19 @@ jobs:
             # Process the Snyk JSON output
             if [ -f "$SCAN_RESULTS_FILE" ]; then
               # Check for critical and high vulnerabilities
-              if jq -e '.vulnerabilities[] | select(.severity == "critical")' "$SCAN_RESULTS_FILE" > /dev/null; then
+              if jq -e '.vulnerabilities[] | select(.severity == "critical")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
                 VULN_ISSUES="Critical severity"
                 HAS_HIGH_SEVERITY=true
                 HIGH_COUNT=$((HIGH_COUNT + 1))
-              elif jq -e '.vulnerabilities[] | select(.severity == "high")' "$SCAN_RESULTS_FILE" > /dev/null; then
+              elif jq -e '.vulnerabilities[] | select(.severity == "high")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
                 VULN_ISSUES="High severity"
                 HAS_HIGH_SEVERITY=true
                 HIGH_COUNT=$((HIGH_COUNT + 1))
-              elif jq -e '.vulnerabilities[] | select(.severity == "medium")' "$SCAN_RESULTS_FILE" > /dev/null; then
+              elif jq -e '.vulnerabilities[] | select(.severity == "medium")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
                 VULN_ISSUES="Medium severity"
                 HAS_ISSUES=true
                 ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              elif jq -e '.vulnerabilities[] | select(.severity == "low")' "$SCAN_RESULTS_FILE" > /dev/null; then
+              elif jq -e '.vulnerabilities[] | select(.severity == "low")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
                 VULN_ISSUES="Low severity"
                 HAS_ISSUES=true
                 ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -337,16 +352,16 @@ jobs:
               fi
               
               # Extract recommendations if available
-              if jq -e '.remediation' "$SCAN_RESULTS_FILE" > /dev/null; then
+              if jq -e '.remediation' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
                 RECOMMENDATIONS=$(jq -r '.remediation.advice[0] // "No specific recommendations"' "$SCAN_RESULTS_FILE")
                 CONFIG_ISSUES+=("$RECOMMENDATIONS")
               fi
               
               # Count total vulnerabilities by severity
-              CRITICAL_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$SCAN_RESULTS_FILE")
-              HIGH_COUNT_FILE=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$SCAN_RESULTS_FILE")
-              MEDIUM_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$SCAN_RESULTS_FILE")
-              LOW_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$SCAN_RESULTS_FILE")
+              CRITICAL_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+              HIGH_COUNT_FILE=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+              MEDIUM_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+              LOW_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
               
               # Add detailed vulnerability count to config issues
               if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT_FILE" -gt 0 ] || [ "$MEDIUM_COUNT" -gt 0 ] || [ "$LOW_COUNT" -gt 0 ]; then
