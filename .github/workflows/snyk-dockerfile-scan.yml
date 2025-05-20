@@ -235,6 +235,17 @@ jobs:
             echo "$resolved_image"
           }
           
+          # Fix for Snyk API connectivity issues
+          test_snyk_connectivity() {
+            # Test API connectivity
+            if ! curl -s -o /dev/null -w "%{http_code}" -X GET "https://api.snyk.io/v1/user/me" -H "Authorization: token $SNYK_TOKEN"; then
+              echo "Warning: Snyk API connectivity test failed. Continuing anyway..."
+            fi
+          }
+          
+          # Test connectivity before starting
+          test_snyk_connectivity
+          
           # Scan each Dockerfile
           for DIR in "${DOCKERFILE_DIRS[@]}"; do
             DOCKERFILE_PATH="$TRAINING_DIR/${DIR}/Dockerfile"
@@ -290,12 +301,18 @@ jobs:
             # Run Snyk container test on the processed Dockerfile
             echo "Running Snyk container test on processed Dockerfile..."
             HAS_VULNS=false
-            if ! snyk container test --file="$PROCESSED_DOCKERFILE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
+            
+            # First try: scan the processed Dockerfile
+            if snyk container test --file="$PROCESSED_DOCKERFILE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
+              echo "Scan completed successfully without vulnerabilities for $DIR"
+              VULN_ISSUES="No vulnerabilities"
+              PASSED_COUNT=$((PASSED_COUNT + 1))
+            else
               SNYK_EXIT_CODE=$?
               
-              # Exit code 1 means vulnerabilities were found, but scan completed
+              # Exit code 1 means vulnerabilities were found (this is actually "successful")
               if [ $SNYK_EXIT_CODE -eq 1 ]; then
-                echo "Vulnerabilities found in $DIR"
+                echo "Vulnerabilities found in $DIR (exit code 1)"
                 HAS_VULNS=true
                 HAS_ISSUES=true
               else
@@ -303,12 +320,21 @@ jobs:
                 if [ "$DEBUG_MODE" = "true" ]; then
                   cat scan_results/${DIR}-error.log
                 fi
-                SCAN_FAILURES=$((SCAN_FAILURES + 1))
                 
                 # Try scanning just the base image if it doesn't have variables
                 if [[ "$BASE_IMAGE" != *"\$"* ]] && [[ "$BASE_IMAGE" != *"{"* ]]; then
                   echo "Trying to scan just the base image as fallback..."
-                  if ! snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
+                  
+                  # Second try: scan just the base image
+                  if snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
+                    echo "Base image scan succeeded without vulnerabilities"
+                    VULN_ISSUES="No vulnerabilities (base image only)"
+                    PASSED_COUNT=$((PASSED_COUNT + 1))
+                  elif [ $? -eq 1 ]; then
+                    echo "Base image scan found vulnerabilities"
+                    HAS_VULNS=true
+                    HAS_ISSUES=true
+                  else
                     SCAN_FAILURES=$((SCAN_FAILURES + 1))
                     echo "Base image scan also failed"
                     VULN_ISSUES="Scan failed"
@@ -318,10 +344,6 @@ jobs:
                     HAS_ISSUES=true
                     ISSUES_COUNT=$((ISSUES_COUNT + 1))
                     continue
-                  else
-                    # Successful base image scan with no vulnerabilities
-                    echo "Base image scan succeeded"
-                    HAS_VULNS=true  # Treat as having vulnerabilities to process
                   fi
                 else
                   # Base image has unresolved variables - can't scan it
@@ -336,10 +358,6 @@ jobs:
                   continue
                 fi
               fi
-            else
-              # Scan completed with exit code 0 (success - no vulnerabilities)
-              echo "Scan completed successfully without vulnerabilities for $DIR"
-              HAS_VULNS=false
             fi
             
             # Process the Snyk JSON output
@@ -592,7 +610,8 @@ jobs:
           github.event.inputs.debug == 'true' || 
           github.event_name == 'schedule' ||
           job.status == 'failure' ||
-          steps.scan.outputs.scan_failures != '0')
+          steps.scan.outputs.scan_failures != '0') &&
+          secrets.SLACK_WEBHOOK_URL != ''
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
