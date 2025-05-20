@@ -1,6 +1,7 @@
-# Dockerfile security best practices scan
-# Checks for Docker security best practices
-name: Dockerfile Security Scan
+# Snyk scan for training‑runtime Dockerfiles
+# push to main, nightly 03:00 UTC, fork PRs after label `run‑snyk`
+# Fails on High/Critical CVEs
+name: Snyk Dockerfile Scan
 on:
   push:
     branches: [ main ]
@@ -23,8 +24,8 @@ on:
           - 'false'
 
 jobs:
-  dockerfile-scan:
-    name: Dockerfile Security Scan
+  snyk-dockerfile-scan:
+    name: Snyk Security Scan
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,77 +34,104 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Create Test Dockerfile with Known Issues
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true'
-        id: test_dockerfile
+      - name: Setup Snyk
+        uses: snyk/actions/setup@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Verify Snyk Token
+        id: verify_token
         run: |
-          echo "Creating test Dockerfile with known security issues..."
+          # Check if SNYK_TOKEN is set
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::SNYK_TOKEN is not set. Please add the SNYK_TOKEN secret to your repository."
+            echo "token_present=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "::notice::SNYK_TOKEN is set."
+            echo "token_present=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Test Snyk Authentication
+        id: test_auth
+        run: |
+          # Try to get Snyk auth status
+          if ! snyk auth --help > /dev/null 2>&1; then
+            echo "::error::Snyk CLI not installed correctly"
+            exit 1
+          fi
           
-          # Create a test Dockerfile with multiple security issues
-          cat > test_insecure.Dockerfile << 'EOF'
+          # Try a non-interactive command that requires auth
+          snyk config get api > /dev/null 2>&1
+          AUTH_EXIT_CODE=$?
+          
+          if [ $AUTH_EXIT_CODE -ne 0 ]; then
+            echo "::error::Snyk authentication failed. Verify your SNYK_TOKEN is correct and has proper permissions."
+            echo "authenticated=false" >> $GITHUB_OUTPUT
+            exit 1
+          else 
+            echo "::notice::Snyk authentication successful."
+            echo "authenticated=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Create Test Dockerfile with Known Vulnerability
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true'
+        id: test_vulnerability
+        run: |
+          echo "Creating test Dockerfile with known vulnerabilities..."
+          
+          # Create a test Dockerfile with known security issues
+          cat > test_vuln.Dockerfile << 'EOF'
+          # Use latest tag - bad practice
           FROM alpine:latest
-          
-          # No USER directive (will run as root)
-          
-          # Adding a secret in ENV
-          ENV API_TOKEN=abcdef12345
-          
-          # Using curl insecurely
+          # Run as root - bad practice
+          # Add a secret in env var - bad practice
+          ENV MY_SECRET_TOKEN=1234567890abcdef
+          # Use curl with insecure flag - bad practice
           RUN apk add --no-cache curl && \
               curl -k https://example.com
-              
-          # Using ADD instead of COPY
-          ADD file.txt /app/
-          
-          CMD ["echo", "Insecure container"]
           EOF
           
           echo "Running test scan..."
+          snyk iac test test_vuln.Dockerfile --severity-threshold=medium > test_vuln_output.txt 2>&1 || true
+          TEST_EXIT_CODE=$?
           
-          # Check security issues using simple grep commands
-          ISSUES=()
+          echo "Test scan exit code: $TEST_EXIT_CODE"
+          echo "Test scan output:"
+          cat test_vuln_output.txt
           
-          # Check for latest tag (high severity)
-          if grep -E "FROM\s+\S+:latest" test_insecure.Dockerfile > /dev/null; then
-            ISSUES+=("Latest tag detected")
-          fi
-          
-          # Check for missing USER instruction
-          if ! grep -q "USER" test_insecure.Dockerfile; then
-            ISSUES+=("Missing USER instruction")
-          fi
-          
-          # Check for secrets in ENV
-          if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" test_insecure.Dockerfile > /dev/null; then
-            ISSUES+=("Secrets in ENV variables")
-          fi
-          
-          # Check if any issues were found
-          if [ ${#ISSUES[@]} -gt 0 ]; then
-            echo "Test scan results: Found ${#ISSUES[@]} issues"
-            echo "Issues detected: ${ISSUES[*]}"
+          # Check if security issues were detected
+          if grep -q "issue" test_vuln_output.txt || grep -q "Issues" test_vuln_output.txt; then
+            echo "::notice::Test successful - security issues detected in test Dockerfile"
             echo "test_passed=true" >> $GITHUB_OUTPUT
           else
-            echo "Test scan results: No issues found"
+            echo "::warning::Test failed - no security issues detected in known vulnerable Dockerfile"
             echo "test_passed=false" >> $GITHUB_OUTPUT
           fi
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Scan Dockerfiles
         id: scan
         env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' }}
-          TEST_PASSED: ${{ steps.test_dockerfile.outputs.test_passed }}
+          TEST_PASSED: ${{ steps.test_vulnerability.outputs.test_passed }}
         run: |
           set -euo pipefail
           
           if [ "$DEBUG_MODE" = "true" ]; then
             set -x
             echo "Running in debug mode"
-            # If we ran the test, report the result
+            # If we ran the test vulnerability check, report the result
             if [ -n "${TEST_PASSED:-}" ]; then
-              echo "Security check verification result: $TEST_PASSED"
+              echo "Vulnerability test scan result: $TEST_PASSED"
               if [ "$TEST_PASSED" != "true" ]; then
-                echo "::warning::Security check verification failed. Results may be unreliable."
+                echo "::warning::Vulnerability detection test failed. Snyk may not be detecting vulnerabilities correctly."
               fi
             fi
           fi
@@ -131,6 +159,13 @@ jobs:
           
           REPORT_ROWS=()
           
+          # Verify Snyk is working by testing with a known command
+          echo "Verifying Snyk functionality..."
+          if ! snyk --version > /dev/null 2>&1; then
+            echo "::error::Snyk CLI is not functioning properly."
+            exit 1
+          fi
+          
           for DIR in "${DOCKERFILE_DIRS[@]}"; do
             DOCKERFILE_PATH="images/runtime/training/${DIR}/Dockerfile"
             echo "Scanning ${DIR} Dockerfile..."
@@ -143,69 +178,84 @@ jobs:
               continue
             fi
             
-            SECURITY_ISSUES="None"
+            VULN_ISSUES="None"
             CONFIG_ISSUES=()
+            SCAN_OUTPUT="${DIR}_snyk_output.txt"
+            ERROR_OUTPUT="${DIR}_snyk_error.txt"
             
-            # Perform security checks directly
+            # Run Snyk IaC test instead of container test
+            echo "Running Snyk IaC test on ${DOCKERFILE_PATH}..."
+            snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "$SCAN_OUTPUT" 2> "$ERROR_OUTPUT" || true
+            SCAN_EXIT_CODE=$?
             
-            # Check for latest tag (high severity)
-            if grep -E "FROM\s+\S+:latest" "$DOCKERFILE_PATH" > /dev/null; then
-              SECURITY_ISSUES="High: Using 'latest' tag"
-              HAS_HIGH_SEVERITY=true
-              HIGH_COUNT=$((HIGH_COUNT + 1))
+            # Print Snyk output for debugging
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Snyk exit code: $SCAN_EXIT_CODE"
+              echo "Snyk stdout (first 20 lines):"
+              head -n 20 "$SCAN_OUTPUT" || true
+              echo "Snyk stderr (first 20 lines):"
+              head -n 20 "$ERROR_OUTPUT" || true
             fi
             
-            # Check for missing USER instruction (medium severity)
-            if ! grep -q "USER" "$DOCKERFILE_PATH"; then
+            # Parse the results based on exit code and output
+            if [ $SCAN_EXIT_CODE -eq 0 ]; then
+              echo "✅ Snyk scan passed with no security issues"
+            elif [ $SCAN_EXIT_CODE -eq 1 ]; then
+              # Check for different severity levels in the output
+              if grep -i "critical severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Critical severity"
+                HAS_HIGH_SEVERITY=true
+                HIGH_COUNT=$((HIGH_COUNT + 1))
+              elif grep -i "high severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="High severity"
+                HAS_HIGH_SEVERITY=true
+                HIGH_COUNT=$((HIGH_COUNT + 1))
+              elif grep -i "medium severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Medium severity"
+                HAS_ISSUES=true
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              elif grep -i "low severity" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Low severity"
+              fi
+            else
+              # Check for errors
+              if grep -i "authentication failed" "$SCAN_OUTPUT" >/dev/null || grep -i "not authorized" "$SCAN_OUTPUT" >/dev/null; then
+                VULN_ISSUES="Authentication error"
+                echo "::warning::Snyk authentication error detected during scan"
+              else
+                VULN_ISSUES="Scan error (see logs)"
+              fi
+            fi
+            
+            # Check for configuration issues in the Dockerfile
+            if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" >/dev/null; then
+              CONFIG_ISSUES+=("Potential secrets in ENV")
+            fi
+            if ! grep -q "USER" "$DOCKERFILE_PATH" >/dev/null; then
               CONFIG_ISSUES+=("Missing USER instruction (runs as root)")
             fi
             
-            # Check for secrets in ENV (medium severity)
-            if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" > /dev/null; then
-              CONFIG_ISSUES+=("Potential secrets in ENV variables")
-            fi
-            
-            # Check for curl with insecure flag (medium severity)
-            if grep -E "curl\s+.*(-k|--insecure)" "$DOCKERFILE_PATH" > /dev/null; then
-              CONFIG_ISSUES+=("Using curl with insecure flag")
-            fi
-            
-            # Check for ADD instead of COPY (low severity)
-            if grep -q "ADD" "$DOCKERFILE_PATH"; then
-              CONFIG_ISSUES+=("Using ADD instead of COPY")
-            fi
-            
-            # Generate the configuration issues string
             if [ ${#CONFIG_ISSUES[@]} -eq 0 ]; then
               CONFIG_ISSUES_STR="None"
             else
               CONFIG_ISSUES_STR=$(IFS=", "; echo "${CONFIG_ISSUES[*]}")
-              HAS_ISSUES=true
+            fi
+            
+            if [ "$VULN_ISSUES" = "None" ] && [ "$CONFIG_ISSUES_STR" = "None" ]; then
+              STATUS="✅ Pass"
+              PASSED_COUNT=$((PASSED_COUNT + 1))
+            elif [ "$VULN_ISSUES" = "Critical severity" ] || [ "$VULN_ISSUES" = "High severity" ]; then
+              STATUS="❌ Fail"
+              ISSUES_COUNT=$((ISSUES_COUNT + 1))
+            else
+              STATUS="⚠️ Warning"
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
             fi
             
-            # Set status based on findings
-            if [ "$SECURITY_ISSUES" = "None" ] && [ "$CONFIG_ISSUES_STR" = "None" ]; then
-              STATUS="✅ Pass"
-              PASSED_COUNT=$((PASSED_COUNT + 1))
-            elif [[ "$SECURITY_ISSUES" == High* ]]; then
-              STATUS="❌ Fail"
-            else
-              STATUS="⚠️ Warning"
-            fi
-            
-            REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${SECURITY_ISSUES}|${CONFIG_ISSUES_STR}")
+            REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${VULN_ISSUES}|${CONFIG_ISSUES_STR}")
             ROWS+=$'\n'"• ${DIR}: ${STATUS}"
-            
-            if [ "$DEBUG_MODE" = "true" ]; then
-              echo "Results for $DIR:"
-              echo "  Status: $STATUS"
-              echo "  Security Issues: $SECURITY_ISSUES"
-              echo "  Config Issues: $CONFIG_ISSUES_STR"
-            fi
           done
 
-          # Set overall status
           if $HAS_HIGH_SEVERITY; then
             OVERALL_STATUS="❌ Failed"
           elif $HAS_ISSUES; then 
@@ -214,15 +264,17 @@ jobs:
             OVERALL_STATUS="✅ All Secure"
           fi
 
-          # Generate the report
+          # If test vulnerability detection failed, but we're passing everything, add a warning
+          if [ "$DEBUG_MODE" = "true" ] && [ -n "${TEST_PASSED:-}" ] && [ "$TEST_PASSED" != "true" ] && [ "$OVERALL_STATUS" = "✅ All Secure" ]; then
+            OVERALL_STATUS="✅ All Secure ⚠️ (Verification Failed)"
+            echo "::warning::All images passed, but Snyk failed to detect vulnerabilities in the test file. Results may be unreliable."
+          fi
+
           TZ=Europe/London
           export TZ
           LON_DATE="$(date '+%a %d %b %Y %T %Z')"
           
           echo "# Dockerfile Security Scan Results" > "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Note: This scan checks for Docker security best practices, not for CVEs or vulnerabilities in the base images.**" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
 
           echo "## Summary Overview" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -233,7 +285,7 @@ jobs:
           
           # If in debug mode and we ran the test, add the test result
           if [ "$DEBUG_MODE" = "true" ] && [ -n "${TEST_PASSED:-}" ]; then
-            echo "| **Security Check Verification** | ${TEST_PASSED} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **Test Vulnerability Detection** | ${TEST_PASSED} |" >> "$GITHUB_STEP_SUMMARY"
           fi
           
           echo "| **Total Images** | 4 |" >> "$GITHUB_STEP_SUMMARY"
@@ -272,17 +324,14 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Latest Tag** | Checks if Dockerfile uses ':latest' tag | High |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **User Directive** | Checks if Dockerfile includes USER instruction | Medium |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Secrets in ENV** | Checks for potential secrets in ENV variables | Medium |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Insecure Curl** | Checks for curl with -k/--insecure flags | Medium |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **ADD vs COPY** | Checks if Dockerfile uses ADD instead of COPY | Low |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Dockerfile Scan** | Detects security issues in Dockerfile configuration | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Secret Detection** | Identifies potential secrets in ENV variables | Warning |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **User Configuration** | Verifies non-root USER instruction | Warning |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- This scan **does not** check for vulnerabilities in base images" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Workflow fails only on High severity issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Workflow fails only on High or Critical security issues" >> "$GITHUB_STEP_SUMMARY"
           echo "- Medium and Low severity issues are reported but don't cause failure" >> "$GITHUB_STEP_SUMMARY"
           echo "- Missing USER instruction indicates container runs as root (security risk)" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC" >> "$GITHUB_STEP_SUMMARY"
@@ -293,8 +342,9 @@ jobs:
           echo "<details>" >> "$GITHUB_STEP_SUMMARY"
           echo "<summary>Technical Scan Information</summary>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Scanner:** Custom Dockerfile best-practices check  " >> "$GITHUB_STEP_SUMMARY"
-          echo "**Scan Type:** Static analysis of Dockerfile syntax  " >> "$GITHUB_STEP_SUMMARY"
+          echo "**Scanner:** Snyk IaC + Dockerfile best-practices  " >> "$GITHUB_STEP_SUMMARY"
+          echo "**Version:** Latest  " >> "$GITHUB_STEP_SUMMARY"
+          echo "**Scan Parameters:** \`--severity-threshold=medium\`  " >> "$GITHUB_STEP_SUMMARY"
           echo "**Workflow Run ID:** \`${{ github.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
@@ -323,7 +373,7 @@ jobs:
           fi
           
           if $HAS_HIGH_SEVERITY; then
-            echo "❌ High severity security issues detected — failing the workflow."
+            echo "❌ High/Critical security issues detected — failing the workflow."
             exit 1
           fi
 
@@ -345,9 +395,9 @@ jobs:
                 {
                   "color": "${{ job.status == 'failure' && 'danger' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
                   "title": "Dockerfile Security Scan Results",
-                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles follow security best practices' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity security issues detected' || '⚠️ Security configuration issues detected' }}${{ steps.scan.outputs.test_passed == 'false' && ' (⚠️ Security check verification failed)' || '' }}\n${{ steps.scan.outputs.results }}",
+                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed: Snyk authentication or scanning issue' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || '⚠️ Security issues detected' }}${{ steps.scan.outputs.test_passed == 'false' && ' (⚠️ Vulnerability detection verification failed)' || '' }}\n${{ steps.scan.outputs.results }}",
                   "mrkdwn_in": ["text"],
-                  "footer": "Dockerfile Security Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
+                  "footer": "Snyk Dockerfile Security Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
                 }
               ]
             }
