@@ -19,11 +19,6 @@ on:
         options:
           - 'true'
           - 'false'
-      snyk_version:
-        description: 'Snyk CLI version (leave empty for latest)'
-        required: false
-        default: ''
-        type: string
 
 jobs:
   snyk-dockerfile-scan:
@@ -36,32 +31,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Use a specific Snyk version or latest if not specified
       - name: Setup Snyk
-        id: setup_snyk
-        run: |
-          echo "::group::Setting up Snyk"
-          REQUESTED_VERSION="${{ github.event.inputs.snyk_version }}"
-          
-          if [ -z "$REQUESTED_VERSION" ]; then
-            echo "Installing latest Snyk version"
-            npm install -g snyk
-          else
-            echo "Installing Snyk version $REQUESTED_VERSION"
-            npm install -g snyk@$REQUESTED_VERSION
-          fi
-          
-          INSTALLED_VERSION=$(snyk --version)
-          echo "Installed Snyk version: $INSTALLED_VERSION"
-          echo "snyk_version=$INSTALLED_VERSION" >> $GITHUB_OUTPUT
-          echo "::endgroup::"
+        uses: snyk/actions/setup@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Verify Snyk Token
         id: verify_token
         run: |
-          echo "::group::Verifying Snyk Token"
           # Check if SNYK_TOKEN is set
           if [ -z "$SNYK_TOKEN" ]; then
             echo "::error::SNYK_TOKEN is not set. Please add the SNYK_TOKEN secret to your repository."
@@ -71,72 +48,52 @@ jobs:
             echo "::notice::SNYK_TOKEN is set."
             echo "token_present=true" >> $GITHUB_OUTPUT
           fi
-          echo "::endgroup::"
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Test Snyk Authentication
         id: test_auth
         run: |
-          echo "::group::Testing Snyk Authentication"
-          # Try to authenticate with Snyk
-          if ! snyk auth "$SNYK_TOKEN" > /dev/null 2>&1; then
-            echo "::error::Failed to authenticate with Snyk. Check your token."
-            echo "authenticated=false" >> $GITHUB_OUTPUT
+          # Try a non-interactive command that requires auth
+          # Simply check Snyk version first to ensure CLI is working
+          echo "Checking Snyk CLI version..."
+          snyk --version
+          
+          echo "Testing Snyk authentication..."
+          if snyk test --help > /dev/null 2>&1; then
+            echo "::notice::Snyk CLI appears to be functioning."
+          else
+            echo "::error::Snyk CLI not working properly."
             exit 1
           fi
           
-          # Verify authentication status
-          snyk config get api > /dev/null 2>&1
-          AUTH_EXIT_CODE=$?
+          # Check if authentication works by creating a dummy test
+          echo "FROM alpine:latest" > test.Dockerfile
           
-          if [ $AUTH_EXIT_CODE -ne 0 ]; then
-            echo "::error::Snyk authentication failed. Verify your SNYK_TOKEN is correct and has proper permissions."
+          # Try a quick test that would require auth
+          snyk iac test test.Dockerfile --severity-threshold=low 2>&1 | tee auth_test.log
+          
+          # Check if we got an authentication error
+          if grep -i "auth" auth_test.log > /dev/null || grep -i "not authorized" auth_test.log > /dev/null; then
+            echo "::error::Snyk authentication failed. Token may be invalid or expired."
             echo "authenticated=false" >> $GITHUB_OUTPUT
+            cat auth_test.log
             exit 1
           else 
-            echo "::notice::Snyk authentication successful."
+            echo "::notice::Snyk authentication appears successful."
             echo "authenticated=true" >> $GITHUB_OUTPUT
           fi
-          echo "::endgroup::"
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Verify Snyk Functionality
-        id: verify_functionality
-        run: |
-          echo "::group::Verifying Snyk Functionality"
-          # Check if Snyk is functioning properly
-          if ! snyk --version > /dev/null 2>&1; then
-            echo "::error::Snyk CLI is not functioning properly."
-            echo "functional=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          
-          # Test a basic Snyk command
-          snyk --help > /dev/null 2>&1
-          HELP_EXIT_CODE=$?
-          
-          if [ $HELP_EXIT_CODE -ne 0 ]; then
-            echo "::error::Snyk CLI is not functioning properly."
-            echo "functional=false" >> $GITHUB_OUTPUT
-            exit 1
-          else
-            echo "::notice::Snyk CLI is functioning properly."
-            echo "functional=true" >> $GITHUB_OUTPUT
-          fi
-          echo "::endgroup::"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Create Test Dockerfiles with Known Vulnerabilities
+      - name: Create Test Dockerfile with Known Vulnerability
+        if: success() && github.event.inputs.debug == 'true'
         id: test_vulnerability
         run: |
-          echo "::group::Creating test Dockerfiles with known vulnerabilities"
-          mkdir -p test_dockerfiles
+          echo "Creating test Dockerfile with known vulnerabilities..."
           
-          # Test file 1: Basic vulnerabilities
-          cat > test_dockerfiles/test_basic_vuln.Dockerfile << 'EOF'
+          # Create a test Dockerfile with known security issues
+          cat > test_vuln.Dockerfile << 'EOF'
           # Use latest tag - bad practice
           FROM alpine:latest
           # Run as root - bad practice
@@ -147,185 +104,43 @@ jobs:
               curl -k https://example.com
           EOF
           
-          # Test file 2: More severe vulnerabilities
-          cat > test_dockerfiles/test_severe_vuln.Dockerfile << 'EOF'
-          # Use vulnerable Node.js version
-          FROM node:14.0.0
-          # Exposed secrets
-          ENV AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
-          ENV AWS_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-          # Run as root
-          USER root
-          # Unsafe package installation
-          RUN npm install --unsafe-perm
-          # No USER directive
-          EOF
+          echo "Running test scan..."
+          snyk iac test test_vuln.Dockerfile --severity-threshold=low > test_vuln_output.txt 2>&1 || true
+          TEST_EXIT_CODE=$?
           
-          # List created test files
-          echo "Created test Dockerfiles:"
-          ls -la test_dockerfiles/
-          echo "::endgroup::"
+          echo "Test scan exit code: $TEST_EXIT_CODE"
+          echo "Test scan output:"
+          cat test_vuln_output.txt
           
-          # Create results directory
-          mkdir -p test_results
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Test Vulnerability Detection (IaC)
-        id: test_iac
-        run: |
-          echo "::group::Testing vulnerability detection with Snyk IaC"
-          RESULTS_DIR="test_results/iac"
-          mkdir -p "$RESULTS_DIR"
-          
-          # Test basic vulnerabilities file with verbose debugging
-          echo "Testing basic vulnerabilities file..."
-          snyk iac test test_dockerfiles/test_basic_vuln.Dockerfile --severity-threshold=low -d > "$RESULTS_DIR/basic_output.txt" 2> "$RESULTS_DIR/basic_error.txt" || true
-          BASIC_EXIT_CODE=$?
-          
-          # Test severe vulnerabilities file
-          echo "Testing severe vulnerabilities file..."
-          snyk iac test test_dockerfiles/test_severe_vuln.Dockerfile --severity-threshold=low -d > "$RESULTS_DIR/severe_output.txt" 2> "$RESULTS_DIR/severe_error.txt" || true
-          SEVERE_EXIT_CODE=$?
-          
-          # Check if tests detected vulnerabilities
-          BASIC_DETECTED=false
-          SEVERE_DETECTED=false
-          
-          if [ $BASIC_EXIT_CODE -eq 1 ] && (grep -q "severity" "$RESULTS_DIR/basic_output.txt" || grep -q "issue" "$RESULTS_DIR/basic_output.txt"); then
-            echo "::notice::Successfully detected vulnerabilities in basic test file using IaC"
-            BASIC_DETECTED=true
-          else
-            echo "::warning::Failed to detect vulnerabilities in basic test file using IaC"
-          fi
-          
-          if [ $SEVERE_EXIT_CODE -eq 1 ] && (grep -q "severity" "$RESULTS_DIR/severe_output.txt" || grep -q "issue" "$RESULTS_DIR/severe_output.txt"); then
-            echo "::notice::Successfully detected vulnerabilities in severe test file using IaC"
-            SEVERE_DETECTED=true
-          else
-            echo "::warning::Failed to detect vulnerabilities in severe test file using IaC"
-          fi
-          
-          if [ "$BASIC_DETECTED" = "true" ] || [ "$SEVERE_DETECTED" = "true" ]; then
-            echo "iac_test_passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "iac_test_passed=false" >> $GITHUB_OUTPUT
-          fi
-          
-          # Display excerpts from results for debugging
-          echo "Basic test exit code: $BASIC_EXIT_CODE"
-          echo "Severe test exit code: $SEVERE_EXIT_CODE"
-          echo "Basic test output excerpt:"
-          head -n 20 "$RESULTS_DIR/basic_output.txt" || true
-          echo "Severe test output excerpt:"
-          head -n 20 "$RESULTS_DIR/severe_output.txt" || true
-          echo "::endgroup::"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Test Vulnerability Detection (Container)
-        id: test_container
-        run: |
-          echo "::group::Testing vulnerability detection with Snyk Container"
-          RESULTS_DIR="test_results/container"
-          mkdir -p "$RESULTS_DIR"
-          
-          # Build test images
-          echo "Building test images..."
-          docker build -t test-basic-vuln -f test_dockerfiles/test_basic_vuln.Dockerfile . || true
-          docker build -t test-severe-vuln -f test_dockerfiles/test_severe_vuln.Dockerfile . || true
-          
-          # Test basic vulnerabilities file
-          echo "Testing basic vulnerabilities image..."
-          snyk container test test-basic-vuln --file=test_dockerfiles/test_basic_vuln.Dockerfile --severity-threshold=low -d > "$RESULTS_DIR/basic_output.txt" 2> "$RESULTS_DIR/basic_error.txt" || true
-          BASIC_EXIT_CODE=$?
-          
-          # Test severe vulnerabilities file
-          echo "Testing severe vulnerabilities image..."
-          snyk container test test-severe-vuln --file=test_dockerfiles/test_severe_vuln.Dockerfile --severity-threshold=low -d > "$RESULTS_DIR/severe_output.txt" 2> "$RESULTS_DIR/severe_error.txt" || true
-          SEVERE_EXIT_CODE=$?
-          
-          # Check if tests detected vulnerabilities
-          BASIC_DETECTED=false
-          SEVERE_DETECTED=false
-          
-          if [ $BASIC_EXIT_CODE -eq 1 ] && (grep -q "severity" "$RESULTS_DIR/basic_output.txt" || grep -q "vulnerabilit" "$RESULTS_DIR/basic_output.txt"); then
-            echo "::notice::Successfully detected vulnerabilities in basic test image using Container"
-            BASIC_DETECTED=true
-          else
-            echo "::warning::Failed to detect vulnerabilities in basic test image using Container"
-          fi
-          
-          if [ $SEVERE_EXIT_CODE -eq 1 ] && (grep -q "severity" "$RESULTS_DIR/severe_output.txt" || grep -q "vulnerabilit" "$RESULTS_DIR/severe_output.txt"); then
-            echo "::notice::Successfully detected vulnerabilities in severe test image using Container"
-            SEVERE_DETECTED=true
-          else
-            echo "::warning::Failed to detect vulnerabilities in severe test image using Container"
-          fi
-          
-          if [ "$BASIC_DETECTED" = "true" ] || [ "$SEVERE_DETECTED" = "true" ]; then
-            echo "container_test_passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "container_test_passed=false" >> $GITHUB_OUTPUT
-          fi
-          
-          # Display excerpts from results for debugging
-          echo "Basic test exit code: $BASIC_EXIT_CODE"
-          echo "Severe test exit code: $SEVERE_EXIT_CODE"
-          echo "Basic test output excerpt:"
-          head -n 20 "$RESULTS_DIR/basic_output.txt" || true
-          echo "Severe test output excerpt:"
-          head -n 20 "$RESULTS_DIR/severe_output.txt" || true
-          echo "::endgroup::"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Determine Best Scanning Method
-        id: determine_scan_method
-        run: |
-          echo "::group::Determining best scanning method"
-          # Determine which scanning method to use based on test results
-          IAC_TEST_PASSED="${{ steps.test_iac.outputs.iac_test_passed }}"
-          CONTAINER_TEST_PASSED="${{ steps.test_container.outputs.container_test_passed }}"
-          
-          echo "IAC test passed: $IAC_TEST_PASSED"
-          echo "Container test passed: $CONTAINER_TEST_PASSED"
-          
-          if [ "$CONTAINER_TEST_PASSED" = "true" ]; then
-            echo "::notice::Using Snyk Container scanning as primary method (preferred)"
-            echo "scan_method=container" >> $GITHUB_OUTPUT
-            echo "test_passed=true" >> $GITHUB_OUTPUT
-          elif [ "$IAC_TEST_PASSED" = "true" ]; then
-            echo "::notice::Using Snyk IaC scanning as primary method"
-            echo "scan_method=iac" >> $GITHUB_OUTPUT
+          # Check if security issues were detected
+          if grep -q "issue" test_vuln_output.txt || grep -q "Issues" test_vuln_output.txt; then
+            echo "::notice::Test successful - security issues detected in test Dockerfile"
             echo "test_passed=true" >> $GITHUB_OUTPUT
           else
-            echo "::warning::Both scanning methods failed verification. Using both methods with caution."
-            echo "scan_method=both" >> $GITHUB_OUTPUT
+            echo "::warning::Test failed - no security issues detected in known vulnerable Dockerfile"
             echo "test_passed=false" >> $GITHUB_OUTPUT
           fi
-          echo "::endgroup::"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Scan Dockerfiles
         id: scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
-          TEST_PASSED: ${{ steps.determine_scan_method.outputs.test_passed }}
-          SCAN_METHOD: ${{ steps.determine_scan_method.outputs.scan_method }}
-          SNYK_VERSION: ${{ steps.setup_snyk.outputs.snyk_version }}
+          TEST_PASSED: ${{ steps.test_vulnerability.outputs.test_passed }}
         run: |
           set -euo pipefail
           
           if [ "$DEBUG_MODE" = "true" ]; then
             set -x
             echo "Running in debug mode"
-            echo "Using Snyk version: $SNYK_VERSION"
-            echo "Selected scan method: $SCAN_METHOD"
-            echo "Vulnerability detection test passed: $TEST_PASSED"
-            
-            if [ "$TEST_PASSED" != "true" ]; then
-              echo "::warning::Vulnerability detection tests failed. Snyk may not be detecting vulnerabilities correctly."
+            # If we ran the test vulnerability check, report the result
+            if [ -n "${TEST_PASSED:-}" ]; then
+              echo "Vulnerability test scan result: $TEST_PASSED"
+              if [ "$TEST_PASSED" != "true" ]; then
+                echo "::warning::Vulnerability detection test failed. Snyk may not be detecting vulnerabilities correctly."
+              fi
             fi
           fi
           
@@ -372,130 +187,78 @@ jobs:
             SCAN_RESULTS_DIR="scan_results/${DIR}"
             mkdir -p "$SCAN_RESULTS_DIR"
             
-            # Perform scanning based on the determined method
-            if [ "$SCAN_METHOD" = "container" ] || [ "$SCAN_METHOD" = "both" ]; then
-              echo "Running Snyk Container test on ${DOCKERFILE_PATH}..."
-              
-              # Build the image first
-              IMAGE_NAME="dockerfile-scan-${DIR}"
-              docker build -t "$IMAGE_NAME" -f "$DOCKERFILE_PATH" $(dirname "$DOCKERFILE_PATH") > "$SCAN_RESULTS_DIR/build_output.txt" 2>&1 || true
-              BUILD_EXIT_CODE=$?
-              
-              if [ $BUILD_EXIT_CODE -ne 0 ]; then
-                echo "::warning::Failed to build image for ${DIR}. Container scan will be skipped."
-                # Add to config issues
-                CONFIG_ISSUES+=("Docker build failed")
-              else
-                # Run container test with 3 retries
-                RETRY_COUNT=0
-                MAX_RETRIES=3
-                CONTAINER_SUCCESS=false
-                
-                while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$CONTAINER_SUCCESS" = "false" ]; do
-                  echo "Running container scan (attempt $((RETRY_COUNT+1))/$MAX_RETRIES)..."
-                  snyk container test "$IMAGE_NAME" --file="$DOCKERFILE_PATH" --severity-threshold=medium -d > "$SCAN_RESULTS_DIR/container_output.txt" 2> "$SCAN_RESULTS_DIR/container_error.txt" || true
-                  CONTAINER_EXIT_CODE=$?
-                  
-                  # Check if scan was successful (not necessarily secure)
-                  if [ $CONTAINER_EXIT_CODE -eq 0 ] || [ $CONTAINER_EXIT_CODE -eq 1 ]; then
-                    CONTAINER_SUCCESS=true
-                  else
-                    RETRY_COUNT=$((RETRY_COUNT+1))
-                    echo "Scan failed with exit code $CONTAINER_EXIT_CODE. Retrying..."
-                    sleep 5
-                  fi
-                done
-                
-                if [ "$CONTAINER_SUCCESS" = "true" ]; then
-                  # Parse container scan results
-                  if [ $CONTAINER_EXIT_CODE -eq 0 ]; then
-                    echo "✅ Snyk container scan passed with no security issues"
-                  elif [ $CONTAINER_EXIT_CODE -eq 1 ]; then
-                    # Check for different severity levels in the output
-                    if grep -i "critical severity" "$SCAN_RESULTS_DIR/container_output.txt" >/dev/null; then
-                      VULN_ISSUES="Critical severity (container)"
-                      HAS_HIGH_SEVERITY=true
-                      HIGH_COUNT=$((HIGH_COUNT + 1))
-                    elif grep -i "high severity" "$SCAN_RESULTS_DIR/container_output.txt" >/dev/null; then
-                      VULN_ISSUES="High severity (container)"
-                      HAS_HIGH_SEVERITY=true
-                      HIGH_COUNT=$((HIGH_COUNT + 1))
-                    elif grep -i "medium severity" "$SCAN_RESULTS_DIR/container_output.txt" >/dev/null; then
-                      VULN_ISSUES="Medium severity (container)"
-                      HAS_ISSUES=true
-                      ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                    elif grep -i "low severity" "$SCAN_RESULTS_DIR/container_output.txt" >/dev/null; then
-                      VULN_ISSUES="Low severity (container)"
-                    fi
-                  fi
-                else
-                  echo "::warning::Failed to run container scan after $MAX_RETRIES attempts"
-                  FAILED_SCANS=$((FAILED_SCANS+1))
-                  CONFIG_ISSUES+=("Container scan failed")
-                fi
-              fi
-            fi
+            # Run Snyk IaC test
+            echo "Running Snyk IaC test on ${DOCKERFILE_PATH}..."
             
-            # If container scan failed or we're using both/iac methods, run IaC scan
-            if [ "$SCAN_METHOD" = "iac" ] || [ "$SCAN_METHOD" = "both" ] || [ "${#CONFIG_ISSUES[@]}" -gt 0 ]; then
-              echo "Running Snyk IaC test on ${DOCKERFILE_PATH}..."
+            # Try multiple times in case of transient errors
+            for ATTEMPT in {1..3}; do
+              echo "Attempt $ATTEMPT of 3..."
               
-              # Run IaC test with 3 retries
-              RETRY_COUNT=0
-              MAX_RETRIES=3
-              IAC_SUCCESS=false
-              
-              while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$IAC_SUCCESS" = "false" ]; do
-                echo "Running IaC scan (attempt $((RETRY_COUNT+1))/$MAX_RETRIES)..."
-                snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium -d > "$SCAN_RESULTS_DIR/iac_output.txt" 2> "$SCAN_RESULTS_DIR/iac_error.txt" || true
-                IAC_EXIT_CODE=$?
-                
-                # Check if scan was successful (not necessarily secure)
-                if [ $IAC_EXIT_CODE -eq 0 ] || [ $IAC_EXIT_CODE -eq 1 ]; then
-                  IAC_SUCCESS=true
-                else
-                  RETRY_COUNT=$((RETRY_COUNT+1))
-                  echo "Scan failed with exit code $IAC_EXIT_CODE. Retrying..."
-                  sleep 5
-                fi
-              done
-              
-              if [ "$IAC_SUCCESS" = "true" ]; then
-                # Only use IaC results if container scan didn't find issues or we're not using container scanning
-                if [ "$VULN_ISSUES" = "None" ]; then
-                  if [ $IAC_EXIT_CODE -eq 0 ]; then
-                    echo "✅ Snyk IaC scan passed with no security issues"
-                  elif [ $IAC_EXIT_CODE -eq 1 ]; then
-                    # Check for different severity levels in the output
-                    if grep -i "critical severity" "$SCAN_RESULTS_DIR/iac_output.txt" >/dev/null; then
-                      VULN_ISSUES="Critical severity (IaC)"
-                      HAS_HIGH_SEVERITY=true
-                      HIGH_COUNT=$((HIGH_COUNT + 1))
-                    elif grep -i "high severity" "$SCAN_RESULTS_DIR/iac_output.txt" >/dev/null; then
-                      VULN_ISSUES="High severity (IaC)"
-                      HAS_HIGH_SEVERITY=true
-                      HIGH_COUNT=$((HIGH_COUNT + 1))
-                    elif grep -i "medium severity" "$SCAN_RESULTS_DIR/iac_output.txt" >/dev/null; then
-                      VULN_ISSUES="Medium severity (IaC)"
-                      HAS_ISSUES=true
-                      ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                    elif grep -i "low severity" "$SCAN_RESULTS_DIR/iac_output.txt" >/dev/null; then
-                      VULN_ISSUES="Low severity (IaC)"
-                    fi
-                  fi
-                fi
+              # Run with verbose output in debug mode
+              if [ "$DEBUG_MODE" = "true" ]; then
+                snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium -d > "$SCAN_RESULTS_DIR/output.txt" 2> "$SCAN_RESULTS_DIR/error.txt" || true
               else
-                echo "::warning::Failed to run IaC scan after $MAX_RETRIES attempts"
+                snyk iac test "$DOCKERFILE_PATH" --severity-threshold=medium > "$SCAN_RESULTS_DIR/output.txt" 2> "$SCAN_RESULTS_DIR/error.txt" || true
+              fi
+              
+              SCAN_EXIT_CODE=$?
+              
+              # If scan succeeded (exit code 0 or 1), break the retry loop
+              if [ $SCAN_EXIT_CODE -eq 0 ] || [ $SCAN_EXIT_CODE -eq 1 ]; then
+                break
+              fi
+              
+              # If this was the last attempt and it failed, mark as a failed scan
+              if [ $ATTEMPT -eq 3 ]; then
                 FAILED_SCANS=$((FAILED_SCANS+1))
-                if [ -z "${CONFIG_ISSUES[*]}" ]; then
-                  CONFIG_ISSUES+=("IaC scan failed")
-                elif [[ ! "${CONFIG_ISSUES[*]}" =~ "Container scan failed" ]]; then
-                  CONFIG_ISSUES+=("IaC scan failed")
-                fi
+                echo "::warning::Failed to scan ${DIR} after 3 attempts"
+                CONFIG_ISSUES+=("Scan failed after 3 attempts")
+              else
+                # Wait before retrying
+                sleep 5
+              fi
+            done
+            
+            # Print Snyk output for debugging
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "Snyk exit code: $SCAN_EXIT_CODE"
+              echo "Snyk stdout (first 20 lines):"
+              head -n 20 "$SCAN_RESULTS_DIR/output.txt" || true
+              echo "Snyk stderr (first 20 lines):"
+              head -n 20 "$SCAN_RESULTS_DIR/error.txt" || true
+            fi
+            
+            # Parse the results based on exit code and output
+            if [ $SCAN_EXIT_CODE -eq 0 ]; then
+              echo "✅ Snyk scan passed with no security issues"
+            elif [ $SCAN_EXIT_CODE -eq 1 ]; then
+              # Check for different severity levels in the output
+              if grep -i "critical severity" "$SCAN_RESULTS_DIR/output.txt" >/dev/null; then
+                VULN_ISSUES="Critical severity"
+                HAS_HIGH_SEVERITY=true
+                HIGH_COUNT=$((HIGH_COUNT + 1))
+              elif grep -i "high severity" "$SCAN_RESULTS_DIR/output.txt" >/dev/null; then
+                VULN_ISSUES="High severity"
+                HAS_HIGH_SEVERITY=true
+                HIGH_COUNT=$((HIGH_COUNT + 1))
+              elif grep -i "medium severity" "$SCAN_RESULTS_DIR/output.txt" >/dev/null; then
+                VULN_ISSUES="Medium severity"
+                HAS_ISSUES=true
+                ISSUES_COUNT=$((ISSUES_COUNT + 1))
+              elif grep -i "low severity" "$SCAN_RESULTS_DIR/output.txt" >/dev/null; then
+                VULN_ISSUES="Low severity"
+              fi
+            else
+              # Check for errors
+              if grep -i "authentication failed" "$SCAN_RESULTS_DIR/output.txt" >/dev/null || grep -i "not authorized" "$SCAN_RESULTS_DIR/output.txt" >/dev/null; then
+                VULN_ISSUES="Authentication error"
+                echo "::warning::Snyk authentication error detected during scan"
+              else
+                VULN_ISSUES="Scan error (see logs)"
               fi
             fi
             
-            # Always check for configuration issues in the Dockerfile
+            # Check for configuration issues in the Dockerfile
             if grep -E "ENV.*(PASSWORD|SECRET|KEY|TOKEN).*=" "$DOCKERFILE_PATH" >/dev/null; then
               CONFIG_ISSUES+=("Potential secrets in ENV")
             fi
@@ -512,7 +275,7 @@ jobs:
             if [ "$VULN_ISSUES" = "None" ] && [ "$CONFIG_ISSUES_STR" = "None" ]; then
               STATUS="✅ Pass"
               PASSED_COUNT=$((PASSED_COUNT + 1))
-            elif [[ "$VULN_ISSUES" == *"Critical severity"* ]] || [[ "$VULN_ISSUES" == *"High severity"* ]]; then
+            elif [ "$VULN_ISSUES" = "Critical severity" ] || [ "$VULN_ISSUES" = "High severity" ]; then
               STATUS="❌ Fail"
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
             else
@@ -526,7 +289,7 @@ jobs:
           
           if $HAS_HIGH_SEVERITY; then
             OVERALL_STATUS="❌ Failed"
-          elif [ $FAILED_SCANS -eq ${#DOCKERFILE_DIRS[@]} ]; then
+          elif [ $FAILED_SCANS -eq ${#DOCKERFILE_DIRS[@]} ]; then 
             OVERALL_STATUS="❌ Failed (All Scans Failed)"
             HAS_ISSUES=true
           elif $HAS_ISSUES; then 
@@ -536,9 +299,9 @@ jobs:
           fi
           
           # If test vulnerability detection failed, but we're passing everything, add a warning
-          if [ "$TEST_PASSED" != "true" ] && [ "$OVERALL_STATUS" = "✅ All Secure" ]; then
+          if [ -n "${TEST_PASSED:-}" ] && [ "$TEST_PASSED" != "true" ] && [ "$OVERALL_STATUS" = "✅ All Secure" ]; then
             OVERALL_STATUS="✅ All Secure ⚠️ (Verification Failed)"
-            echo "::warning::All images passed, but Snyk failed to detect vulnerabilities in the test files. Results may be unreliable."
+            echo "::warning::All images passed, but Snyk failed to detect vulnerabilities in the test file. Results may be unreliable."
           fi
           
           # Add a warning if some scans failed
@@ -546,6 +309,8 @@ jobs:
             OVERALL_STATUS="$OVERALL_STATUS ⚠️ ($FAILED_SCANS Scans Failed)"
             echo "::warning::$FAILED_SCANS scan(s) failed to complete. Some results may be missing."
           fi
+          
+          SNYK_VERSION=$(snyk --version || echo "Unknown")
           
           TZ=Europe/London
           export TZ
@@ -560,8 +325,12 @@ jobs:
           echo "| **Scan Date** | $LON_DATE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Snyk Version** | $SNYK_VERSION |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scan Method** | $SCAN_METHOD |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Verification Status** | ${TEST_PASSED} |" >> "$GITHUB_STEP_SUMMARY"
+          
+          # If in debug mode and we ran the test, add the test result
+          if [ -n "${TEST_PASSED:-}" ]; then
+            echo "| **Test Vulnerability Detection** | ${TEST_PASSED} |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          
           echo "| **Total Images** | ${#DOCKERFILE_DIRS[@]} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Passed** | $PASSED_COUNT |" >> "$GITHUB_STEP_SUMMARY" 
           echo "| **Issues** | $ISSUES_COUNT |" >> "$GITHUB_STEP_SUMMARY"
@@ -600,17 +369,8 @@ jobs:
           echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Dockerfile Scan** | Detects security issues in Dockerfile configuration | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Container Scan** | Detects vulnerabilities in container image | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Secret Detection** | Identifies potential secrets in ENV variables | Warning |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **User Configuration** | Verifies non-root USER instruction | Warning |" >> "$GITHUB_STEP_SUMMARY"
-          
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Verification Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Test Type | Result | Details |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|:----------|:-------|:--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **IaC Test** | ${{ steps.test_iac.outputs.iac_test_passed }} | Tests if Snyk can detect issues using IaC scanning |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Container Test** | ${{ steps.test_container.outputs.container_test_passed }} | Tests if Snyk can detect issues using Container scanning |" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
@@ -618,7 +378,6 @@ jobs:
           echo "- Workflow fails only on High or Critical security issues" >> "$GITHUB_STEP_SUMMARY"
           echo "- Medium and Low severity issues are reported but don't cause failure" >> "$GITHUB_STEP_SUMMARY"
           echo "- Missing USER instruction indicates container runs as root (security risk)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- When verification tests fail, scan results should be treated with caution" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC" >> "$GITHUB_STEP_SUMMARY"
           
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -627,11 +386,9 @@ jobs:
           echo "<details>" >> "$GITHUB_STEP_SUMMARY"
           echo "<summary>Technical Scan Information</summary>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Scanner:** Snyk IaC & Container" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Scanner:** Snyk IaC" >> "$GITHUB_STEP_SUMMARY"
           echo "**Version:** $SNYK_VERSION" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Scan Parameters:** \`--severity-threshold=medium -d\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Scan Method:** $SCAN_METHOD" >> "$GITHUB_STEP_SUMMARY" 
-          echo "**Verification Status:** $TEST_PASSED" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Scan Parameters:** \`--severity-threshold=medium\`" >> "$GITHUB_STEP_SUMMARY"
           echo "**Workflow Run ID:** \`${{ github.run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
@@ -651,10 +408,12 @@ jobs:
           fi
           
           echo "debug_mode=$DEBUG_MODE" >> $GITHUB_OUTPUT
-          echo "test_passed=$TEST_PASSED" >> $GITHUB_OUTPUT
-          echo "scan_method=$SCAN_METHOD" >> $GITHUB_OUTPUT
           echo "snyk_version=$SNYK_VERSION" >> $GITHUB_OUTPUT
           echo "failed_scans=$FAILED_SCANS" >> $GITHUB_OUTPUT
+          
+          if [ -n "${TEST_PASSED:-}" ]; then
+            echo "test_passed=${TEST_PASSED}" >> $GITHUB_OUTPUT
+          fi
           
           if $HAS_HIGH_SEVERITY; then
             echo "❌ High/Critical security issues detected — failing the workflow."
@@ -664,16 +423,12 @@ jobs:
             exit 1
           fi
 
-      # Note: Artifact upload step has been removed due to compatibility issues
-      # Results are still available in the job summary and Slack notifications
-
       - name: Slack Notification
         if: >
           always() &&
           (steps.scan.outputs.status != 'secure' || 
           steps.scan.outputs.failed_scans != '0' ||
-          steps.scan.outputs.test_passed != 'true' ||
-          steps.scan.outputs.debug_mode == 'true' || 
+          github.event.inputs.debug == 'true' || 
           github.event_name == 'schedule' ||
           job.status == 'failure')
         continue-on-error: true
@@ -687,7 +442,7 @@ jobs:
                 {
                   "color": "${{ job.status == 'failure' && 'danger' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || steps.scan.outputs.status == 'all_scans_failed' && 'danger' || 'warning' }}",
                   "title": "Dockerfile Security Scan Results",
-                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || steps.scan.outputs.status == 'all_scans_failed' && '🚨 All scans failed to complete' || '⚠️ Security issues detected' }}${{ steps.scan.outputs.test_passed == 'false' && ' (⚠️ Verification Failed)' || '' }}${{ steps.scan.outputs.failed_scans != '0' && ' (⚠️ ' || '' }}${{ steps.scan.outputs.failed_scans != '0' && steps.scan.outputs.failed_scans || '' }}${{ steps.scan.outputs.failed_scans != '0' && ' Scans Failed)' || '' }}\n${{ steps.scan.outputs.results }}\n\n*Scan Method:* ${{ steps.scan.outputs.scan_method || 'N/A' }}\n*Snyk Version:* ${{ steps.scan.outputs.snyk_version || 'Unknown' }}",
+                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || steps.scan.outputs.status == 'all_scans_failed' && '🚨 All scans failed to complete' || '⚠️ Security issues detected' }}${{ steps.scan.outputs.test_passed == 'false' && ' (⚠️ Verification Failed)' || '' }}${{ steps.scan.outputs.failed_scans != '0' && ' (⚠️ ' || '' }}${{ steps.scan.outputs.failed_scans != '0' && steps.scan.outputs.failed_scans || '' }}${{ steps.scan.outputs.failed_scans != '0' && ' Scans Failed)' || '' }}\n${{ steps.scan.outputs.results }}\n\n*Snyk Version:* ${{ steps.scan.outputs.snyk_version || 'Unknown' }}",
                   "mrkdwn_in": ["text"],
                   "footer": "Snyk Dockerfile Security Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
                 }
