@@ -10,7 +10,7 @@ on:
     paths:
       - 'images/runtime/training/*/Dockerfile'
   schedule:
-    - cron: '0 3 * * *'  # Run nightly at 3:00 UTC as discussed in Slack
+    - cron: '0 3 * * *'  # Run nightly at 3: UTC as discussed in Slack
   workflow_dispatch:
     inputs:
       debug:
