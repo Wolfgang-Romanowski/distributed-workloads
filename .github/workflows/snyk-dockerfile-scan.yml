@@ -66,6 +66,11 @@ jobs:
             echo "::notice::SNYK_TOKEN is set."
             echo "token_present=true" >> $GITHUB_OUTPUT
           fi
+          
+          # Create Snyk config directory and config file 
+          mkdir -p ~/.config/configstore/
+          echo "{\"api\": \"${{ secrets.SNYK_TOKEN }}\"}" > ~/.config/configstore/snyk.json
+          chmod 600 ~/.config/configstore/snyk.json
 
       - name: Get Snyk Version
         id: snyk_version
