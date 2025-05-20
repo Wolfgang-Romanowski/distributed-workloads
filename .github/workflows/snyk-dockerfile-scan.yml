@@ -610,8 +610,7 @@ jobs:
           github.event.inputs.debug == 'true' || 
           github.event_name == 'schedule' ||
           job.status == 'failure' ||
-          steps.scan.outputs.scan_failures != '0') &&
-          secrets.SLACK_WEBHOOK_URL != ''
+          steps.scan.outputs.scan_failures != '0')
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
