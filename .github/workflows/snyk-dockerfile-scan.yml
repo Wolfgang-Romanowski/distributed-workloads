@@ -666,7 +666,7 @@ jobs:
 
       - name: Archive Scan Results
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v2
         with:
           name: snyk-scan-results
           path: |
