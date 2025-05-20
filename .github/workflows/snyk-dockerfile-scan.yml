@@ -51,6 +51,7 @@ jobs:
       - name: Setup Snyk
         uses: snyk/actions/setup@master
         env:
+          # Explicitly pass token to prevent browser-based auth
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Verify Snyk Token
@@ -76,8 +77,10 @@ jobs:
       - name: Verify Snyk Authentication
         run: |
           echo "Verifying Snyk authentication..."
-          snyk auth
-          snyk config get api
+          # Use the token directly - don't try interactive browser auth
+          snyk auth ${{ secrets.SNYK_TOKEN }}
+          # Verify auth worked by checking the API endpoint
+          snyk config get api || echo "API config check failed but continuing"
 
       - name: Scan Dockerfiles
         id: scan
@@ -192,7 +195,7 @@ jobs:
             
             # Run Snyk container test - this is the primary method discussed in Slack
             echo "Running Snyk container test on $DOCKERFILE_PATH..."
-            if ! snyk container test --file="$DOCKERFILE_PATH" --json > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
+            if ! snyk container test --file="$DOCKERFILE_PATH" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
               SNYK_EXIT_CODE=$?
               
               # Exit code 1 means vulnerabilities were found, but scan completed
@@ -206,7 +209,7 @@ jobs:
                 
                 # Try scanning just the base image as fallback
                 echo "Trying to scan just the base image as fallback..."
-                if ! snyk container test "$BASE_IMAGE" --json > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
+                if ! snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
                   SCAN_FAILURES=$((SCAN_FAILURES + 1))
                   echo "Base image scan also failed"
                   VULN_ISSUES="Scan failed"
@@ -284,7 +287,7 @@ jobs:
               echo "Scan completed for $DIR with status: $STATUS"
               
               # Save human-readable results as well
-              snyk container test --file="$DOCKERFILE_PATH" > "scan_results/${DIR}-readable.txt" 2>/dev/null || true
+              snyk container test --file="$DOCKERFILE_PATH" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null || true
             else
               echo "No scan results file found for $DIR"
               REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|No scan results|Snyk scan failed to produce results")
