@@ -542,7 +542,8 @@ jobs:
 
       - name: Upload Scan Results
         if: always()
-        uses: actions/upload-artifact@v3
+        continue-on-error: true  # Don't fail the workflow if upload fails
+        uses: actions/upload-artifact@v2  # Downgrade to v2 which is more stable
         with:
           name: snyk-scan-results
           path: scan_results.tar.gz
