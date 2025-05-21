@@ -27,24 +27,30 @@ on:
         default: ''
         type: string
 
+# Define shared variables/paths used across jobs
+env:
+  TRAINING_DIR: "images/runtime/training"
+  DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
+  TARGET_DIR: ${{ github.event.inputs.target_dir }}
+
 jobs:
-  snyk-dockerfile-scan:
-    name: Snyk Security Scan
+  # Job 1: Setup and prepare for scanning
+  setup:
+    name: Setup
     runs-on: ubuntu-latest
-    # Only run PR scans if they have the appropriate label or are from the same repo
-    # This addresses the security concern mentioned in Slack about PR secrets access
     if: >
       github.event_name != 'pull_request_target' || 
       github.event.label.name == 'safe-to-test' || 
       github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      dirs_to_scan: ${{ steps.get_dirs.outputs.dirs }}
+      snyk_version: ${{ steps.snyk_version.outputs.version }}
     permissions:
       contents: read
-      security-events: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
         with:
-          # For pull_request_target, checkout the PR code
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.ref || '' }}
           repository: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || '' }}
 
@@ -69,7 +75,6 @@ jobs:
           echo "{\"api\": \"${{ secrets.SNYK_TOKEN }}\"}" > ~/.config/configstore/snyk.json
           chmod 600 ~/.config/configstore/snyk.json
 
-      # Check that Snyk CLI works properly
       - name: Test Snyk CLI
         id: snyk_version
         env:
@@ -79,37 +84,350 @@ jobs:
           echo "version=$SNYK_VERSION" >> $GITHUB_OUTPUT
           echo "Snyk Version: $SNYK_VERSION"
           
-          # Verify authentication by testing a command
+          # Verify authentication
           echo "Verifying Snyk authentication..."
           snyk auth "${{ secrets.SNYK_TOKEN }}"
           snyk --version
 
-      - name: Scan Dockerfiles
-        id: scan
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
-          TARGET_DIR: ${{ github.event.inputs.target_dir }}
+      - name: Determine directories to scan
+        id: get_dirs
         run: |
-          set -euo pipefail
+          if [ -n "${{ env.TARGET_DIR }}" ]; then
+            # Single directory mode
+            echo "dirs=[\"${{ env.TARGET_DIR }}\"]" >> $GITHUB_OUTPUT
+            echo "Scanning single directory: ${{ env.TRAINING_DIR }}/${{ env.TARGET_DIR }}"
+          else
+            # Default - scan all training directories
+            echo 'dirs=["py311-cuda121-torch241","py311-cuda124-torch251","py311-rocm62-torch241","py311-rocm62-torch251"]' >> $GITHUB_OUTPUT
+            echo "Scanning all training Dockerfiles"
+          fi
+
+  # Job 2: Scan each Dockerfile individually
+  scan:
+    name: Scan Dockerfiles
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile_dir: ${{ fromJson(needs.setup.outputs.dirs_to_scan) }}
+    outputs:
+      scan_status: ${{ steps.summary.outputs.status }}
+      scan_failures: ${{ steps.summary.outputs.failures }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.ref || '' }}
+          repository: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || '' }}
+
+      - name: Setup Snyk
+        uses: snyk/actions/setup@master
+
+      - name: Configure Snyk
+        run: |
+          mkdir -p ~/.config/configstore/
+          echo "{\"api\": \"${{ secrets.SNYK_TOKEN }}\"}" > ~/.config/configstore/snyk.json
+          chmod 600 ~/.config/configstore/snyk.json
+          snyk auth "${{ secrets.SNYK_TOKEN }}"
+
+      - name: Create scan directories
+        run: mkdir -p scan_results
+
+      - name: Extract base image
+        id: base_image
+        run: |
+          DOCKERFILE_PATH="${{ env.TRAINING_DIR }}/${{ matrix.dockerfile_dir }}/Dockerfile"
           
-          # Enable debug mode if requested
-          if [ "$DEBUG_MODE" = "true" ]; then
-            set -x
-            echo "Running in debug mode"
+          # Check if directory and Dockerfile exist
+          if [ ! -d "${{ env.TRAINING_DIR }}/${{ matrix.dockerfile_dir }}" ]; then
+            echo "Directory ${{ env.TRAINING_DIR }}/${{ matrix.dockerfile_dir }} does not exist."
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
           
-          # Base directory for training Dockerfiles
-          TRAINING_DIR="images/runtime/training"
+          if [ ! -f "$DOCKERFILE_PATH" ]; then
+            echo "Dockerfile $DOCKERFILE_PATH does not exist."
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
-          # Track results for summary and outputs
-          HAS_HIGH_SEVERITY=false
-          HAS_ISSUES=false
-          ROWS=""
-          PASSED_COUNT=0
-          ISSUES_COUNT=0
-          HIGH_COUNT=0
+          echo "exists=true" >> $GITHUB_OUTPUT
+          
+          # Extract base image from Dockerfile
+          BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE_PATH" | awk '{print $2}' | sed 's/ AS .*//g')
+          
+          # Extract ARG values from Dockerfile to resolve variables in base image
+          declare -A arg_values
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
+              var_name="${BASH_REMATCH[1]}"
+              var_value="${BASH_REMATCH[2]}"
+              # Remove any quotes from value
+              var_value="${var_value//\"/}"
+              var_value="${var_value//\'/}"
+              arg_values["$var_name"]="$var_value"
+              echo "Extracted ARG $var_name = ${arg_values[$var_name]}"
+            fi
+          done < "$DOCKERFILE_PATH"
+          
+          # Replace variables in base image
+          for var_name in "${!arg_values[@]}"; do
+            BASE_IMAGE="${BASE_IMAGE//\$\{$var_name\}/${arg_values[$var_name]}}"
+            BASE_IMAGE="${BASE_IMAGE//\$$var_name/${arg_values[$var_name]}}"
+          done
+          
+          # Check if base image still contains variables, use fallback if needed
+          if [[ "$BASE_IMAGE" == *"\$"* ]] || [[ "$BASE_IMAGE" == *"{"* ]]; then
+            echo "Warning: Base image still contains unresolved variables: $BASE_IMAGE"
+            echo "Using fallback base image based on directory name."
+            
+            # Use known base images for specific directories
+            case "${{ matrix.dockerfile_dir }}" in
+              py311-cuda*)
+                BASE_IMAGE="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                ;;
+              py311-rocm*)
+                BASE_IMAGE="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
+                ;;
+              *)
+                BASE_IMAGE="ubuntu:latest"
+                ;;
+            esac
+          fi
+          
+          echo "base_image=$BASE_IMAGE" >> $GITHUB_OUTPUT
+          echo "Identified base image: $BASE_IMAGE"
+
+      - name: Scan base image
+        if: steps.base_image.outputs.exists == 'true'
+        id: base_scan
+        continue-on-error: true
+        run: |
+          # Create output file paths
+          BASE_IMAGE_SCAN_FILE="scan_results/${{ matrix.dockerfile_dir }}-base-image.json"
+          BASE_READABLE_FILE="scan_results/${{ matrix.dockerfile_dir }}-base-readable.txt"
+          
+          echo "Scanning base image ${{ steps.base_image.outputs.base_image }} separately..."
+          
+          # Run Snyk scan on just the base image and capture exit code
+          snyk container test "${{ steps.base_image.outputs.base_image }}" --json --severity-threshold=medium > "$BASE_IMAGE_SCAN_FILE" 2>/dev/null
+          BASE_EXIT_CODE=$?
+          
+          echo "base_exit_code=$BASE_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Generate human-readable output for base image
+          if [ $BASE_EXIT_CODE -eq 0 ] || [ $BASE_EXIT_CODE -eq 1 ]; then
+            snyk container test "${{ steps.base_image.outputs.base_image }}" --severity-threshold=medium > "$BASE_READABLE_FILE" 2>/dev/null || 
+            echo "Failed to generate human-readable results for base image" > "$BASE_READABLE_FILE"
+          else
+            echo "Base image scan failed with exit code $BASE_EXIT_CODE" > "$BASE_READABLE_FILE"
+          fi
+          
+          # Count vulnerabilities in base image
+          if [ -f "$BASE_IMAGE_SCAN_FILE" ] && [ $BASE_EXIT_CODE -eq 1 ]; then
+            BASE_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$BASE_IMAGE_SCAN_FILE" 2>/dev/null || echo 0)
+            BASE_HIGH=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$BASE_IMAGE_SCAN_FILE" 2>/dev/null || echo 0)
+            BASE_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$BASE_IMAGE_SCAN_FILE" 2>/dev/null || echo 0)
+            BASE_LOW=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$BASE_IMAGE_SCAN_FILE" 2>/dev/null || echo 0)
+          else
+            BASE_CRITICAL=0
+            BASE_HIGH=0
+            BASE_MEDIUM=0
+            BASE_LOW=0
+          fi
+          
+          echo "base_critical=$BASE_CRITICAL" >> $GITHUB_OUTPUT
+          echo "base_high=$BASE_HIGH" >> $GITHUB_OUTPUT
+          echo "base_medium=$BASE_MEDIUM" >> $GITHUB_OUTPUT
+          echo "base_low=$BASE_LOW" >> $GITHUB_OUTPUT
+
+      - name: Scan Dockerfile
+        if: steps.base_image.outputs.exists == 'true'
+        id: dockerfile_scan
+        continue-on-error: true
+        run: |
+          DOCKERFILE_PATH="${{ env.TRAINING_DIR }}/${{ matrix.dockerfile_dir }}/Dockerfile"
+          SCAN_RESULTS_FILE="scan_results/${{ matrix.dockerfile_dir }}-results.json"
+          READABLE_FILE="scan_results/${{ matrix.dockerfile_dir }}-readable.txt"
+          
+          echo "Running Snyk container test on ${{ steps.base_image.outputs.base_image }} with Dockerfile $DOCKERFILE_PATH..."
+          
+          # Run Snyk test with --file option for the Dockerfile
+          snyk container test "${{ steps.base_image.outputs.base_image }}" --file="$DOCKERFILE_PATH" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${{ matrix.dockerfile_dir }}-error.log
+          SCAN_EXIT_CODE=$?
+          
+          echo "scan_exit_code=$SCAN_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Generate human-readable output
+          if [ $SCAN_EXIT_CODE -eq 0 ] || [ $SCAN_EXIT_CODE -eq 1 ]; then
+            snyk container test "${{ steps.base_image.outputs.base_image }}" --file="$DOCKERFILE_PATH" --severity-threshold=medium > "$READABLE_FILE" 2>/dev/null || 
+            echo "Failed to generate human-readable results" > "$READABLE_FILE"
+          else
+            echo "Dockerfile scan failed with exit code $SCAN_EXIT_CODE - see error log for details" > "$READABLE_FILE"
+            cat scan_results/${{ matrix.dockerfile_dir }}-error.log >> "$READABLE_FILE"
+          fi
+          
+          # Count vulnerabilities in total scan
+          if [ -f "$SCAN_RESULTS_FILE" ] && [ $SCAN_EXIT_CODE -eq 1 ]; then
+            TOTAL_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+            TOTAL_HIGH=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+            TOTAL_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+            TOTAL_LOW=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
+          else
+            TOTAL_CRITICAL=0
+            TOTAL_HIGH=0
+            TOTAL_MEDIUM=0
+            TOTAL_LOW=0
+          fi
+          
+          echo "total_critical=$TOTAL_CRITICAL" >> $GITHUB_OUTPUT
+          echo "total_high=$TOTAL_HIGH" >> $GITHUB_OUTPUT
+          echo "total_medium=$TOTAL_MEDIUM" >> $GITHUB_OUTPUT
+          echo "total_low=$TOTAL_LOW" >> $GITHUB_OUTPUT
+
+      - name: Calculate Dockerfile-specific issues
+        if: steps.base_image.outputs.exists == 'true'
+        id: issue_summary
+        run: |
+          # Calculate Dockerfile-specific issues by subtracting base image issues
+          # Ensure we don't get negative numbers
+          DOCKERFILE_CRITICAL=$(( ${{ steps.dockerfile_scan.outputs.total_critical }} > ${{ steps.base_scan.outputs.base_critical }} ? ${{ steps.dockerfile_scan.outputs.total_critical }} - ${{ steps.base_scan.outputs.base_critical }} : 0 ))
+          DOCKERFILE_HIGH=$(( ${{ steps.dockerfile_scan.outputs.total_high }} > ${{ steps.base_scan.outputs.base_high }} ? ${{ steps.dockerfile_scan.outputs.total_high }} - ${{ steps.base_scan.outputs.base_high }} : 0 ))
+          DOCKERFILE_MEDIUM=$(( ${{ steps.dockerfile_scan.outputs.total_medium }} > ${{ steps.base_scan.outputs.base_medium }} ? ${{ steps.dockerfile_scan.outputs.total_medium }} - ${{ steps.base_scan.outputs.base_medium }} : 0 ))
+          DOCKERFILE_LOW=$(( ${{ steps.dockerfile_scan.outputs.total_low }} > ${{ steps.base_scan.outputs.base_low }} ? ${{ steps.dockerfile_scan.outputs.total_low }} - ${{ steps.base_scan.outputs.base_low }} : 0 ))
+          
+          # Determine status based on vulnerabilities
+          if [ ${{ steps.dockerfile_scan.outputs.total_critical }} -gt 0 ] || [ ${{ steps.dockerfile_scan.outputs.total_high }} -gt 0 ]; then
+            STATUS="❌ Fail"
+            SEVERITY="Critical/High"
+          elif [ ${{ steps.dockerfile_scan.outputs.total_medium }} -gt 0 ] || [ ${{ steps.dockerfile_scan.outputs.total_low }} -gt 0 ]; then
+            STATUS="⚠️ Warning"
+            SEVERITY="Medium/Low"
+          elif [ ${{ steps.dockerfile_scan.outputs.scan_exit_code }} -gt 1 ] || [ ${{ steps.base_scan.outputs.base_exit_code }} -gt 1 ]; then
+            STATUS="❌ Fail"
+            SEVERITY="Scan Error"
+          else
+            STATUS="✅ Pass"
+            SEVERITY="No Issues"
+          fi
+          
+          # Prepare issue summary
+          BASE_SUMMARY="Base image vulnerabilities: ${{ steps.base_scan.outputs.base_critical }} critical, ${{ steps.base_scan.outputs.base_high }} high, ${{ steps.base_scan.outputs.base_medium }} medium, ${{ steps.base_scan.outputs.base_low }} low"
+          DOCKERFILE_SUMMARY="Dockerfile-specific vulnerabilities: ${DOCKERFILE_CRITICAL} critical, ${DOCKERFILE_HIGH} high, ${DOCKERFILE_MEDIUM} medium, ${DOCKERFILE_LOW} low"
+          TOTAL_SUMMARY="Total vulnerabilities: ${{ steps.dockerfile_scan.outputs.total_critical }} critical, ${{ steps.dockerfile_scan.outputs.total_high }} high, ${{ steps.dockerfile_scan.outputs.total_medium }} medium, ${{ steps.dockerfile_scan.outputs.total_low }} low"
+          
+          # Write summary to file
+          echo "$BASE_SUMMARY" > scan_results/${{ matrix.dockerfile_dir }}-issues-summary.txt
+          echo "$DOCKERFILE_SUMMARY" >> scan_results/${{ matrix.dockerfile_dir }}-issues-summary.txt
+          echo "$TOTAL_SUMMARY" >> scan_results/${{ matrix.dockerfile_dir }}-issues-summary.txt
+          
+          # Add summary to readable results
+          echo -e "\n--- Issue Summary ---\n" >> scan_results/${{ matrix.dockerfile_dir }}-readable.txt
+          cat scan_results/${{ matrix.dockerfile_dir }}-issues-summary.txt >> scan_results/${{ matrix.dockerfile_dir }}-readable.txt
+          
+          # Set outputs for later use
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+          echo "base_summary=$BASE_SUMMARY" >> $GITHUB_OUTPUT
+          echo "dockerfile_summary=$DOCKERFILE_SUMMARY" >> $GITHUB_OUTPUT
+          echo "total_summary=$TOTAL_SUMMARY" >> $GITHUB_OUTPUT
+
+      - name: Determine overall scan result
+        id: summary
+        run: |
+          if [ "${{ steps.base_image.outputs.exists }}" != "true" ]; then
+            echo "status=❌ Fail" >> $GITHUB_OUTPUT
+            echo "message=File not found" >> $GITHUB_OUTPUT
+            echo "failures=1" >> $GITHUB_OUTPUT
+            echo "has_high_severity=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Determine scan result
+          if [ "${{ steps.issue_summary.outputs.status }}" == "❌ Fail" ]; then
+            echo "status=❌ Fail" >> $GITHUB_OUTPUT
+            
+            if [ "${{ steps.issue_summary.outputs.severity }}" == "Scan Error" ]; then
+              echo "message=Scan failed" >> $GITHUB_OUTPUT
+              echo "failures=1" >> $GITHUB_OUTPUT
+              echo "has_high_severity=false" >> $GITHUB_OUTPUT
+            else
+              echo "message=${{ steps.issue_summary.outputs.severity }} severity" >> $GITHUB_OUTPUT
+              echo "failures=0" >> $GITHUB_OUTPUT
+              echo "has_high_severity=true" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ steps.issue_summary.outputs.status }}" == "⚠️ Warning" ]; then
+            echo "status=⚠️ Warning" >> $GITHUB_OUTPUT
+            echo "message=${{ steps.issue_summary.outputs.severity }} severity" >> $GITHUB_OUTPUT
+            echo "failures=0" >> $GITHUB_OUTPUT
+            echo "has_high_severity=false" >> $GITHUB_OUTPUT
+          else
+            echo "status=✅ Pass" >> $GITHUB_OUTPUT
+            echo "message=No vulnerabilities" >> $GITHUB_OUTPUT
+            echo "failures=0" >> $GITHUB_OUTPUT
+            echo "has_high_severity=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Save results to file for artifact
+          mkdir -p ./artifacts
+          echo "# Scan Results for ${{ matrix.dockerfile_dir }}" > ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "- **Status**: ${{ steps.issue_summary.outputs.status }}" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "- **Severity**: ${{ steps.issue_summary.outputs.severity }}" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "- **Base Image**: ${{ steps.base_image.outputs.base_image }}" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "## Issue Summary" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "${{ steps.issue_summary.outputs.base_summary }}" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "${{ steps.issue_summary.outputs.dockerfile_summary }}" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+          echo "${{ steps.issue_summary.outputs.total_summary }}" >> ./artifacts/${{ matrix.dockerfile_dir }}-results.md
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: scan-results-${{ matrix.dockerfile_dir }}
+          path: scan_results/
+          retention-days: 7
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: summary-${{ matrix.dockerfile_dir }}
+          path: ./artifacts/
+          retention-days: 7
+
+  # Job 3: Collect results and generate report
+  report:
+    name: Generate Report
+    needs: [setup, scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./all-artifacts
+
+      - name: Generate summary report
+        id: report
+        run: |
+          # Prepare directory structure
+          mkdir -p ./report
+
+          # Initialize counters
+          TOTAL_IMAGES=0
+          PASSED=0
+          ISSUES=0
+          HIGH_SEVERITY=0
           SCAN_FAILURES=0
+          HAS_HIGH_SEVERITY=false
+          
+          # Initialize results
+          RESULTS=""
+          REPORT_ROWS=""
           
           # Define image types for reporting
           declare -A IMAGE_TYPES
@@ -118,553 +436,182 @@ jobs:
           IMAGE_TYPES["py311-rocm62-torch241"]="ROCm 6.2 + PyTorch 2.4.1"
           IMAGE_TYPES["py311-rocm62-torch251"]="ROCm 6.2 + PyTorch 2.5.1"
           
-          # Determine which directories to scan
-          if [ -n "$TARGET_DIR" ]; then
-            # Single directory mode - only scan the specified directory
-            DOCKERFILE_DIRS=("$TARGET_DIR")
-            echo "Scanning single directory: $TRAINING_DIR/$TARGET_DIR"
-          else
-            # Default - scan all training directories
-            DOCKERFILE_DIRS=(
-              "py311-cuda121-torch241"
-              "py311-cuda124-torch251"
-              "py311-rocm62-torch241"
-              "py311-rocm62-torch251"
-            )
-            echo "Scanning all training Dockerfiles"
-          fi
-          
-          REPORT_ROWS=()
-          BASE_IMAGE_ISSUES=()
-          
-          # Create results directory for scans
-          mkdir -p scan_results
-          
-          # Function to print section headers for better readability in logs
-          print_section() {
-            echo "============================================================"
-            echo "  $1"
-            echo "============================================================"
-          }
-          
-          # Improved function to extract base image from Dockerfile
-          extract_base_image() {
-            local dockerfile="$1"
+          # Process all summary artifacts
+          for DIR in ${{ join(fromJson(needs.setup.outputs.dirs_to_scan), ' ') }}; do
+            TOTAL_IMAGES=$((TOTAL_IMAGES + 1))
             
-            # First try to get the FROM line and extract just the base image
-            base_image=$(grep -m 1 "^FROM" "$dockerfile" | awk '{print $2}' || echo "")
-            
-            # Handle multi-stage builds by removing stage name if present
-            base_image=$(echo "$base_image" | sed 's/ AS .*//g')
-            
-            # If empty, use a default
-            if [ -z "$base_image" ]; then
-              echo "ubuntu:latest"
-              return
-            fi
-            
-            # Extract ARG values from Dockerfile
-            declare -A arg_values
-            while IFS= read -r line; do
-              if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
-                var_name="${BASH_REMATCH[1]}"
-                var_value="${BASH_REMATCH[2]}"
-                # Remove any quotes from value
-                var_value="${var_value//\"/}"
-                var_value="${var_value//\'/}"
-                arg_values["$var_name"]="$var_value"
-                if [ "$DEBUG_MODE" = "true" ]; then
-                  echo "Extracted ARG $var_name = ${arg_values[$var_name]}" >&2
-                fi
-              fi
-            done < "$dockerfile"
-            
-            # Replace variables in base image
-            for var_name in "${!arg_values[@]}"; do
-              base_image="${base_image//\$\{$var_name\}/${arg_values[$var_name]}}"
-              base_image="${base_image//\$$var_name/${arg_values[$var_name]}}"
-            done
-            
-            # Return resolved image
-            echo "$base_image"
-          }
-          
-          # Function to check Snyk API connectivity
-          test_snyk_connectivity() {
-            echo "Testing Snyk API connectivity..."
-            if ! curl -s -o /dev/null -w "%{http_code}" -X GET "https://api.snyk.io/v1/user/me" -H "Authorization: token $SNYK_TOKEN"; then
-              echo "Warning: Snyk API connectivity test failed. Will retry authentication."
-              # Try re-authenticating
-              snyk auth "$SNYK_TOKEN"
-            fi
-          }
-          
-          # New function to scan base image separately
-          scan_base_image() {
-            local base_image="$1"
-            local output_file="$2"
-            local human_readable_file="$3"
-            
-            echo "Scanning base image: $base_image"
-            
-            # Run Snyk scan on just the base image
-            if snyk container test "$base_image" --json --severity-threshold=medium > "$output_file" 2>/dev/null; then
-              echo "Base image scan completed successfully without vulnerabilities"
-              return 0
-            elif [ $? -eq 1 ]; then
-              # Exit code 1 means vulnerabilities were found (successful scan with issues)
-              echo "Base image scan found vulnerabilities"
+            if [ -d "./all-artifacts/summary-${DIR}" ]; then
+              SUMMARY_FILE="./all-artifacts/summary-${DIR}/${DIR}-results.md"
               
-              # Capture human-readable results for the base image
-              snyk container test "$base_image" --severity-threshold=medium > "$human_readable_file" 2>/dev/null || 
-              echo "Failed to generate human-readable results for base image" > "$human_readable_file"
-              
-              return 1
-            else
-              echo "Base image scan failed with unexpected error"
-              return 2
-            fi
-          }
-          
-          # Function to extract vulnerability counts from Snyk JSON output
-          extract_vulnerability_counts() {
-            local json_file="$1"
-            local prefix="$2"
-            local counts_file="$3"
-            
-            if [ ! -f "$json_file" ]; then
-              echo "${prefix}_critical=0" >> "$counts_file"
-              echo "${prefix}_high=0" >> "$counts_file"
-              echo "${prefix}_medium=0" >> "$counts_file"
-              echo "${prefix}_low=0" >> "$counts_file"
-              return
-            fi
-            
-            # Count vulnerabilities by severity
-            local critical_count=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$json_file" 2>/dev/null || echo 0)
-            local high_count=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$json_file" 2>/dev/null || echo 0)
-            local medium_count=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$json_file" 2>/dev/null || echo 0)
-            local low_count=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$json_file" 2>/dev/null || echo 0)
-            
-            echo "${prefix}_critical=$critical_count" >> "$counts_file"
-            echo "${prefix}_high=$high_count" >> "$counts_file"
-            echo "${prefix}_medium=$medium_count" >> "$counts_file"
-            echo "${prefix}_low=$low_count" >> "$counts_file"
-          }
-          
-          # Function to compare two vulnerability counts and output Dockerfile-specific issues
-          calculate_dockerfile_issues() {
-            local counts_file="$1"
-            local output_file="$2"
-            
-            # Source the counts file to get variables
-            source "$counts_file"
-            
-            # Calculate Dockerfile-specific issues by subtracting base image issues
-            # Ensure we don't get negative numbers
-            dockerfile_critical=$((total_critical > base_critical ? total_critical - base_critical : 0))
-            dockerfile_high=$((total_high > base_high ? total_high - base_high : 0))
-            dockerfile_medium=$((total_medium > base_medium ? total_medium - base_medium : 0))
-            dockerfile_low=$((total_low > base_low ? total_low - base_low : 0))
-            
-            # Write to output file without heredoc syntax that breaks YAML
-            echo "Base image vulnerabilities: ${base_critical} critical, ${base_high} high, ${base_medium} medium, ${base_low} low" > "$output_file"
-            echo "Dockerfile-specific vulnerabilities: ${dockerfile_critical} critical, ${dockerfile_high} high, ${dockerfile_medium} medium, ${dockerfile_low} low" >> "$output_file"
-            echo "Total vulnerabilities: ${total_critical} critical, ${total_high} high, ${total_medium} medium, ${total_low} low" >> "$output_file"
-          }
-          
-          # Test connectivity before starting
-          test_snyk_connectivity
-          
-          # For each Dockerfile directory
-          for DIR in "${DOCKERFILE_DIRS[@]}"; do
-            DOCKERFILE_PATH="$TRAINING_DIR/${DIR}/Dockerfile"
-            print_section "Scanning ${DIR} Dockerfile"
-            
-            # Check if directory and Dockerfile exist
-            if [ ! -d "$TRAINING_DIR/${DIR}" ]; then
-              echo "Directory $TRAINING_DIR/${DIR} does not exist."
-              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Directory not found|N/A|N/A")
-              ROWS+=$'\n'"• ${DIR}: ❌ Failed (directory not found)"
-              HAS_ISSUES=true
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              continue
-            fi
-            
-            if [ ! -f "$DOCKERFILE_PATH" ]; then
-              echo "Dockerfile $DOCKERFILE_PATH does not exist."
-              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Dockerfile not found|N/A|N/A")
-              ROWS+=$'\n'"• ${DIR}: ❌ Failed (not found)"
-              HAS_ISSUES=true
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              continue
-            fi
-            
-            # Set up variables for this file's results
-            VULN_ISSUES="None"
-            CONFIG_ISSUES=()
-            BASE_IMAGE_RESULTS=()
-            SCAN_RESULTS_FILE="scan_results/${DIR}-results.json"
-            BASE_IMAGE_SCAN_FILE="scan_results/${DIR}-base-image.json"
-            VULN_COUNTS_FILE="scan_results/${DIR}-vuln-counts.txt"
-            ISSUE_SUMMARY_FILE="scan_results/${DIR}-issues-summary.txt"
-            
-            # Extract the base image from Dockerfile
-            BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH")
-            echo "Identified base image: $BASE_IMAGE"
-            
-            # Check if base image still contains variables
-            if [[ "$BASE_IMAGE" == *"\$"* ]] || [[ "$BASE_IMAGE" == *"{"* ]]; then
-              echo "Warning: Base image still contains unresolved variables: $BASE_IMAGE"
-              echo "Using fallback base image based on directory name."
-              
-              # Use known base images for specific directories
-              case "$DIR" in
-                py311-cuda*)
-                  BASE_IMAGE="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
-                  ;;
-                py311-rocm*)
-                  BASE_IMAGE="registry.access.redhat.com/ubi9/python-311:9.5-1741671866"
-                  ;;
-                *)
-                  BASE_IMAGE="ubuntu:latest"
-                  ;;
-              esac
-              echo "Using fallback base image: $BASE_IMAGE"
-            fi
-            
-            # First: Scan the base image alone to identify base vulnerabilities
-            echo "Scanning base image $BASE_IMAGE separately..."
-            scan_base_image "$BASE_IMAGE" "$BASE_IMAGE_SCAN_FILE" "scan_results/${DIR}-base-readable.txt"
-            BASE_IMAGE_EXIT_CODE=$?
-            
-            # Extract vulnerability counts from base image scan
-            extract_vulnerability_counts "$BASE_IMAGE_SCAN_FILE" "base" "$VULN_COUNTS_FILE"
-            
-            echo "Running Snyk container test on $BASE_IMAGE with Dockerfile $DOCKERFILE_PATH..."
-            
-            # Now run Snyk's test with --file option for the Dockerfile
-            if snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
-              echo "Scan completed successfully without vulnerabilities for $DIR"
-              VULN_ISSUES="No vulnerabilities"
-              PASSED_COUNT=$((PASSED_COUNT + 1))
-              # Still extract counts for consistency (should be all zeros)
-              extract_vulnerability_counts "$SCAN_RESULTS_FILE" "total" "$VULN_COUNTS_FILE"
-            else
-              SNYK_EXIT_CODE=$?
-              
-              if [ $SNYK_EXIT_CODE -eq 1 ]; then
-                # Exit code 1 means vulnerabilities were found (successful scan with issues)
-                echo "Vulnerabilities found in $DIR (exit code 1)"
-                HAS_VULNS=true
-                HAS_ISSUES=true
-                # Extract vulnerability counts from the full scan
-                extract_vulnerability_counts "$SCAN_RESULTS_FILE" "total" "$VULN_COUNTS_FILE"
-              elif [ $SNYK_EXIT_CODE -eq 2 ]; then
-                # Exit code 2 is a Snyk error - try fallback to just base image results
-                echo "Snyk scan with --file failed with exit code 2. Using base image results."
+              if [ -f "$SUMMARY_FILE" ]; then
+                # Extract info from summary file
+                STATUS=$(grep "Status" "$SUMMARY_FILE" | cut -d':' -f2 | xargs)
+                SEVERITY=$(grep "Severity" "$SUMMARY_FILE" | cut -d':' -f2 | xargs)
+                BASE_IMAGE=$(grep "Base Image" "$SUMMARY_FILE" | cut -d':' -f2 | xargs)
                 
-                # Copy base image results as total results
-                cp "$BASE_IMAGE_SCAN_FILE" "$SCAN_RESULTS_FILE"
-                # Copy counts from base image
-                echo "total_critical=$(grep "base_critical" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
-                echo "total_high=$(grep "base_high" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
-                echo "total_medium=$(grep "base_medium" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
-                echo "total_low=$(grep "base_low" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
+                # Get issue details
+                BASE_SUMMARY=$(grep "Base image vulnerabilities" "$SUMMARY_FILE" | xargs)
+                DOCKERFILE_SUMMARY=$(grep "Dockerfile-specific vulnerabilities" "$SUMMARY_FILE" | xargs)
                 
-                if [ $BASE_IMAGE_EXIT_CODE -eq 0 ]; then
-                  echo "Using base image scan results (no vulnerabilities)"
-                  VULN_ISSUES="No vulnerabilities"
-                  PASSED_COUNT=$((PASSED_COUNT + 1))
-                elif [ $BASE_IMAGE_EXIT_CODE -eq 1 ]; then
-                  echo "Using base image scan results (vulnerabilities found)"
-                  HAS_VULNS=true
-                  HAS_ISSUES=true
+                # Update counters
+                if [ "$STATUS" == "✅ Pass" ]; then
+                  PASSED=$((PASSED + 1))
+                elif [ "$STATUS" == "❌ Fail" ]; then
+                  if [ "$SEVERITY" == "Scan Error" ]; then
+                    SCAN_FAILURES=$((SCAN_FAILURES + 1))
+                  elif [ "$SEVERITY" == "Critical/High" ]; then
+                    HIGH_SEVERITY=$((HIGH_SEVERITY + 1))
+                    HAS_HIGH_SEVERITY=true
+                  else
+                    ISSUES=$((ISSUES + 1))
+                  fi
                 else
-                  # Base image scanning also failed
-                  SCAN_FAILURES=$((SCAN_FAILURES + 1))
-                  echo "Base image scan also failed - check scan_results/${DIR}-error.log for details"
-                  VULN_ISSUES="Scan failed"
-                  CONFIG_ISSUES+=("Snyk scan failed - check logs")
-                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs|N/A")
-                  ROWS+=$'\n'"• ${DIR}: ❌ Failed (scan error)"
-                  HAS_ISSUES=true
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                  continue
+                  ISSUES=$((ISSUES + 1))
                 fi
+                
+                # Add to results row
+                REPORT_ROWS="${REPORT_ROWS}${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${SEVERITY}|${DOCKERFILE_SUMMARY}|${BASE_SUMMARY}\n"
+                RESULTS="${RESULTS}• ${DIR}: ${STATUS} (${SEVERITY})\n"
               else
-                # Other error code
+                # No summary file found
                 SCAN_FAILURES=$((SCAN_FAILURES + 1))
-                echo "Snyk scan failed with unexpected exit code: $SNYK_EXIT_CODE"
-                VULN_ISSUES="Scan failed"
-                CONFIG_ISSUES+=("Snyk scan failed with code $SNYK_EXIT_CODE")
-                REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Unexpected error (code $SNYK_EXIT_CODE)|N/A")
-                ROWS+=$'\n'"• ${DIR}: ❌ Failed (unexpected error)"
-                HAS_ISSUES=true
-                ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                continue
+                REPORT_ROWS="${REPORT_ROWS}${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Missing results|N/A|N/A\n"
+                RESULTS="${RESULTS}• ${DIR}: ❌ Failed (missing results)\n"
               fi
-            fi
-            
-            # Calculate and save Dockerfile-specific issues by comparing with base image
-            calculate_dockerfile_issues "$VULN_COUNTS_FILE" "$ISSUE_SUMMARY_FILE"
-            
-            # Load the processed issue summary
-            ISSUE_SUMMARY=$(<"$ISSUE_SUMMARY_FILE")
-            BASE_IMAGE_ISSUES+=("$DIR: $ISSUE_SUMMARY")
-            
-            # Process the scan results for reporting
-            source "$VULN_COUNTS_FILE"
-            
-            # Determine severity based on total vulnerabilities
-            if [ "${total_critical:-0}" -gt 0 ]; then
-              VULN_ISSUES="Critical severity"
-              HAS_HIGH_SEVERITY=true
-              HIGH_COUNT=$((HIGH_COUNT + 1))
-              HAS_ISSUES=true
-            elif [ "${total_high:-0}" -gt 0 ]; then
-              VULN_ISSUES="High severity"
-              HAS_HIGH_SEVERITY=true
-              HIGH_COUNT=$((HIGH_COUNT + 1))
-              HAS_ISSUES=true
-            elif [ "${total_medium:-0}" -gt 0 ]; then
-              VULN_ISSUES="Medium severity"
-              HAS_ISSUES=true
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
-            elif [ "${total_low:-0}" -gt 0 ]; then
-              VULN_ISSUES="Low severity"
-            elif [ "${HAS_VULNS:-false}" = "true" ]; then
-              # Fallback if there are vulnerabilities but we couldn't detect them
-              VULN_ISSUES="Unknown severity"
-              HAS_ISSUES=true
-              ISSUES_COUNT=$((ISSUES_COUNT + 1))
             else
-              VULN_ISSUES="No vulnerabilities"
-              PASSED_COUNT=$((PASSED_COUNT + 1))
+              # No artifact directory found
+              SCAN_FAILURES=$((SCAN_FAILURES + 1))
+              REPORT_ROWS="${REPORT_ROWS}${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Missing results|N/A|N/A\n"
+              RESULTS="${RESULTS}• ${DIR}: ❌ Failed (missing results)\n"
             fi
-            
-            # Format the issue summary for the report
-            BASE_IMAGE_SUMMARY=$(grep "Base image vulnerabilities" "$ISSUE_SUMMARY_FILE")
-            DOCKERFILE_SUMMARY=$(grep "Dockerfile-specific vulnerabilities" "$ISSUE_SUMMARY_FILE")
-            
-            # Format issues for reporting
-            if [ ${#CONFIG_ISSUES[@]} -eq 0 ]; then
-              CONFIG_ISSUES_STR="None"
-            else
-              CONFIG_ISSUES_STR=$(printf "%s; " "${CONFIG_ISSUES[@]}" | sed 's/; $//')
-            fi
-            
-            # Determine status based on found issues
-            if [ "$VULN_ISSUES" = "Critical severity" ] || [ "$VULN_ISSUES" = "High severity" ]; then
-              STATUS="❌ Fail"
-            elif [ "$VULN_ISSUES" = "Medium severity" ] || [ "$VULN_ISSUES" = "Low severity" ] || [ "$VULN_ISSUES" = "Unknown severity" ]; then
-              STATUS="⚠️ Warning"
-            else
-              STATUS="✅ Pass"
-            fi
-            
-            # Save to report rows for summary
-            REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${VULN_ISSUES}|${CONFIG_ISSUES_STR}|${BASE_IMAGE_SUMMARY}")
-            ROWS+=$'\n'"• ${DIR}: ${STATUS}"
-            
-            echo "Scan completed for $DIR with status: $STATUS"
-            
-            # Generate human-readable results
-            echo "Saving human-readable results for $DIR"
-            
-            (snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null) || 
-            (echo "Direct scan failed, trying base image scan..." && 
-            snyk container test "$BASE_IMAGE" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null) || 
-            (echo "Failed to generate human-readable results" > "scan_results/${DIR}-readable.txt")
-            
-            # Add the issue summary to the readable results
-            echo -e "\n--- Issue Summary ---\n" >> "scan_results/${DIR}-readable.txt"
-            cat "$ISSUE_SUMMARY_FILE" >> "scan_results/${DIR}-readable.txt"
           done
-          
-          print_section "Scan Summary"
           
           # Determine overall status
           if [ $SCAN_FAILURES -gt 0 ]; then
             SCAN_STATUS="⚠️ Scan failures: $SCAN_FAILURES"
-            HAS_ISSUES=true
+            OVERALL_STATUS="❌ Failed"
           elif $HAS_HIGH_SEVERITY; then
             SCAN_STATUS="❌ Security issues found"
-          elif $HAS_ISSUES; then 
-            SCAN_STATUS="⚠️ Issues found"
-          else
-            SCAN_STATUS="✅ All secure"
-          fi
-          
-          if $HAS_HIGH_SEVERITY; then
             OVERALL_STATUS="❌ Failed"
-          elif $HAS_ISSUES; then 
+          elif [ $ISSUES -gt 0 ]; then 
+            SCAN_STATUS="⚠️ Issues found"
             OVERALL_STATUS="⚠️ Issues Found"
           else
+            SCAN_STATUS="✅ All secure"
             OVERALL_STATUS="✅ All Secure"
           fi
           
+          # Set outputs for later use
+          echo "results<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$RESULTS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "report_rows<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$REPORT_ROWS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "total_images=$TOTAL_IMAGES" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "issues=$ISSUES" >> $GITHUB_OUTPUT
+          echo "high_severity=$HIGH_SEVERITY" >> $GITHUB_OUTPUT
+          echo "scan_failures=$SCAN_FAILURES" >> $GITHUB_OUTPUT
+          echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          echo "scan_status=$SCAN_STATUS" >> $GITHUB_OUTPUT
+          
+          if $HAS_HIGH_SEVERITY; then
+            echo "status=high_severity" >> $GITHUB_OUTPUT
+          elif [ $ISSUES -gt 0 ]; then
+            echo "status=issues_found" >> $GITHUB_OUTPUT
+          elif [ $SCAN_FAILURES -gt 0 ]; then
+            echo "status=failures" >> $GITHUB_OUTPUT
+          else
+            echo "status=secure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub summary
+        run: |
           # Set timezone for consistent reporting
           TZ=Europe/London
           export TZ
           LON_DATE="$(date '+%a %d %b %Y %T %Z')"
           
           # Create GitHub step summary
-          echo "# Dockerfile Security Scan Results" > "$GITHUB_STEP_SUMMARY"
+          echo "# Dockerfile Security Scan Results" > $GITHUB_STEP_SUMMARY
           
-          echo "## Summary Overview" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|:-------|:------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scan Date** | $LON_DATE |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scan Status** | $SCAN_STATUS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Snyk Version** | ${{ steps.snyk_version.outputs.version }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scanner Mode** | Snyk container test |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Total Images** | ${#DOCKERFILE_DIRS[@]} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Passed** | $PASSED_COUNT |" >> "$GITHUB_STEP_SUMMARY" 
-          echo "| **Issues** | $ISSUES_COUNT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Critical/High** | $HIGH_COUNT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scan Failures** | $SCAN_FAILURES |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Summary Overview" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|:-------|:------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Scan Date** | $LON_DATE |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ steps.report.outputs.overall_status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Scan Status** | ${{ steps.report.outputs.scan_status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Snyk Version** | ${{ needs.setup.outputs.snyk_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Scanner Mode** | Snyk container test |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total Images** | ${{ steps.report.outputs.total_images }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Passed** | ${{ steps.report.outputs.passed }} |" >> $GITHUB_STEP_SUMMARY 
+          echo "| **Issues** | ${{ steps.report.outputs.issues }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Critical/High** | ${{ steps.report.outputs.high_severity }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Scan Failures** | ${{ steps.report.outputs.scan_failures }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## Detailed Scan Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Detailed Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "<table>" >> "$GITHUB_STEP_SUMMARY"
-          echo "  <tr>" >> "$GITHUB_STEP_SUMMARY"
-          echo "    <th align='left'>Dockerfile</th>" >> "$GITHUB_STEP_SUMMARY"
-          echo "    <th align='left'>Image Type</th>" >> "$GITHUB_STEP_SUMMARY"
-          echo "    <th align='center'>Status</th>" >> "$GITHUB_STEP_SUMMARY"
-          echo "    <th align='left'>Security Issues</th>" >> "$GITHUB_STEP_SUMMARY"
-          echo "    <th align='left'>Configuration Issues</th>" >> "$GITHUB_STEP_SUMMARY"
-          echo "    <th align='left'>Base Image Issues</th>" >> "$GITHUB_STEP_SUMMARY"
-          echo "  </tr>" >> "$GITHUB_STEP_SUMMARY"
+          echo "<table>" >> $GITHUB_STEP_SUMMARY
+          echo "  <tr>" >> $GITHUB_STEP_SUMMARY
+          echo "    <th align='left'>Dockerfile</th>" >> $GITHUB_STEP_SUMMARY
+          echo "    <th align='left'>Image Type</th>" >> $GITHUB_STEP_SUMMARY
+          echo "    <th align='center'>Status</th>" >> $GITHUB_STEP_SUMMARY
+          echo "    <th align='left'>Security Issues</th>" >> $GITHUB_STEP_SUMMARY
+          echo "    <th align='left'>Dockerfile-specific Issues</th>" >> $GITHUB_STEP_SUMMARY
+          echo "    <th align='left'>Base Image Issues</th>" >> $GITHUB_STEP_SUMMARY
+          echo "  </tr>" >> $GITHUB_STEP_SUMMARY
           
-          for ROW in "${REPORT_ROWS[@]}"; do
-            IFS='|' read -r DIR IMAGE_TYPE STATUS VULN CONFIG BASE_IMAGE_VULN <<< "$ROW"
-            echo "  <tr>" >> "$GITHUB_STEP_SUMMARY"
-            echo "    <td>${DIR}</td>" >> "$GITHUB_STEP_SUMMARY"
-            echo "    <td>${IMAGE_TYPE}</td>" >> "$GITHUB_STEP_SUMMARY"
-            echo "    <td align='center'>${STATUS}</td>" >> "$GITHUB_STEP_SUMMARY"
-            echo "    <td>${VULN}</td>" >> "$GITHUB_STEP_SUMMARY"
-            echo "    <td>${CONFIG}</td>" >> "$GITHUB_STEP_SUMMARY"
-            echo "    <td>${BASE_IMAGE_VULN}</td>" >> "$GITHUB_STEP_SUMMARY"
-            echo "  </tr>" >> "$GITHUB_STEP_SUMMARY"
+          # Process all rows
+          IFS=$'\n'
+          for ROW in $(echo -e "${{ steps.report.outputs.report_rows }}"); do
+            IFS='|' read -r DIR IMAGE_TYPE STATUS SEVERITY DOCKERFILE_ISSUES BASE_ISSUES <<< "$ROW"
+            echo "  <tr>" >> $GITHUB_STEP_SUMMARY
+            echo "    <td>${DIR}</td>" >> $GITHUB_STEP_SUMMARY
+            echo "    <td>${IMAGE_TYPE}</td>" >> $GITHUB_STEP_SUMMARY
+            echo "    <td align='center'>${STATUS}</td>" >> $GITHUB_STEP_SUMMARY
+            echo "    <td>${SEVERITY}</td>" >> $GITHUB_STEP_SUMMARY
+            echo "    <td>${DOCKERFILE_ISSUES}</td>" >> $GITHUB_STEP_SUMMARY
+            echo "    <td>${BASE_ISSUES}</td>" >> $GITHUB_STEP_SUMMARY
+            echo "  </tr>" >> $GITHUB_STEP_SUMMARY
           done
           
-          echo "</table>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "</table>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "## Base Image vs Dockerfile Issues" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Security Checks Performed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check Type | Description | Severity |" >> $GITHUB_STEP_SUMMARY
+          echo "|:-----------|:------------|:---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Base Image Analysis** | Snyk container test on base image | Critical/High = Fail |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Dockerfile Analysis** | Snyk container test with --file option | Critical/High = Fail |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Issue Segregation** | Separate reporting of base image vs Dockerfile issues | Informational |" >> $GITHUB_STEP_SUMMARY
           
-          echo "<details>" >> "$GITHUB_STEP_SUMMARY"
-          echo "<summary>Click to expand vulnerability breakdown by image</summary>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Notes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Scans run directly using Snyk's container test functionality" >> $GITHUB_STEP_SUMMARY
+          echo "- Base image issues and Dockerfile-specific issues are segregated for better analysis" >> $GITHUB_STEP_SUMMARY
+          echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> $GITHUB_STEP_SUMMARY
+          echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> $GITHUB_STEP_SUMMARY
+          echo "- No container images are built during this process" >> $GITHUB_STEP_SUMMARY
           
-          for ISSUE in "${BASE_IMAGE_ISSUES[@]}"; do
-            echo "**${ISSUE}**" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-          done
-          
-          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          
-          echo "## Security Checks Performed" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Base Image Analysis** | Snyk container test on base image | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Dockerfile Analysis** | Snyk container test with --file option | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Issue Segregation** | Separate reporting of base image vs Dockerfile issues | Informational |" >> "$GITHUB_STEP_SUMMARY"
-          
-          # If debug mode is enabled, add detailed output of scan results
-          if [ "$DEBUG_MODE" = "true" ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "## Debug: Scan Results Details" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            
-            for DIR in "${DOCKERFILE_DIRS[@]}"; do
-              if [ -f "scan_results/${DIR}-readable.txt" ]; then
-                echo "<details>" >> "$GITHUB_STEP_SUMMARY"
-                echo "<summary>Scan Results for ${DIR}</summary>" >> "$GITHUB_STEP_SUMMARY"
-                echo "" >> "$GITHUB_STEP_SUMMARY"
-                echo '```' >> "$GITHUB_STEP_SUMMARY"
-                cat "scan_results/${DIR}-readable.txt" >> "$GITHUB_STEP_SUMMARY"
-                echo '```' >> "$GITHUB_STEP_SUMMARY"
-                echo "" >> "$GITHUB_STEP_SUMMARY"
-                echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-              fi
-              
-              if [ -f "scan_results/${DIR}-base-readable.txt" ]; then
-                echo "<details>" >> "$GITHUB_STEP_SUMMARY"
-                echo "<summary>Base Image Scan Results for ${DIR}</summary>" >> "$GITHUB_STEP_SUMMARY"
-                echo "" >> "$GITHUB_STEP_SUMMARY"
-                echo '```' >> "$GITHUB_STEP_SUMMARY"
-                cat "scan_results/${DIR}-base-readable.txt" >> "$GITHUB_STEP_SUMMARY"
-                echo '```' >> "$GITHUB_STEP_SUMMARY"
-                echo "" >> "$GITHUB_STEP_SUMMARY"
-                echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-              fi
-            done
-          fi
-          
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Scans run directly using Snyk's container test functionality" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Base image issues and Dockerfile-specific issues are segregated for better analysis" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
-          echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> "$GITHUB_STEP_SUMMARY"
-          echo "- No container images are built during this process" >> "$GITHUB_STEP_SUMMARY"
-          
-          if [ $SCAN_FAILURES -gt 0 ]; then
-            echo "- **⚠️ Some scans failed.** Check the logs for details." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          
-          # Output results for use in later steps
-          echo "results<<EOF" >> $GITHUB_OUTPUT
-          echo -e "${ROWS}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-          # Output status for Slack notification
-          if $HAS_HIGH_SEVERITY; then
-            echo "status=high_severity" >> $GITHUB_OUTPUT
-          elif $HAS_ISSUES; then
-            echo "status=issues_found" >> $GITHUB_OUTPUT
-          else
-            echo "status=secure" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "debug_mode=$DEBUG_MODE" >> $GITHUB_OUTPUT
-          echo "snyk_version=${{ steps.snyk_version.outputs.version }}" >> $GITHUB_OUTPUT
-          echo "scanner_mode=dockerfile" >> $GITHUB_OUTPUT
-          echo "scan_failures=$SCAN_FAILURES" >> $GITHUB_OUTPUT
-          
-          # Print final scan summary to logs
-          print_section "Final Results"
-          echo "Scan completed with status: $OVERALL_STATUS"
-          echo "Total images: ${#DOCKERFILE_DIRS[@]}"
-          echo "Passed: $PASSED_COUNT"
-          echo "Issues: $ISSUES_COUNT"
-          echo "Critical/High: $HIGH_COUNT"
-          echo "Scan Failures: $SCAN_FAILURES"
-          
-          # Fail the workflow if high severity issues are found
-          if $HAS_HIGH_SEVERITY; then
-            echo "❌ High/Critical security issues detected — failing the workflow."
-            exit 1
+          if [ ${{ steps.report.outputs.scan_failures }} -gt 0 ]; then
+            echo "- **⚠️ Some scans failed.** Check the logs for details." >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Slack Notification
         if: >
           always() &&
-          (steps.scan.outputs.status != 'secure' || 
+          (steps.report.outputs.status != 'secure' || 
           github.event.inputs.debug == 'true' || 
           github.event_name == 'schedule' ||
-          job.status == 'failure' ||
-          steps.scan.outputs.scan_failures != '0')
+          job.status == 'failure')
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
@@ -674,9 +621,9 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ job.status == 'failure' && 'danger' || steps.scan.outputs.status == 'secure' && 'good' || steps.scan.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
+                  "color": "${{ job.status == 'failure' && 'danger' || steps.report.outputs.status == 'secure' && 'good' || steps.report.outputs.status == 'high_severity' && 'danger' || 'warning' }}",
                   "title": "Dockerfile Security Scan Results",
-                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.scan.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.scan.outputs.status == 'high_severity' && '🚨 High severity issues detected' || steps.scan.outputs.scan_failures != '0' && '⚠️ Some scans failed' || '⚠️ Security issues detected' }}\n${{ steps.scan.outputs.results }}\n\n*Scanner:* Snyk | *Version:* ${{ steps.snyk_version.outputs.version || 'Unknown' }}",
+                  "text": "${{ job.status == 'failure' && '🚨 Workflow failed' || steps.report.outputs.status == 'secure' && '✅ All Dockerfiles are secure' || steps.report.outputs.status == 'high_severity' && '🚨 High severity issues detected' || steps.report.outputs.scan_failures != '0' && '⚠️ Some scans failed' || '⚠️ Security issues detected' }}\n${{ steps.report.outputs.results }}\n\n*Scanner:* Snyk | *Version:* ${{ needs.setup.outputs.snyk_version || 'Unknown' }}",
                   "mrkdwn_in": ["text"],
                   "footer": "Snyk Dockerfile Security Scan | Run ID: ${{ github.run_id }} | $(TZ=Europe/London date '+%d-%m-%Y %H:%M %Z')"
                 }
