@@ -135,6 +135,7 @@ jobs:
           fi
           
           REPORT_ROWS=()
+          BASE_IMAGE_ISSUES=()
           
           # Create results directory for scans
           mkdir -p scan_results
@@ -198,6 +199,80 @@ jobs:
             fi
           }
           
+          # New function to scan base image separately
+          scan_base_image() {
+            local base_image="$1"
+            local output_file="$2"
+            local human_readable_file="$3"
+            
+            echo "Scanning base image: $base_image"
+            
+            # Run Snyk scan on just the base image
+            if snyk container test "$base_image" --json --severity-threshold=medium > "$output_file" 2>/dev/null; then
+              echo "Base image scan completed successfully without vulnerabilities"
+              return 0
+            elif [ $? -eq 1 ]; then
+              # Exit code 1 means vulnerabilities were found (successful scan with issues)
+              echo "Base image scan found vulnerabilities"
+              
+              # Capture human-readable results for the base image
+              snyk container test "$base_image" --severity-threshold=medium > "$human_readable_file" 2>/dev/null || 
+              echo "Failed to generate human-readable results for base image" > "$human_readable_file"
+              
+              return 1
+            else
+              echo "Base image scan failed with unexpected error"
+              return 2
+            fi
+          }
+          
+          # Function to extract vulnerability counts from Snyk JSON output
+          extract_vulnerability_counts() {
+            local json_file="$1"
+            local prefix="$2"
+            local counts_file="$3"
+            
+            if [ ! -f "$json_file" ]; then
+              echo "${prefix}_critical=0" >> "$counts_file"
+              echo "${prefix}_high=0" >> "$counts_file"
+              echo "${prefix}_medium=0" >> "$counts_file"
+              echo "${prefix}_low=0" >> "$counts_file"
+              return
+            fi
+            
+            # Count vulnerabilities by severity
+            local critical_count=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$json_file" 2>/dev/null || echo 0)
+            local high_count=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$json_file" 2>/dev/null || echo 0)
+            local medium_count=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$json_file" 2>/dev/null || echo 0)
+            local low_count=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$json_file" 2>/dev/null || echo 0)
+            
+            echo "${prefix}_critical=$critical_count" >> "$counts_file"
+            echo "${prefix}_high=$high_count" >> "$counts_file"
+            echo "${prefix}_medium=$medium_count" >> "$counts_file"
+            echo "${prefix}_low=$low_count" >> "$counts_file"
+          }
+          
+          # Function to compare two vulnerability counts and output Dockerfile-specific issues
+          calculate_dockerfile_issues() {
+            local counts_file="$1"
+            local output_file="$2"
+            
+            # Source the counts file to get variables
+            source "$counts_file"
+            
+            # Calculate Dockerfile-specific issues by subtracting base image issues
+            # Ensure we don't get negative numbers
+            dockerfile_critical=$((total_critical > base_critical ? total_critical - base_critical : 0))
+            dockerfile_high=$((total_high > base_high ? total_high - base_high : 0))
+            dockerfile_medium=$((total_medium > base_medium ? total_medium - base_medium : 0))
+            dockerfile_low=$((total_low > base_low ? total_low - base_low : 0))
+            
+            # Write to output file without heredoc syntax that breaks YAML
+            echo "Base image vulnerabilities: ${base_critical} critical, ${base_high} high, ${base_medium} medium, ${base_low} low" > "$output_file"
+            echo "Dockerfile-specific vulnerabilities: ${dockerfile_critical} critical, ${dockerfile_high} high, ${dockerfile_medium} medium, ${dockerfile_low} low" >> "$output_file"
+            echo "Total vulnerabilities: ${total_critical} critical, ${total_high} high, ${total_medium} medium, ${total_low} low" >> "$output_file"
+          }
+          
           # Test connectivity before starting
           test_snyk_connectivity
           
@@ -209,7 +284,7 @@ jobs:
             # Check if directory and Dockerfile exist
             if [ ! -d "$TRAINING_DIR/${DIR}" ]; then
               echo "Directory $TRAINING_DIR/${DIR} does not exist."
-              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Directory not found|N/A")
+              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Directory not found|N/A|N/A")
               ROWS+=$'\n'"• ${DIR}: ❌ Failed (directory not found)"
               HAS_ISSUES=true
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -218,7 +293,7 @@ jobs:
             
             if [ ! -f "$DOCKERFILE_PATH" ]; then
               echo "Dockerfile $DOCKERFILE_PATH does not exist."
-              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Dockerfile not found|N/A")
+              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Dockerfile not found|N/A|N/A")
               ROWS+=$'\n'"• ${DIR}: ❌ Failed (not found)"
               HAS_ISSUES=true
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -228,7 +303,11 @@ jobs:
             # Set up variables for this file's results
             VULN_ISSUES="None"
             CONFIG_ISSUES=()
+            BASE_IMAGE_RESULTS=()
             SCAN_RESULTS_FILE="scan_results/${DIR}-results.json"
+            BASE_IMAGE_SCAN_FILE="scan_results/${DIR}-base-image.json"
+            VULN_COUNTS_FILE="scan_results/${DIR}-vuln-counts.txt"
+            ISSUE_SUMMARY_FILE="scan_results/${DIR}-issues-summary.txt"
             
             # Extract the base image from Dockerfile
             BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH")
@@ -254,44 +333,60 @@ jobs:
               echo "Using fallback base image: $BASE_IMAGE"
             fi
             
-            echo "Running Snyk container test on base image $BASE_IMAGE..."
+            # First: Scan the base image alone to identify base vulnerabilities
+            echo "Scanning base image $BASE_IMAGE separately..."
+            scan_base_image "$BASE_IMAGE" "$BASE_IMAGE_SCAN_FILE" "scan_results/${DIR}-base-readable.txt"
+            BASE_IMAGE_EXIT_CODE=$?
             
-            # First: Try running Snyk's test with --file-path option which is better for Dockerfiles
+            # Extract vulnerability counts from base image scan
+            extract_vulnerability_counts "$BASE_IMAGE_SCAN_FILE" "base" "$VULN_COUNTS_FILE"
+            
+            echo "Running Snyk container test on $BASE_IMAGE with Dockerfile $DOCKERFILE_PATH..."
+            
+            # Now run Snyk's test with --file option for the Dockerfile
             if snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>scan_results/${DIR}-error.log; then
               echo "Scan completed successfully without vulnerabilities for $DIR"
               VULN_ISSUES="No vulnerabilities"
               PASSED_COUNT=$((PASSED_COUNT + 1))
+              # Still extract counts for consistency (should be all zeros)
+              extract_vulnerability_counts "$SCAN_RESULTS_FILE" "total" "$VULN_COUNTS_FILE"
             else
               SNYK_EXIT_CODE=$?
               
               if [ $SNYK_EXIT_CODE -eq 1 ]; then
-                # Exit code 1 means vulnerabilities were found (this is actually "successful")
+                # Exit code 1 means vulnerabilities were found (successful scan with issues)
                 echo "Vulnerabilities found in $DIR (exit code 1)"
                 HAS_VULNS=true
                 HAS_ISSUES=true
+                # Extract vulnerability counts from the full scan
+                extract_vulnerability_counts "$SCAN_RESULTS_FILE" "total" "$VULN_COUNTS_FILE"
               elif [ $SNYK_EXIT_CODE -eq 2 ]; then
-                # Exit code 2 is a Snyk error - try fallback to just the base image
-                echo "Snyk scan with --file failed with exit code 2. Trying just the base image..."
+                # Exit code 2 is a Snyk error - try fallback to just base image results
+                echo "Snyk scan with --file failed with exit code 2. Using base image results."
                 
-                if snyk container test "$BASE_IMAGE" --json --severity-threshold=medium > "$SCAN_RESULTS_FILE" 2>>scan_results/${DIR}-error.log; then
-                  echo "Base image scan succeeded without vulnerabilities"
-                  VULN_ISSUES="No vulnerabilities (base image only)"
+                # Copy base image results as total results
+                cp "$BASE_IMAGE_SCAN_FILE" "$SCAN_RESULTS_FILE"
+                # Copy counts from base image
+                echo "total_critical=$(grep "base_critical" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
+                echo "total_high=$(grep "base_high" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
+                echo "total_medium=$(grep "base_medium" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
+                echo "total_low=$(grep "base_low" "$VULN_COUNTS_FILE" | cut -d'=' -f2)" >> "$VULN_COUNTS_FILE"
+                
+                if [ $BASE_IMAGE_EXIT_CODE -eq 0 ]; then
+                  echo "Using base image scan results (no vulnerabilities)"
+                  VULN_ISSUES="No vulnerabilities"
                   PASSED_COUNT=$((PASSED_COUNT + 1))
-                elif [ $? -eq 1 ]; then
-                  # Vulnerabilities found
-                  echo "Base image scan found vulnerabilities"
+                elif [ $BASE_IMAGE_EXIT_CODE -eq 1 ]; then
+                  echo "Using base image scan results (vulnerabilities found)"
                   HAS_VULNS=true
                   HAS_ISSUES=true
                 else
-                  # Scanning failed completely
+                  # Base image scanning also failed
                   SCAN_FAILURES=$((SCAN_FAILURES + 1))
                   echo "Base image scan also failed - check scan_results/${DIR}-error.log for details"
-                  if [ "$DEBUG_MODE" = "true" ]; then
-                    cat scan_results/${DIR}-error.log
-                  fi
                   VULN_ISSUES="Scan failed"
                   CONFIG_ISSUES+=("Snyk scan failed - check logs")
-                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs")
+                  REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Snyk scan failed - check logs|N/A")
                   ROWS+=$'\n'"• ${DIR}: ❌ Failed (scan error)"
                   HAS_ISSUES=true
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -301,12 +396,9 @@ jobs:
                 # Other error code
                 SCAN_FAILURES=$((SCAN_FAILURES + 1))
                 echo "Snyk scan failed with unexpected exit code: $SNYK_EXIT_CODE"
-                if [ "$DEBUG_MODE" = "true" ]; then
-                  cat scan_results/${DIR}-error.log
-                fi
                 VULN_ISSUES="Scan failed"
                 CONFIG_ISSUES+=("Snyk scan failed with code $SNYK_EXIT_CODE")
-                REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Unexpected error (code $SNYK_EXIT_CODE)")
+                REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|Scan failed|Unexpected error (code $SNYK_EXIT_CODE)|N/A")
                 ROWS+=$'\n'"• ${DIR}: ❌ Failed (unexpected error)"
                 HAS_ISSUES=true
                 ISSUES_COUNT=$((ISSUES_COUNT + 1))
@@ -314,107 +406,80 @@ jobs:
               fi
             fi
             
-            # Process the Snyk JSON output
-            if [ -f "$SCAN_RESULTS_FILE" ]; then
-              # Try parsing the JSON output
-              if jq '.' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
-                # Check for critical and high vulnerabilities
-                if jq -e '.vulnerabilities[] | select(.severity == "critical")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
-                  VULN_ISSUES="Critical severity"
-                  HAS_HIGH_SEVERITY=true
-                  HIGH_COUNT=$((HIGH_COUNT + 1))
-                  HAS_ISSUES=true
-                elif jq -e '.vulnerabilities[] | select(.severity == "high")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
-                  VULN_ISSUES="High severity"
-                  HAS_HIGH_SEVERITY=true
-                  HIGH_COUNT=$((HIGH_COUNT + 1))
-                  HAS_ISSUES=true
-                elif jq -e '.vulnerabilities[] | select(.severity == "medium")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
-                  VULN_ISSUES="Medium severity"
-                  HAS_ISSUES=true
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                elif jq -e '.vulnerabilities[] | select(.severity == "low")' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
-                  VULN_ISSUES="Low severity" 
-                elif [ "${HAS_VULNS:-false}" = "true" ]; then
-                  # Fallback if there are vulnerabilities but we couldn't detect them
-                  VULN_ISSUES="Unknown severity"
-                  HAS_ISSUES=true
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                else
-                  VULN_ISSUES="No vulnerabilities"
-                  PASSED_COUNT=$((PASSED_COUNT + 1))
-                fi
-                
-                # Extract recommendations if available
-                if jq -e '.remediation' "$SCAN_RESULTS_FILE" > /dev/null 2>&1; then
-                  RECOMMENDATIONS=$(jq -r '.remediation.advice[0] // "No specific recommendations"' "$SCAN_RESULTS_FILE")
-                  CONFIG_ISSUES+=("$RECOMMENDATIONS")
-                fi
-                
-                # Count total vulnerabilities by severity
-                CRITICAL_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
-                HIGH_COUNT_FILE=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
-                MEDIUM_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "medium")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
-                LOW_COUNT=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' "$SCAN_RESULTS_FILE" 2>/dev/null || echo 0)
-                
-                # Add detailed vulnerability count to config issues
-                if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT_FILE" -gt 0 ] || [ "$MEDIUM_COUNT" -gt 0 ] || [ "$LOW_COUNT" -gt 0 ]; then
-                  CONFIG_ISSUES+=("Vulnerabilities: $CRITICAL_COUNT critical, $HIGH_COUNT_FILE high, $MEDIUM_COUNT medium, $LOW_COUNT low")
-                fi
-              else
-                # JSON parsing failed
-                echo "Warning: Could not parse Snyk output as valid JSON"
-                if [ "$DEBUG_MODE" = "true" ]; then
-                  cat "$SCAN_RESULTS_FILE" | head -n 20
-                fi
-                
-                if [ "${HAS_VULNS:-false}" = "true" ]; then
-                  VULN_ISSUES="Issues found (details unavailable)"
-                  HAS_ISSUES=true
-                  ISSUES_COUNT=$((ISSUES_COUNT + 1))
-                else
-                  VULN_ISSUES="No vulnerabilities"
-                  PASSED_COUNT=$((PASSED_COUNT + 1))
-                fi
-              fi
-              
-              # Format issues for reporting
-              if [ ${#CONFIG_ISSUES[@]} -eq 0 ]; then
-                CONFIG_ISSUES_STR="None"
-              else
-                CONFIG_ISSUES_STR=$(printf "%s; " "${CONFIG_ISSUES[@]}" | sed 's/; $//')
-              fi
-              
-              # Determine status based on found issues
-              if [ "$VULN_ISSUES" = "Critical severity" ] || [ "$VULN_ISSUES" = "High severity" ]; then
-                STATUS="❌ Fail"
-              elif [ "$VULN_ISSUES" = "Medium severity" ] || [ "$VULN_ISSUES" = "Low severity" ] || [ "$VULN_ISSUES" = "Unknown severity" ] || [ "$VULN_ISSUES" = "Issues found (details unavailable)" ]; then
-                STATUS="⚠️ Warning"
-              else
-                STATUS="✅ Pass"
-              fi
-              
-              # Save to report rows for summary
-              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${VULN_ISSUES}|${CONFIG_ISSUES_STR}")
-              ROWS+=$'\n'"• ${DIR}: ${STATUS}"
-              
-              echo "Scan completed for $DIR with status: $STATUS"
-              
-              # Save human-readable results as well
-              if [ "$STATUS" = "❌ Fail" ] || [ "$STATUS" = "⚠️ Warning" ] || [ "$DEBUG_MODE" = "true" ]; then
-                echo "Saving human-readable results for $DIR"
-                snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null || 
-                snyk container test "$BASE_IMAGE" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null || 
-                echo "Failed to generate human-readable results" > "scan_results/${DIR}-readable.txt"
-              fi
-            else
-              echo "No scan results file found for $DIR"
-              REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|❌ Fail|No scan results|Snyk scan failed to produce results")
-              ROWS+=$'\n'"• ${DIR}: ❌ Failed (no results)"
+            # Calculate and save Dockerfile-specific issues by comparing with base image
+            calculate_dockerfile_issues "$VULN_COUNTS_FILE" "$ISSUE_SUMMARY_FILE"
+            
+            # Load the processed issue summary
+            ISSUE_SUMMARY=$(<"$ISSUE_SUMMARY_FILE")
+            BASE_IMAGE_ISSUES+=("$DIR: $ISSUE_SUMMARY")
+            
+            # Process the scan results for reporting
+            source "$VULN_COUNTS_FILE"
+            
+            # Determine severity based on total vulnerabilities
+            if [ "${total_critical:-0}" -gt 0 ]; then
+              VULN_ISSUES="Critical severity"
+              HAS_HIGH_SEVERITY=true
+              HIGH_COUNT=$((HIGH_COUNT + 1))
+              HAS_ISSUES=true
+            elif [ "${total_high:-0}" -gt 0 ]; then
+              VULN_ISSUES="High severity"
+              HAS_HIGH_SEVERITY=true
+              HIGH_COUNT=$((HIGH_COUNT + 1))
+              HAS_ISSUES=true
+            elif [ "${total_medium:-0}" -gt 0 ]; then
+              VULN_ISSUES="Medium severity"
               HAS_ISSUES=true
               ISSUES_COUNT=$((ISSUES_COUNT + 1))
-              SCAN_FAILURES=$((SCAN_FAILURES + 1))
+            elif [ "${total_low:-0}" -gt 0 ]; then
+              VULN_ISSUES="Low severity"
+            elif [ "${HAS_VULNS:-false}" = "true" ]; then
+              # Fallback if there are vulnerabilities but we couldn't detect them
+              VULN_ISSUES="Unknown severity"
+              HAS_ISSUES=true
+              ISSUES_COUNT=$((ISSUES_COUNT + 1))
+            else
+              VULN_ISSUES="No vulnerabilities"
+              PASSED_COUNT=$((PASSED_COUNT + 1))
             fi
+            
+            # Format the issue summary for the report
+            BASE_IMAGE_SUMMARY=$(grep "Base image vulnerabilities" "$ISSUE_SUMMARY_FILE")
+            DOCKERFILE_SUMMARY=$(grep "Dockerfile-specific vulnerabilities" "$ISSUE_SUMMARY_FILE")
+            
+            # Format issues for reporting
+            if [ ${#CONFIG_ISSUES[@]} -eq 0 ]; then
+              CONFIG_ISSUES_STR="None"
+            else
+              CONFIG_ISSUES_STR=$(printf "%s; " "${CONFIG_ISSUES[@]}" | sed 's/; $//')
+            fi
+            
+            # Determine status based on found issues
+            if [ "$VULN_ISSUES" = "Critical severity" ] || [ "$VULN_ISSUES" = "High severity" ]; then
+              STATUS="❌ Fail"
+            elif [ "$VULN_ISSUES" = "Medium severity" ] || [ "$VULN_ISSUES" = "Low severity" ] || [ "$VULN_ISSUES" = "Unknown severity" ]; then
+              STATUS="⚠️ Warning"
+            else
+              STATUS="✅ Pass"
+            fi
+            
+            # Save to report rows for summary
+            REPORT_ROWS+=("${DIR}|${IMAGE_TYPES[$DIR]}|${STATUS}|${VULN_ISSUES}|${CONFIG_ISSUES_STR}|${BASE_IMAGE_SUMMARY}")
+            ROWS+=$'\n'"• ${DIR}: ${STATUS}"
+            
+            echo "Scan completed for $DIR with status: $STATUS"
+            
+            # Generate human-readable results
+            echo "Saving human-readable results for $DIR"
+            
+            (snyk container test "$BASE_IMAGE" --file="$DOCKERFILE_PATH" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null) || 
+            (echo "Direct scan failed, trying base image scan..." && 
+            snyk container test "$BASE_IMAGE" --severity-threshold=medium > "scan_results/${DIR}-readable.txt" 2>/dev/null) || 
+            (echo "Failed to generate human-readable results" > "scan_results/${DIR}-readable.txt")
+            
+            # Add the issue summary to the readable results
+            echo -e "\n--- Issue Summary ---\n" >> "scan_results/${DIR}-readable.txt"
+            cat "$ISSUE_SUMMARY_FILE" >> "scan_results/${DIR}-readable.txt"
           done
           
           print_section "Scan Summary"
@@ -473,28 +538,46 @@ jobs:
           echo "    <th align='center'>Status</th>" >> "$GITHUB_STEP_SUMMARY"
           echo "    <th align='left'>Security Issues</th>" >> "$GITHUB_STEP_SUMMARY"
           echo "    <th align='left'>Configuration Issues</th>" >> "$GITHUB_STEP_SUMMARY"
+          echo "    <th align='left'>Base Image Issues</th>" >> "$GITHUB_STEP_SUMMARY"
           echo "  </tr>" >> "$GITHUB_STEP_SUMMARY"
           
           for ROW in "${REPORT_ROWS[@]}"; do
-            IFS='|' read -r DIR IMAGE_TYPE STATUS VULN CONFIG <<< "$ROW"
+            IFS='|' read -r DIR IMAGE_TYPE STATUS VULN CONFIG BASE_IMAGE_VULN <<< "$ROW"
             echo "  <tr>" >> "$GITHUB_STEP_SUMMARY"
             echo "    <td>${DIR}</td>" >> "$GITHUB_STEP_SUMMARY"
             echo "    <td>${IMAGE_TYPE}</td>" >> "$GITHUB_STEP_SUMMARY"
             echo "    <td align='center'>${STATUS}</td>" >> "$GITHUB_STEP_SUMMARY"
             echo "    <td>${VULN}</td>" >> "$GITHUB_STEP_SUMMARY"
             echo "    <td>${CONFIG}</td>" >> "$GITHUB_STEP_SUMMARY"
+            echo "    <td>${BASE_IMAGE_VULN}</td>" >> "$GITHUB_STEP_SUMMARY"
             echo "  </tr>" >> "$GITHUB_STEP_SUMMARY"
           done
           
           echo "</table>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           
+          echo "## Base Image vs Dockerfile Issues" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          
+          echo "<details>" >> "$GITHUB_STEP_SUMMARY"
+          echo "<summary>Click to expand vulnerability breakdown by image</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          
+          for ISSUE in "${BASE_IMAGE_ISSUES[@]}"; do
+            echo "**${ISSUE}**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          done
+          
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          
           echo "## Security Checks Performed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check Type | Description | Severity |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-----------|:------------|:---------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Base Image Analysis** | Snyk container test on base image | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Dockerfile Analysis** | Snyk container test with --file option | Critical/High = Fail |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Base Image Analysis** | Snyk container test on base image | Used when Dockerfile scan fails |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Issue Segregation** | Separate reporting of base image vs Dockerfile issues | Informational |" >> "$GITHUB_STEP_SUMMARY"
           
           # If debug mode is enabled, add detailed output of scan results
           if [ "$DEBUG_MODE" = "true" ]; then
@@ -513,6 +596,17 @@ jobs:
                 echo "" >> "$GITHUB_STEP_SUMMARY"
                 echo "</details>" >> "$GITHUB_STEP_SUMMARY"
               fi
+              
+              if [ -f "scan_results/${DIR}-base-readable.txt" ]; then
+                echo "<details>" >> "$GITHUB_STEP_SUMMARY"
+                echo "<summary>Base Image Scan Results for ${DIR}</summary>" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo '```' >> "$GITHUB_STEP_SUMMARY"
+                cat "scan_results/${DIR}-base-readable.txt" >> "$GITHUB_STEP_SUMMARY"
+                echo '```' >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+              fi
             done
           fi
           
@@ -520,6 +614,7 @@ jobs:
           echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run directly using Snyk's container test functionality" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Base image issues and Dockerfile-specific issues are segregated for better analysis" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scans run nightly at 03:00 UTC to catch newly discovered vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
           echo "- PR scans only run on labeled PRs ('safe-to-test') to maintain security" >> "$GITHUB_STEP_SUMMARY"
           echo "- No container images are built during this process" >> "$GITHUB_STEP_SUMMARY"
