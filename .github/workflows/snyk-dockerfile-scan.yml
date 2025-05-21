@@ -259,41 +259,45 @@ jobs:
             SCAN_STATUS="All secure"
           fi
           
-          # Create GitHub summary
-          echo "# Dockerfile Security Scan Results" > "$GITHUB_STEP_SUMMARY"
-          echo "## Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|:-------|:------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Status** | $OVERALL_STATUS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scan Status** | $SCAN_STATUS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Total Images** | ${#DIRS[@]} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Passed** | $PASSED_COUNT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Issues** | $ISSUES_COUNT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Critical/High** | $HIGH_COUNT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Scan Failures** | $SCAN_FAILURES |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          # Create GitHub step summary - FIX: Make sure this is all handled safely
+          {
+            echo "# Dockerfile Security Scan Results"
+            echo "## Summary"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|:-------|:------|"
+            echo "| **Status** | $OVERALL_STATUS |"
+            echo "| **Scan Status** | $SCAN_STATUS |"
+            echo "| **Total Images** | ${#DIRS[@]} |"
+            echo "| **Passed** | $PASSED_COUNT |"
+            echo "| **Issues** | $ISSUES_COUNT |"
+            echo "| **Critical/High** | $HIGH_COUNT |"
+            echo "| **Scan Failures** | $SCAN_FAILURES |"
+            echo ""
+            echo "## Results"
+            echo '```'
+            echo "$SCAN_RESULTS"
+            echo '```'
+            echo ""
+            echo "## Notes"
+            echo "- Scans run directly using Snyk's container test functionality"
+            echo "- Base image issues and Dockerfile-specific issues are segregated"
+            echo "- No container images are built during this process"
+          } > summary.md
           
-          # Add scan results
-          echo "## Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "```" >> "$GITHUB_STEP_SUMMARY"
-          echo "$SCAN_RESULTS" >> "$GITHUB_STEP_SUMMARY"
-          echo "```" >> "$GITHUB_STEP_SUMMARY"
-          
-          # Add notes
-          echo "## Notes" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Scans run directly using Snyk's container test functionality" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Base image issues and Dockerfile-specific issues are segregated" >> "$GITHUB_STEP_SUMMARY"
-          echo "- No container images are built during this process" >> "$GITHUB_STEP_SUMMARY"
+          # Use GitHub's built-in way to set the step summary
+          cat summary.md >> $GITHUB_STEP_SUMMARY
           
           # Save outputs for next steps
-          echo "scan_status=$SCAN_STATUS" >> "$GITHUB_OUTPUT"
-          echo "overall_status=$OVERALL_STATUS" >> "$GITHUB_OUTPUT"
-          echo "scan_failures=$SCAN_FAILURES" >> "$GITHUB_OUTPUT"
-          echo "high_severity=$HAS_HIGH_SEVERITY" >> "$GITHUB_OUTPUT"
-          echo "results<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$SCAN_RESULTS" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "scan_status=$SCAN_STATUS"
+            echo "overall_status=$OVERALL_STATUS"
+            echo "scan_failures=$SCAN_FAILURES"
+            echo "high_severity=$HAS_HIGH_SEVERITY"
+            echo "results<<EOF"
+            echo "$SCAN_RESULTS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
           
           # Print final results
           print_section "Scan Summary"
