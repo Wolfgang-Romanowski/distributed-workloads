@@ -85,8 +85,12 @@ jobs:
           
           # Results storage
           SCAN_SUMMARY=""
-          DETAILED_BREAKDOWN=""
+          DOCKERFILE_BREAKDOWN=""
+          BASE_IMAGE_BREAKDOWN=""
           HUMAN_READABLE_REPORTS=""
+          
+          # Track unique base images
+          declare -A BASE_IMAGES
           
           # Utility functions
           log_section() {
@@ -231,7 +235,7 @@ jobs:
               echo "Dockerfile not found: $DOCKERFILE"
               SCAN_ERRORS=$((SCAN_ERRORS + 1))
               SCAN_SUMMARY="${SCAN_SUMMARY}FAILED - $DIR: DOCKERFILE NOT FOUND\n"
-              DETAILED_BREAKDOWN="${DETAILED_BREAKDOWN}| $DIR | Error | Error | Error |\n"
+              DOCKERFILE_BREAKDOWN="${DOCKERFILE_BREAKDOWN}| $DIR | Error | FAILED |\n"
               continue
             fi
             
@@ -269,7 +273,7 @@ jobs:
               echo "Dockerfile scan failed"
               SCAN_ERRORS=$((SCAN_ERRORS + 1))
               SCAN_SUMMARY="${SCAN_SUMMARY}FAILED - $DIR: SCAN FAILED\n"
-              DETAILED_BREAKDOWN="${DETAILED_BREAKDOWN}| $DIR | Error | Error | Error |\n"
+              DOCKERFILE_BREAKDOWN="${DOCKERFILE_BREAKDOWN}| $DIR | Error | FAILED |\n"
               continue
             fi
             
@@ -277,17 +281,24 @@ jobs:
             IFS=',' read -r base_crit base_high base_med base_low <<< "$BASE_COUNTS"
             IFS=',' read -r full_crit full_high full_med full_low <<< "$FULL_COUNTS"
             
+            # Store base image info (avoid duplicates)
+            BASE_IMAGE_KEY="${BASE_IMAGE//\//_}"
+            BASE_IMAGE_KEY="${BASE_IMAGE_KEY//[:.]/_}"
+            if [ -z "${BASE_IMAGES[$BASE_IMAGE_KEY]}" ]; then
+              BASE_IMAGES[$BASE_IMAGE_KEY]="$BASE_IMAGE|${base_crit}C/${base_high}H/${base_med}M/${base_low}L"
+            fi
+            
             # Calculate Dockerfile-specific vulnerabilities
             dockerfile_crit=$((full_crit - base_crit > 0 ? full_crit - base_crit : 0))
             dockerfile_high=$((full_high - base_high > 0 ? full_high - base_high : 0))
             dockerfile_med=$((full_med - base_med > 0 ? full_med - base_med : 0))
             dockerfile_low=$((full_low - base_low > 0 ? full_low - base_low : 0))
             
-            # Determine overall status
-            if [ "$full_crit" -gt 0 ] || [ "$full_high" -gt 0 ]; then
+            # Determine status based ONLY on Dockerfile-specific vulnerabilities
+            if [ "$dockerfile_crit" -gt 0 ] || [ "$dockerfile_high" -gt 0 ]; then
               STATUS="FAILED"
               FAILED_COUNT=$((FAILED_COUNT + 1))
-            elif [ "$full_med" -gt 0 ]; then
+            elif [ "$dockerfile_med" -gt 0 ]; then
               STATUS="WARNING"
             else
               STATUS="PASSED"
@@ -296,12 +307,16 @@ jobs:
             
             # Build summary line
             SCAN_SUMMARY="${SCAN_SUMMARY}$STATUS - $DIR\n"
-            SCAN_SUMMARY="${SCAN_SUMMARY}  Base: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L\n"
+            SCAN_SUMMARY="${SCAN_SUMMARY}  Base: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L (informational)\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}  Dockerfile: ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}  Total: ${full_crit}C/${full_high}H/${full_med}M/${full_low}L\n"
             
-            # Build detailed breakdown
-            DETAILED_BREAKDOWN="${DETAILED_BREAKDOWN}| $DIR | ${base_crit}C/${base_high}H/${base_med}M/${base_low}L | ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L | ${full_crit}C/${full_high}H/${full_med}M/${full_low}L |\n"
+            # Build dockerfile breakdown (only dockerfile vulnerabilities affect status)
+            if [ $((dockerfile_crit + dockerfile_high + dockerfile_med + dockerfile_low)) -eq 0 ]; then
+              DOCKERFILE_BREAKDOWN="${DOCKERFILE_BREAKDOWN}| $DIR | No vulnerabilities | $STATUS |\n"
+            else
+              DOCKERFILE_BREAKDOWN="${DOCKERFILE_BREAKDOWN}| $DIR | ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L | $STATUS |\n"
+            fi
             
             # Generate concise human-readable report for GitHub summary
             {
@@ -315,17 +330,17 @@ jobs:
               echo "Scan Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
               echo ""
               echo "VULNERABILITY SUMMARY"
-              echo "Base Image: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L"
+              echo "Base Image: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L (informational)"
               echo "Dockerfile Impact: ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L"
               echo "Total: ${full_crit}C/${full_high}H/${full_med}M/${full_low}L"
               echo ""
-              if [ $((full_crit + full_high)) -gt 0 ]; then
-                echo "ACTION REQUIRED: Critical/High vulnerabilities detected"
+              if [ $((dockerfile_crit + dockerfile_high)) -gt 0 ]; then
+                echo "ACTION REQUIRED: Dockerfile introduces Critical/High vulnerabilities"
                 echo "Review detailed scan results in artifacts for remediation steps"
-              elif [ $((full_med)) -gt 0 ]; then
-                echo "ADVISORY: Medium vulnerabilities detected - monitor for updates"
+              elif [ $((dockerfile_med)) -gt 0 ]; then
+                echo "ADVISORY: Dockerfile introduces Medium vulnerabilities - monitor for updates"
               else
-                echo "RESULT: No critical or high vulnerabilities found"
+                echo "RESULT: Dockerfile introduces no additional vulnerabilities"
               fi
               echo ""
             } > "$RESULTS_DIR/${DIR}_brief_report.txt"
@@ -355,16 +370,25 @@ jobs:
               echo "  Medium: $dockerfile_med"
               echo "  Low: $dockerfile_low"
               echo ""
+              echo "NOTE: Status determined by Dockerfile impact only."
+              echo "Base image vulnerabilities are informational."
+              echo ""
             } > "$RESULTS_DIR/${DIR}_detailed_report.txt"
             
             HUMAN_READABLE_REPORTS="${HUMAN_READABLE_REPORTS}\n<details>\n<summary>Security Report: $DIR</summary>\n\n\`\`\`\n$(cat "$RESULTS_DIR/${DIR}_brief_report.txt")\n\`\`\`\n\n</details>\n"
             
             echo ""
             echo "Results Summary for $DIR:"
-            echo "  Status: $STATUS"
-            echo "  Base vulnerabilities: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L"
+            echo "  Status: $STATUS (based on Dockerfile impact only)"
+            echo "  Base vulnerabilities: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L (informational)"
             echo "  Dockerfile impact: ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L"
             echo "  Total vulnerabilities: ${full_crit}C/${full_high}H/${full_med}M/${full_low}L"
+          done
+          
+          # Build base image breakdown from collected data
+          for key in "${!BASE_IMAGES[@]}"; do
+            IFS='|' read -r image_name image_vulns <<< "${BASE_IMAGES[$key]}"
+            BASE_IMAGE_BREAKDOWN="${BASE_IMAGE_BREAKDOWN}| $image_name | $image_vulns |\n"
           done
           
           # Calculate final status
@@ -373,16 +397,16 @@ jobs:
             SCAN_STATUS="Scan errors encountered"
           elif [ $FAILED_COUNT -gt 0 ]; then
             OVERALL_STATUS="FAILED"
-            SCAN_STATUS="Critical/High vulnerabilities found"
+            SCAN_STATUS="Dockerfile vulnerabilities found"
           elif [ $PASSED_COUNT -eq $TOTAL_SCANNED ]; then
             OVERALL_STATUS="PASSED"
-            SCAN_STATUS="All scans passed"
+            SCAN_STATUS="All Dockerfiles clean"
           else
             OVERALL_STATUS="WARNING"
-            SCAN_STATUS="Medium vulnerabilities found"
+            SCAN_STATUS="Dockerfile warnings found"
           fi
           
-          # Generate GitHub Step Summary (condensed for size limits)
+          # Generate GitHub Step Summary
           {
             echo "# Dockerfile Security Scan Results"
             echo ""
@@ -399,11 +423,17 @@ jobs:
             echo "| **Failed** | $FAILED_COUNT |"
             echo "| **Scan Errors** | $SCAN_ERRORS |"
             echo ""
-            echo "## Vulnerability Analysis"
+            echo "## Base Image Vulnerabilities (Informational Only)"
             echo ""
-            echo "| Dockerfile | Base Image | Dockerfile Impact | Total |"
-            echo "|:-----------|:-----------|:------------------|:------|"
-            echo -e "$DETAILED_BREAKDOWN"
+            echo "| Base Image | Vulnerabilities |"
+            echo "|:-----------|:----------------|"
+            echo -e "$BASE_IMAGE_BREAKDOWN"
+            echo ""
+            echo "## Dockerfile Security Analysis (Determines Pass/Fail)"
+            echo ""
+            echo "| Dockerfile | Dockerfile Impact | Status |"
+            echo "|:-----------|:------------------|:-------|"
+            echo -e "$DOCKERFILE_BREAKDOWN"
             echo ""
             echo "**Legend:** C=Critical, H=High, M=Medium, L=Low"
             echo ""
@@ -416,7 +446,10 @@ jobs:
             if [ $FAILED_COUNT -gt 0 ]; then
               echo "## Action Required"
               echo ""
-              echo "Critical or high severity vulnerabilities detected. Review detailed scan results in the uploaded artifacts for specific remediation steps."
+              echo "Dockerfiles are introducing critical or high severity vulnerabilities."
+              echo "Review detailed scan results in the uploaded artifacts for specific remediation steps."
+              echo ""
+              echo "**Note**: Base image vulnerabilities are shown for informational purposes only."
               echo ""
             fi
             echo "## Scan Configuration"
@@ -425,7 +458,8 @@ jobs:
             echo "- **Scan Mode**: Dockerfile analysis with base image context"
             echo "- **Threshold**: All severities (Low, Medium, High, Critical)"
             echo "- **Image Building**: None (Dockerfile-only analysis)"
-            echo "- **Base Image Segregation**: Enabled"
+            echo "- **Base Image Segregation**: Enabled (informational only)"
+            echo "- **Pass/Fail Criteria**: Dockerfile vulnerabilities only"
             echo "- **Detailed Reports**: Available in workflow artifacts"
             echo ""
             echo "---"
