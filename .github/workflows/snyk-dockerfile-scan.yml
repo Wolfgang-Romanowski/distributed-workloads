@@ -223,28 +223,36 @@ jobs:
                     SCAN_RESULTS="${SCAN_RESULTS}* ${DIR}: FAIL (Base: ${BASE_HIGH} high, Dockerfile: No high issues)"$'\n'
                   fi
                   
-                  # Add to detailed results
-                  DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | ${BASE_CRITICAL} | ${BASE_HIGH} | ${BASE_MEDIUM} | ${DOCKERFILE_CRITICAL} | ${DOCKERFILE_HIGH} | ${DOCKERFILE_MEDIUM} |\n"
+                  # Add to detailed results - FIXED FORMAT
+                  BASE_SUMMARY="${BASE_CRITICAL}C/${BASE_HIGH}H/${BASE_MEDIUM}M"
+                  DOCKERFILE_SUMMARY="${DOCKERFILE_CRITICAL}C/${DOCKERFILE_HIGH}H/${DOCKERFILE_MEDIUM}M"
+                  TOTAL_SUMMARY="${TOTAL_CRITICAL}C/${TOTAL_HIGH}H/${TOTAL_MEDIUM}M"
+                  DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | ${BASE_SUMMARY} | ${DOCKERFILE_SUMMARY} | ${TOTAL_SUMMARY} |\n"
                   
                 else
                   ISSUES_COUNT=$((ISSUES_COUNT + 1))
                   STATUS="WARN"
                   SCAN_RESULTS="${SCAN_RESULTS}* ${DIR}: WARN (Base: ${BASE_MEDIUM} medium, Dockerfile: ${DOCKERFILE_MEDIUM} medium)"$'\n'
-                  DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | ${BASE_CRITICAL} | ${BASE_HIGH} | ${BASE_MEDIUM} | ${DOCKERFILE_CRITICAL} | ${DOCKERFILE_HIGH} | ${DOCKERFILE_MEDIUM} |\n"
+                  
+                  # Add to detailed results - FIXED FORMAT
+                  BASE_SUMMARY="${BASE_CRITICAL}C/${BASE_HIGH}H/${BASE_MEDIUM}M"
+                  DOCKERFILE_SUMMARY="${DOCKERFILE_CRITICAL}C/${DOCKERFILE_HIGH}H/${DOCKERFILE_MEDIUM}M"
+                  TOTAL_SUMMARY="${TOTAL_CRITICAL}C/${TOTAL_HIGH}H/${TOTAL_MEDIUM}M"
+                  DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | ${BASE_SUMMARY} | ${DOCKERFILE_SUMMARY} | ${TOTAL_SUMMARY} |\n"
                 fi
               else
                 echo "Dockerfile scan: No vulnerabilities found"
                 PASSED_COUNT=$((PASSED_COUNT + 1))
                 STATUS="PASS"
                 SCAN_RESULTS="${SCAN_RESULTS}* ${DIR}: PASS (no vulnerabilities)"$'\n'
-                DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | 0 | 0 | 0 | 0 | 0 | 0 |\n"
+                DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | 0C/0H/0M | 0C/0H/0M | 0C/0H/0M |\n"
               fi
             else
               echo "Dockerfile scan failed to produce valid results"
               SCAN_FAILURES=$((SCAN_FAILURES + 1))
               STATUS="ERROR"
               SCAN_RESULTS="${SCAN_RESULTS}* ${DIR}: ERROR (scan failed)"$'\n'
-              DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | - | - | - | - | - | - |\n"
+              DETAILED_RESULTS="${DETAILED_RESULTS}| ${DIR} | ERROR | ERROR | ERROR |\n"
               
               # Save error details
               snyk container test "$BASE_IMAGE" --file="$DOCKERFILE" --severity-threshold=medium > "scan_results/${DIR}-error.txt" 2>&1 || true
@@ -292,8 +300,8 @@ jobs:
             echo ""
             echo "## Detailed Vulnerability Breakdown"
             echo ""
-            echo "| Image | Base Critical | Base High | Base Medium | Dockerfile Critical | Dockerfile High | Dockerfile Medium |"
-            echo "|:------|:------------:|:---------:|:-----------:|:-------------------:|:--------------:|:----------------:|"
+            echo "| Image | Base Image | Dockerfile | Total |"
+            echo "|:------|:-----------|:-----------|:------|"
             echo -e "$DETAILED_RESULTS"
             echo ""
             echo "## Results Summary"
