@@ -187,13 +187,13 @@ jobs:
               echo "  Total: $((critical + high + medium + low))"
             } > "${output_prefix}_summary.txt"
             
-            # Extract detailed vulnerability information if any exist
-            if [ $((critical + high + medium + low)) -gt 0 ]; then
+            # Extract sample of high/critical vulnerabilities only
+            if [ $((critical + high)) -gt 0 ]; then
               {
                 echo ""
-                echo "Detailed Vulnerabilities:"
-                echo "========================"
-                jq -r '.vulnerabilities[]? | "• \(.title // .id) (\(.severity | ascii_upcase))\n  Package: \(.packageName // "Unknown")@\(.version // "Unknown")\n  Description: \(.description // "No description available")\n"' "$json_file" 2>/dev/null || echo "Unable to parse vulnerability details"
+                echo "Top Critical/High Vulnerabilities (first 5):"
+                echo "============================================"
+                jq -r '.vulnerabilities[]? | select(.severity == "critical" or .severity == "high") | "• \(.title // .id) (\(.severity | ascii_upcase))\n  Package: \(.packageName // "Unknown")@\(.version // "Unknown")\n"' "$json_file" 2>/dev/null | head -n 15 || echo "Unable to parse vulnerability details"
               } >> "${output_prefix}_summary.txt"
             fi
             
@@ -303,10 +303,37 @@ jobs:
             # Build detailed breakdown
             DETAILED_BREAKDOWN="${DETAILED_BREAKDOWN}| $DIR | ${base_crit}C/${base_high}H/${base_med}M/${base_low}L | ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L | ${full_crit}C/${full_high}H/${full_med}M/${full_low}L |\n"
             
-            # Generate human-readable report
+            # Generate concise human-readable report for GitHub summary
             {
               echo "=========================================="
               echo "SECURITY SCAN REPORT: $DIR"
+              echo "=========================================="
+              echo ""
+              echo "SCAN OVERVIEW"
+              echo "Status: $STATUS"
+              echo "Base Image: $BASE_IMAGE"
+              echo "Scan Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo ""
+              echo "VULNERABILITY SUMMARY"
+              echo "Base Image: ${base_crit}C/${base_high}H/${base_med}M/${base_low}L"
+              echo "Dockerfile Impact: ${dockerfile_crit}C/${dockerfile_high}H/${dockerfile_med}M/${dockerfile_low}L"
+              echo "Total: ${full_crit}C/${full_high}H/${full_med}M/${full_low}L"
+              echo ""
+              if [ $((full_crit + full_high)) -gt 0 ]; then
+                echo "ACTION REQUIRED: Critical/High vulnerabilities detected"
+                echo "Review detailed scan results in artifacts for remediation steps"
+              elif [ $((full_med)) -gt 0 ]; then
+                echo "ADVISORY: Medium vulnerabilities detected - monitor for updates"
+              else
+                echo "RESULT: No critical or high vulnerabilities found"
+              fi
+              echo ""
+            } > "$RESULTS_DIR/${DIR}_brief_report.txt"
+            
+            # Generate detailed report for artifacts only
+            {
+              echo "=========================================="
+              echo "DETAILED SECURITY SCAN REPORT: $DIR"
               echo "=========================================="
               echo ""
               echo "SCAN OVERVIEW"
@@ -328,9 +355,9 @@ jobs:
               echo "  Medium: $dockerfile_med"
               echo "  Low: $dockerfile_low"
               echo ""
-            } > "$RESULTS_DIR/${DIR}_report.txt"
+            } > "$RESULTS_DIR/${DIR}_detailed_report.txt"
             
-            HUMAN_READABLE_REPORTS="${HUMAN_READABLE_REPORTS}\n<details>\n<summary>Security Report: $DIR</summary>\n\n\`\`\`\n$(cat "$RESULTS_DIR/${DIR}_report.txt")\n\`\`\`\n\n</details>\n"
+            HUMAN_READABLE_REPORTS="${HUMAN_READABLE_REPORTS}\n<details>\n<summary>Security Report: $DIR</summary>\n\n\`\`\`\n$(cat "$RESULTS_DIR/${DIR}_brief_report.txt")\n\`\`\`\n\n</details>\n"
             
             echo ""
             echo "Results Summary for $DIR:"
@@ -355,7 +382,7 @@ jobs:
             SCAN_STATUS="Medium vulnerabilities found"
           fi
           
-          # Generate GitHub Step Summary
+          # Generate GitHub Step Summary (condensed for size limits)
           {
             echo "# Dockerfile Security Scan Results"
             echo ""
@@ -380,14 +407,18 @@ jobs:
             echo ""
             echo "**Legend:** C=Critical, H=High, M=Medium, L=Low"
             echo ""
-            echo "## Scan Results"
+            echo "## Scan Results Summary"
             echo ""
             echo "\`\`\`"
             echo -e "$SCAN_SUMMARY"
             echo "\`\`\`"
             echo ""
-            echo -e "$HUMAN_READABLE_REPORTS"
-            echo ""
+            if [ $FAILED_COUNT -gt 0 ]; then
+              echo "## Action Required"
+              echo ""
+              echo "Critical or high severity vulnerabilities detected. Review detailed scan results in the uploaded artifacts for specific remediation steps."
+              echo ""
+            fi
             echo "## Scan Configuration"
             echo ""
             echo "- **Scanner**: Snyk Container Security"
@@ -395,6 +426,7 @@ jobs:
             echo "- **Threshold**: All severities (Low, Medium, High, Critical)"
             echo "- **Image Building**: None (Dockerfile-only analysis)"
             echo "- **Base Image Segregation**: Enabled"
+            echo "- **Detailed Reports**: Available in workflow artifacts"
             echo ""
             echo "---"
             echo "*Generated by Snyk Dockerfile Security Scanner*"
