@@ -27,49 +27,90 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/kueue/apis/kueue/v1beta1"
 
 	. "github.com/opendatahub-io/distributed-workloads/tests/common"
 	. "github.com/opendatahub-io/distributed-workloads/tests/common/support"
 )
 
-func TestPyTorchJobSingleNodeSingleGpuWithCuda(t *testing.T) {
+func TestPyTorchJobSingleNodeSingleGpuWithCudaPyTorch241(t *testing.T) {
 	Tags(t, Tier1, Gpu(NVIDIA))
-	runKFTOPyTorchJob(t, GetCudaTrainingImage(), NVIDIA, 1, 0)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch241Image(), NVIDIA, 1, 0)
 }
 
-func TestPyTorchJobSingleNodeMultiGpuWithCuda(t *testing.T) {
+func TestPyTorchJobSingleNodeSingleGpuWithCudaPyTorch251(t *testing.T) {
+	Tags(t, Tier1, Gpu(NVIDIA))
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch251Image(), NVIDIA, 1, 0)
+}
+
+func TestPyTorchJobSingleNodeMultiGpuWithCudaPyTorch241(t *testing.T) {
 	Tags(t, KftoCuda)
-	runKFTOPyTorchJob(t, GetCudaTrainingImage(), NVIDIA, 2, 0)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch241Image(), NVIDIA, 2, 0)
 }
 
-func TestPyTorchJobMultiNodeSingleGpuWithCuda(t *testing.T) {
+func TestPyTorchJobSingleNodeMultiGpuWithCudaPyTorch251(t *testing.T) {
 	Tags(t, KftoCuda)
-	runKFTOPyTorchJob(t, GetCudaTrainingImage(), NVIDIA, 1, 1)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch251Image(), NVIDIA, 2, 0)
 }
 
-func TestPyTorchJobMultiNodeMultiGpuWithCuda(t *testing.T) {
+func TestPyTorchJobMultiNodeSingleGpuWithCudaPyTorch241(t *testing.T) {
 	Tags(t, KftoCuda)
-	runKFTOPyTorchJob(t, GetCudaTrainingImage(), NVIDIA, 2, 1)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch241Image(), NVIDIA, 1, 1)
 }
 
-func TestPyTorchJobSingleNodeSingleGpuWithROCm(t *testing.T) {
+func TestPyTorchJobMultiNodeSingleGpuWithCudaPyTorch251(t *testing.T) {
+	Tags(t, KftoCuda)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch251Image(), NVIDIA, 1, 1)
+}
+
+func TestPyTorchJobMultiNodeMultiGpuWithCudaPyTorch241(t *testing.T) {
+	Tags(t, KftoCuda)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch241Image(), NVIDIA, 2, 1)
+}
+
+func TestPyTorchJobMultiNodeMultiGpuWithCudaPyTorch251(t *testing.T) {
+	Tags(t, KftoCuda)
+	runKFTOPyTorchJob(t, GetTrainingCudaPyTorch251Image(), NVIDIA, 2, 1)
+}
+
+func TestPyTorchJobSingleNodeSingleGpuWithROCmPyTorch241(t *testing.T) {
 	Tags(t, Tier1, Gpu(AMD))
-	runKFTOPyTorchJob(t, GetROCmTrainingImage(), AMD, 1, 0)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch241Image(), AMD, 1, 0)
 }
 
-func TestPyTorchJobSingleNodeMultiGpuWithROCm(t *testing.T) {
-	Tags(t, KftoRocm)
-	runKFTOPyTorchJob(t, GetROCmTrainingImage(), AMD, 2, 0)
+func TestPyTorchJobSingleNodeSingleGpuWithROCmPyTorch251(t *testing.T) {
+	Tags(t, Tier1, Gpu(AMD))
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch251Image(), AMD, 1, 0)
 }
 
-func TestPyTorchJobMultiNodeSingleGpuWithROCm(t *testing.T) {
+func TestPyTorchJobSingleNodeMultiGpuWithROCmPyTorch241(t *testing.T) {
 	Tags(t, KftoRocm)
-	runKFTOPyTorchJob(t, GetROCmTrainingImage(), AMD, 1, 1)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch241Image(), AMD, 2, 0)
 }
 
-func TestPyTorchJobMultiNodeMultiGpuWithROCm(t *testing.T) {
+func TestPyTorchJobSingleNodeMultiGpuWithROCmPyTorch251(t *testing.T) {
 	Tags(t, KftoRocm)
-	runKFTOPyTorchJob(t, GetROCmTrainingImage(), AMD, 2, 1)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch251Image(), AMD, 2, 0)
+}
+
+func TestPyTorchJobMultiNodeSingleGpuWithROCmPyTorch241(t *testing.T) {
+	Tags(t, KftoRocm)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch241Image(), AMD, 1, 1)
+}
+
+func TestPyTorchJobMultiNodeSingleGpuWithROCmPyTorch251(t *testing.T) {
+	Tags(t, KftoRocm)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch251Image(), AMD, 1, 1)
+}
+
+func TestPyTorchJobMultiNodeMultiGpuWithROCmPyTorch241(t *testing.T) {
+	Tags(t, KftoRocm)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch241Image(), AMD, 2, 1)
+}
+
+func TestPyTorchJobMultiNodeMultiGpuWithROCmPyTorch251(t *testing.T) {
+	Tags(t, KftoRocm)
+	runKFTOPyTorchJob(t, GetTrainingROCmPyTorch251Image(), AMD, 2, 1)
 }
 
 func runKFTOPyTorchJob(t *testing.T, image string, gpu Accelerator, numGpus, numberOfWorkerNodes int) {
@@ -77,6 +118,53 @@ func runKFTOPyTorchJob(t *testing.T, image string, gpu Accelerator, numGpus, num
 
 	// Create a namespace
 	namespace := test.CreateOrGetTestNamespace().Name
+
+	// Create Kueue resources
+	resourceFlavor := CreateKueueResourceFlavor(test, v1beta1.ResourceFlavorSpec{})
+	fmt.Sprintln(gpu.ResourceLabel)
+	defer test.Client().Kueue().KueueV1beta1().ResourceFlavors().Delete(test.Ctx(), resourceFlavor.Name, metav1.DeleteOptions{})
+	cqSpec := v1beta1.ClusterQueueSpec{
+		NamespaceSelector: &metav1.LabelSelector{},
+		ResourceGroups: []v1beta1.ResourceGroup{
+			{
+				CoveredResources: []corev1.ResourceName{corev1.ResourceName("cpu"), corev1.ResourceName("memory")},
+				Flavors: []v1beta1.FlavorQuotas{
+					{
+						Name: v1beta1.ResourceFlavorReference(resourceFlavor.Name),
+						Resources: []v1beta1.ResourceQuota{
+							{
+								Name:         corev1.ResourceCPU,
+								NominalQuota: resource.MustParse("8"),
+							},
+							{
+								Name:         corev1.ResourceMemory,
+								NominalQuota: resource.MustParse("32Gi"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if gpu.IsGpu() {
+		numberOfGpus := (numberOfWorkerNodes + 1) * numGpus
+		cqSpec.ResourceGroups[0].CoveredResources = append(
+			cqSpec.ResourceGroups[0].CoveredResources,
+			corev1.ResourceName(gpu.ResourceLabel),
+		)
+		cqSpec.ResourceGroups[0].Flavors[0].Resources = append(
+			cqSpec.ResourceGroups[0].Flavors[0].Resources,
+			v1beta1.ResourceQuota{
+				Name:         corev1.ResourceName(gpu.ResourceLabel),
+				NominalQuota: resource.MustParse(fmt.Sprint(numberOfGpus)),
+			},
+		)
+	}
+
+	clusterQueue := CreateKueueClusterQueue(test, cqSpec)
+	defer test.Client().Kueue().KueueV1beta1().ClusterQueues().Delete(test.Ctx(), clusterQueue.Name, metav1.DeleteOptions{})
+	localQueue := CreateKueueLocalQueue(test, namespace, clusterQueue.Name, AsDefaultQueue)
 
 	// Create a ConfigMap with training script
 	configData := map[string][]byte{
@@ -89,7 +177,7 @@ func runKFTOPyTorchJob(t *testing.T, image string, gpu Accelerator, numGpus, num
 	defer test.Client().Core().CoreV1().PersistentVolumeClaims(namespace).Delete(test.Ctx(), outputPvc.Name, metav1.DeleteOptions{})
 
 	// Create training PyTorch job
-	tuningJob := createKFTOPyTorchJob(test, namespace, *config, gpu, numGpus, numberOfWorkerNodes, outputPvc.Name, image)
+	tuningJob := createKFTOPyTorchJob(test, namespace, *config, gpu, numGpus, numberOfWorkerNodes, outputPvc.Name, image, localQueue)
 	defer test.Client().Kubeflow().KubeflowV1().PyTorchJobs(namespace).Delete(test.Ctx(), tuningJob.Name, *metav1.NewDeleteOptions(0))
 
 	// Make sure the PyTorch job is running
@@ -122,7 +210,7 @@ func runKFTOPyTorchJob(t *testing.T, image string, gpu Accelerator, numGpus, num
 	test.T().Logf("PytorchJob %s/%s ran successfully", tuningJob.Namespace, tuningJob.Name)
 }
 
-func createKFTOPyTorchJob(test Test, namespace string, config corev1.ConfigMap, gpu Accelerator, numGpus, numberOfWorkerNodes int, outputPvcName string, baseImage string) *kftov1.PyTorchJob {
+func createKFTOPyTorchJob(test Test, namespace string, config corev1.ConfigMap, gpu Accelerator, numGpus, numberOfWorkerNodes int, outputPvcName string, baseImage string, localQueue *v1beta1.LocalQueue) *kftov1.PyTorchJob {
 	tuningJob := &kftov1.PyTorchJob{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: corev1.SchemeGroupVersion.String(),
@@ -130,6 +218,9 @@ func createKFTOPyTorchJob(test Test, namespace string, config corev1.ConfigMap, 
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "kfto-llm-",
+			Labels: map[string]string{
+				"kueue.x-k8s.io/default-queue": localQueue.Name,
+			},
 		},
 		Spec: kftov1.PyTorchJobSpec{
 			PyTorchReplicaSpecs: map[kftov1.ReplicaType]*kftov1.ReplicaSpec{
