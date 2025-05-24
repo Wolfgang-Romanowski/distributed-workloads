@@ -215,7 +215,7 @@ jobs:
               set +e
               snyk container test "$BASE_IMAGE" \
                 --json \
-                --severity-threshold=critical \
+                --severity-threshold=high \
                 > "$BASE_SCAN_JSON" 2> "$BASE_SCAN_OUTPUT"
               BASE_EXIT_CODE=$?
               set -e
@@ -252,7 +252,7 @@ jobs:
             snyk container test "$BASE_IMAGE" \
               --file="$DOCKERFILE" \
               --json \
-              --severity-threshold=critical \
+              --severity-threshold=high \
               > "$FULL_SCAN_JSON" 2> "$FULL_SCAN_OUTPUT"
             DOCKERFILE_EXIT_CODE=$?
             set -e
@@ -352,86 +352,18 @@ jobs:
             echo "$key=${VULNERABILITY_DETAILS[$key]}" >> "$RESULTS_DIR/vulnerability_details.data"
           done
           
-          # Create detailed Slack message
-          SLACK_TITLE="🔒 Snyk Dockerfile Security Scan"
-          SLACK_COLOR="good"
-          SLACK_FIELDS=""
-          
-          if [ "$OVERALL_STATUS" = "FAILED" ]; then
-            SLACK_COLOR="danger"
-            SLACK_TITLE="❌ Snyk Security Scan Failed"
-          elif [ "$OVERALL_STATUS" = "WARNING" ]; then
-            SLACK_COLOR="warning"
-            SLACK_TITLE="⚠️ Snyk Security Scan Warning"
-          elif [ "$OVERALL_STATUS" = "ERROR" ]; then
-            SLACK_COLOR="danger"
-            SLACK_TITLE="🚨 Snyk Security Scan Error"
-          fi
-          
-          # Build Slack fields
-          SLACK_FIELDS=$(cat << EOF
-          [
-            {
-              "title": "Status",
-              "value": "$OVERALL_STATUS",
-              "short": true
-            },
-            {
-              "title": "Mode",
-              "value": "$([ "$DEBUG_MODE" = "true" ] && echo "Debug" || echo "Normal")",
-              "short": true
-            },
-            {
-              "title": "Summary",
-              "value": "$OVERALL_MSG",
-              "short": false
-            },
-            {
-              "title": "Dockerfile Analysis",
-              "value": "✅ Clean: $DOCKERFILE_CLEAN\n⚠️ New Medium/Low: $DOCKERFILE_INHERIT_ONLY\n❌ New Critical/High: $DOCKERFILE_WITH_NEW_ISSUES\n🚨 Errors: $SCAN_ERRORS",
-              "short": true
-            },
-            {
-              "title": "Base Image Analysis", 
-              "value": "$BASE_IMAGES_WITH_ISSUES base image(s) with vulnerabilities (report-only)",
-              "short": true
-            }
-          EOF
-          )
-          
-          # Add vulnerability details if failures exist
-          if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-            VULN_DETAILS=""
-            for DIR in ${DOCKERFILES_WITH_NEW_VULNS//,/ }; do
-              if [ -n "${VULNERABILITY_DETAILS[$DIR]}" ]; then
-                VULN_DETAILS="${VULN_DETAILS}*${DIR}:*\n${VULNERABILITY_DETAILS[$DIR]}\n\n"
-              fi
-            done
-            
-            if [ -n "$VULN_DETAILS" ]; then
-              SLACK_FIELDS="${SLACK_FIELDS},
-              {
-                \"title\": \"Top New Vulnerabilities\",
-                \"value\": \"$VULN_DETAILS\",
-                \"short\": false
-              }"
-            fi
-          fi
-          
-          SLACK_FIELDS="${SLACK_FIELDS}
-          ]"
-          
-          # Save Slack message data
-          echo "slack_title=$SLACK_TITLE" >> "$RESULTS_DIR/slack_data.env"
-          echo "slack_color=$SLACK_COLOR" >> "$RESULTS_DIR/slack_data.env"
-          echo "slack_fields<<EOF" >> "$RESULTS_DIR/slack_data.env"
-          echo "$SLACK_FIELDS" >> "$RESULTS_DIR/slack_data.env"
-          echo "EOF" >> "$RESULTS_DIR/slack_data.env"
-          
           # Set outputs for GitHub Actions
           echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
           echo "scan_status=$OVERALL_MSG" >> $GITHUB_OUTPUT
           echo "dockerfile_failures_exist=$DOCKERFILE_FAILURES_EXIST" >> $GITHUB_OUTPUT
+          
+          # For Slack, output simple values
+          echo "slack_msg=$OVERALL_MSG" >> $GITHUB_OUTPUT
+          echo "base_issues_count=$BASE_IMAGES_WITH_ISSUES" >> $GITHUB_OUTPUT
+          echo "dockerfile_clean_count=$DOCKERFILE_CLEAN" >> $GITHUB_OUTPUT
+          echo "dockerfile_warning_count=$DOCKERFILE_INHERIT_ONLY" >> $GITHUB_OUTPUT
+          echo "dockerfile_failed_count=$DOCKERFILE_WITH_NEW_ISSUES" >> $GITHUB_OUTPUT
+          echo "scan_errors_count=$SCAN_ERRORS" >> $GITHUB_OUTPUT
           
           # Final status
           log_section "FINAL SCAN RESULTS"
@@ -479,6 +411,25 @@ jobs:
           RESULTS_DIR="scan_results"
           SNYK_VERSION="${SNYK_VERSION:-Unknown}"
           DEBUG_MODE="${DEBUG_MODE:-false}"
+          
+          # Helper function to get top vulnerabilities
+          get_top_vulnerabilities() {
+            local json_file="$1"
+            local count="${2:-5}"
+            
+            if [ ! -f "$json_file" ] || [ ! -s "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1; then
+              echo ""
+              return
+            fi
+            
+            jq -r --arg count "$count" '
+              [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
+              | sort_by(-.cvssScore) 
+              | .[0:($count|tonumber)] 
+              | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")]")
+              | join("\n")
+            ' "$json_file" 2>/dev/null || echo ""
+          }
           
           # Read scan results
           if [ -f "$RESULTS_DIR/scan_state.env" ]; then
@@ -555,7 +506,7 @@ jobs:
             echo "|:-------|:------|"
             echo "| **Scan Date** | $(date -u '+%B %d, %Y at %H:%M UTC') |"
             echo "| **Snyk Version** | $SNYK_VERSION |"
-            echo "| **Severity Threshold** | Critical (fail on new critical/high) |"
+            echo "| **Severity Threshold** | High (fail on new critical/high) |"
             echo "| **Mode** | $([ "$DEBUG_MODE" = "true" ] && echo "Debug" || echo "Normal") |"
             echo "| **Total Dockerfiles** | $TOTAL_SCANNED |"
             echo ""
@@ -584,9 +535,41 @@ jobs:
             done
             echo ""
             
+            # Show base image vulnerability details if they exist
+            if [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
+              echo "### 📋 Base Image Vulnerability Details"
+              echo "> For reference only - these don't fail the build"
+              echo ""
+              
+              # Show details for each unique base image with issues
+              for key in "${!BASE_IMAGE_RESULTS[@]}"; do
+                IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
+                if [ "$total" -gt 0 ]; then
+                  base_name=$(echo "$key" | sed 's/_/\//g' | sed 's/\//:/2')
+                  BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"
+                  
+                  echo "<details>"
+                  echo "<summary>$base_name - $total vulnerabilities (C:$critical H:$high M:$medium L:$low)</summary>"
+                  echo ""
+                  
+                  TOP_VULNS=$(get_top_vulnerabilities "$BASE_SCAN_JSON" 5)
+                  if [ -n "$TOP_VULNS" ]; then
+                    echo "$TOP_VULNS"
+                  else
+                    echo "No detailed vulnerability information available."
+                  fi
+                  
+                  echo ""
+                  echo "</details>"
+                  echo ""
+                fi
+              done
+            fi
+            
             # Base Image Status (Report Only)
             echo "## 📦 Base Image Security Status"
             echo "> **Note:** Base image vulnerabilities are report-only and do not fail the build"
+            echo "> Showing all vulnerabilities at High severity threshold and above"
             echo ""
             
             echo "| Base Image | Vulnerabilities | Severity Breakdown |"
@@ -594,22 +577,49 @@ jobs:
             
             # Display unique base images
             declare -A DISPLAYED_IMAGES
+            declare -A BASE_IMAGE_MAP
+            
+            # First, map directories to their base images
             for DIR in "${TARGET_DIRS[@]}"; do
-              if [ -f "$RESULTS_DIR/base_${DIR}_scan.json" ]; then
-                DOCKERFILE="images/runtime/training/$DIR/Dockerfile"
-                if [ -f "$DOCKERFILE" ]; then
-                  BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE" | awk '{print $2}' | sed 's/ AS .*//g')
-                  BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
+              DOCKERFILE="images/runtime/training/$DIR/Dockerfile"
+              if [ -f "$DOCKERFILE" ]; then
+                BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE" | awk '{print $2}' | sed 's/ AS .*//g')
+                
+                # Process ARG substitutions
+                while IFS= read -r line; do
+                  if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
+                    local var_name="${BASH_REMATCH[1]}"
+                    local var_value="${BASH_REMATCH[2]//\"/}"
+                    var_value="${var_value//\'/}"
+                    BASE_IMAGE="${BASE_IMAGE//\$\{$var_name\}/$var_value}"
+                    BASE_IMAGE="${BASE_IMAGE//\$var_name/$var_value}"
+                  fi
+                done < "$DOCKERFILE"
+                
+                BASE_IMAGE_MAP[$DIR]="$BASE_IMAGE"
+              fi
+            done
+            
+            # Now display each unique base image with its vulnerabilities
+            for DIR in "${TARGET_DIRS[@]}"; do
+              if [ -n "${BASE_IMAGE_MAP[$DIR]}" ]; then
+                BASE_IMAGE="${BASE_IMAGE_MAP[$DIR]}"
+                BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
+                
+                if [ -z "${DISPLAYED_IMAGES[$BASE_SCAN_KEY]}" ] && [ -n "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}" ]; then
+                  DISPLAYED_IMAGES[$BASE_SCAN_KEY]="1"
+                  IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}"
                   
-                  if [ -z "${DISPLAYED_IMAGES[$BASE_SCAN_KEY]}" ] && [ -n "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}" ]; then
-                    DISPLAYED_IMAGES[$BASE_SCAN_KEY]="1"
-                    IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}"
-                    
-                    if [ "$total" -eq 0 ]; then
-                      echo "| $BASE_IMAGE | ✅ Clean | No vulnerabilities |"
+                  if [ "$total" -eq 0 ]; then
+                    echo "| $BASE_IMAGE | ✅ Clean | No vulnerabilities |"
+                  else
+                    # Determine icon based on severity
+                    if [ "$critical" -gt 0 ] || [ "$high" -gt 0 ]; then
+                      icon="⚠️"
                     else
-                      echo "| $BASE_IMAGE | ⚠️ $total vulnerabilities | C:$critical H:$high M:$medium L:$low |"
+                      icon="ℹ️"
                     fi
+                    echo "| $BASE_IMAGE | $icon $total vulnerabilities | C:$critical H:$high M:$medium L:$low |"
                   fi
                 fi
               fi
@@ -618,8 +628,8 @@ jobs:
             
             # Vulnerability Details
             if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-              echo "## 🔍 Critical/High Vulnerability Details"
-              echo "> Top vulnerabilities introduced by Dockerfiles"
+              echo "## 🔍 New Vulnerability Details"
+              echo "> Vulnerabilities introduced by Dockerfiles (not present in base images)"
               echo ""
               
               for DIR in ${DOCKERFILES_WITH_NEW_VULNS//,/ }; do
@@ -704,19 +714,43 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ steps.scan.outputs.slack_color }}",
-                  "title": "${{ steps.scan.outputs.slack_title }}",
-                  "fields": ${{ steps.scan.outputs.slack_fields }},
+                  "color": "${{ steps.scan.outputs.overall_status == 'PASSED' && 'good' || steps.scan.outputs.overall_status == 'WARNING' && 'warning' || 'danger' }}",
+                  "title": "${{ steps.scan.outputs.overall_status == 'PASSED' && '✅ Snyk Security Scan Passed' || steps.scan.outputs.overall_status == 'WARNING' && '⚠️ Snyk Security Scan Warning' || steps.scan.outputs.overall_status == 'ERROR' && '🚨 Snyk Security Scan Error' || '❌ Snyk Security Scan Failed' }}",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "value": "${{ steps.scan.outputs.overall_status }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Mode",
+                      "value": "${{ github.event.inputs.debug == 'true' && 'Debug' || 'Normal' }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Summary",
+                      "value": "${{ steps.scan.outputs.slack_msg }}",
+                      "short": false
+                    },
+                    {
+                      "title": "Dockerfile Analysis",
+                      "value": "✅ Clean: ${{ steps.scan.outputs.dockerfile_clean_count }}\n⚠️ New Medium/Low: ${{ steps.scan.outputs.dockerfile_warning_count }}\n❌ New Critical/High: ${{ steps.scan.outputs.dockerfile_failed_count }}\n🚨 Errors: ${{ steps.scan.outputs.scan_errors_count }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Base Image Analysis", 
+                      "value": "${{ steps.scan.outputs.base_issues_count }} base image(s) with vulnerabilities (report-only)",
+                      "short": true
+                    },
+                    {
+                      "title": "View Details",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Full Report>",
+                      "short": false
+                    }
+                  ],
                   "footer": "Snyk Container Security",
                   "footer_icon": "https://res.cloudinary.com/snyk/image/upload/v1537345894/press-kit/brand/logo-black.png",
-                  "ts": ${{ github.event.head_commit.timestamp && 'new Date(github.event.head_commit.timestamp).getTime() / 1000' || 'Math.floor(Date.now() / 1000)' }},
-                  "actions": [
-                    {
-                      "type": "button",
-                      "text": "View Full Report",
-                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                    }
-                  ]
+                  "ts": ${{ github.event.head_commit.timestamp && 'new Date(github.event.head_commit.timestamp).getTime() / 1000' || 'Math.floor(Date.now() / 1000)' }}
                 }
               ]
             }
