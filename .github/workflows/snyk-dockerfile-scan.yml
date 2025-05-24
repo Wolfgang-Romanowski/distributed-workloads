@@ -69,7 +69,14 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
           TARGET_DIR: ${{ github.event.inputs.target_dir }}
+          SNYK_VERSION: ${{ steps.verify_token.outputs.version }}
         run: |
+          # Create scripts directory
+          mkdir -p .github/scripts
+          
+          # Create the scan script
+          cat > .github/scripts/snyk-scan.sh << 'SCRIPT_EOF'
+          #!/bin/bash
           set -e
           
           # Configuration
@@ -84,11 +91,7 @@ jobs:
           DOCKERFILE_PASSED=0
           DOCKERFILE_FAILED=0
           SCAN_ERRORS=0
-          
-          # Track unique base images with issues
           BASE_IMAGES_WITH_ISSUES=0
-          
-          # Track Dockerfiles that introduce new vulnerabilities
           DOCKERFILES_WITH_NEW_VULNS=""
           
           # Results storage
@@ -96,12 +99,6 @@ jobs:
           declare -A BASE_SCAN_RESULTS
           declare -A DOCKERFILE_SCAN_RESULTS
           declare -A BASE_IMAGES_SCANNED
-          
-          # Export variables and functions for use in subshells
-          export DEBUG_MODE
-          export -f extract_base_image
-          export -f get_vuln_summary
-          export -f get_top_vulnerabilities
           
           # Utility functions
           log_section() {
@@ -115,17 +112,15 @@ jobs:
             local dockerfile="$1"
             local base_image
             
-            # Extract FROM line
             base_image=$(grep -m 1 "^FROM" "$dockerfile" | awk '{print $2}' | sed 's/ AS .*//g')
             
-            # Process ARG substitutions from the Dockerfile
             while IFS= read -r line; do
               if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
                 local var_name="${BASH_REMATCH[1]}"
                 local var_value="${BASH_REMATCH[2]//\"/}"
                 var_value="${var_value//\'/}"
                 base_image="${base_image//\$\{$var_name\}/$var_value}"
-                base_image="${base_image//\$$var_name/$var_value}"
+                base_image="${base_image//\$var_name/$var_value}"
               fi
             done < "$dockerfile"
             
@@ -134,7 +129,6 @@ jobs:
           
           get_vuln_summary() {
             local json_file="$1"
-            local label="$2"
             
             if [ ! -f "$json_file" ] || [ ! -s "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1; then
               echo "Unable to parse"
@@ -148,25 +142,6 @@ jobs:
             local total=$(jq '.uniqueCount // 0' "$json_file" 2>/dev/null || echo "0")
             
             echo "${critical}C/${high}H/${medium}M/${low}L (Total: $total)"
-          }
-          
-          get_top_vulnerabilities() {
-            local json_file="$1"
-            local count="${2:-5}"
-            
-            if [ ! -f "$json_file" ] || [ ! -s "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1; then
-              echo ""
-              return
-            fi
-            
-            # Extract top critical/high vulnerabilities with details
-            jq -r --arg count "$count" '
-              [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
-              | sort_by(-.cvssScore) 
-              | .[0:($count|tonumber)] 
-              | .[] 
-              | "- **\(.id // "Unknown")** (\(.severity|ascii_upcase)): \(.title // "No description") - Package: \(.packageName // "Unknown")@\(.version // "Unknown")"
-            ' "$json_file" 2>/dev/null || echo ""
           }
           
           # Determine target directories
@@ -188,6 +163,9 @@ jobs:
             echo "Scanning all Dockerfile directories"
           fi
           
+          # Save target directories
+          printf "%s\n" "${TARGET_DIRS[@]}" > "$RESULTS_DIR/target_dirs.txt"
+          
           # Process each target directory
           for DIR in "${TARGET_DIRS[@]}"; do
             log_section "Processing $DIR"
@@ -195,7 +173,6 @@ jobs:
             DOCKERFILE="$TRAINING_DIR/$DIR/Dockerfile"
             TOTAL_SCANNED=$((TOTAL_SCANNED + 1))
             
-            # Verify Dockerfile exists
             if [ ! -f "$DOCKERFILE" ]; then
               echo "ERROR: Dockerfile not found: $DOCKERFILE"
               SCAN_ERRORS=$((SCAN_ERRORS + 1))
@@ -203,11 +180,10 @@ jobs:
               continue
             fi
             
-            # Extract base image
             BASE_IMAGE=$(extract_base_image "$DOCKERFILE")
             echo "Base image: $BASE_IMAGE"
             
-            # Phase 1: Scan base image only (if not already scanned)
+            # Phase 1: Base image scan
             echo ""
             echo "Phase 1: Base Image Security Analysis"
             echo "-------------------------------------"
@@ -216,11 +192,9 @@ jobs:
             BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
             BASE_SCAN_OUTPUT="$RESULTS_DIR/base_${BASE_SCAN_KEY}_output.txt"
             
-            # Check if we've already scanned this base image
             if [ -z "${BASE_IMAGES_SCANNED[$BASE_SCAN_KEY]}" ]; then
               echo "Running Snyk base image scan..."
               
-              # Run base image scan
               set +e
               snyk container test "$BASE_IMAGE" \
                 --json \
@@ -229,42 +203,26 @@ jobs:
               BASE_EXIT_CODE=$?
               set -e
               
-              # Get vulnerability summary
-              BASE_VULN_SUMMARY=$(get_vuln_summary "$BASE_SCAN_JSON" "Base")
+              BASE_VULN_SUMMARY=$(get_vuln_summary "$BASE_SCAN_JSON")
               
-              # Determine base status
               case $BASE_EXIT_CODE in
-                0)
-                  BASE_STATUS="PASSED"
-                  BASE_MSG="No high/critical vulnerabilities"
-                  ;;
-                1)
-                  BASE_STATUS="FAILED"
-                  BASE_MSG="High/critical vulnerabilities found"
-                  ;;
-                *)
-                  BASE_STATUS="ERROR"
-                  BASE_MSG="Scan error (exit: $BASE_EXIT_CODE)"
-                  ;;
+                0) BASE_STATUS="PASSED"; BASE_MSG="No high/critical vulnerabilities" ;;
+                1) BASE_STATUS="FAILED"; BASE_MSG="High/critical vulnerabilities found" ;;
+                *) BASE_STATUS="ERROR"; BASE_MSG="Scan error (exit: $BASE_EXIT_CODE)" ;;
               esac
               
-              # Store base image results
               BASE_IMAGES_SCANNED[$BASE_SCAN_KEY]="$BASE_STATUS|$BASE_MSG|$BASE_VULN_SUMMARY|$BASE_EXIT_CODE"
-              
-              echo "Base image scan completed"
-              echo "  Status: $BASE_STATUS"
-              echo "  Vulnerabilities: $BASE_VULN_SUMMARY"
+              echo "Base image scan completed - Status: $BASE_STATUS"
             else
               echo "Using cached base image scan results"
               IFS='|' read -r BASE_STATUS BASE_MSG BASE_VULN_SUMMARY BASE_EXIT_CODE <<< "${BASE_IMAGES_SCANNED[$BASE_SCAN_KEY]}"
-              echo "  Status: $BASE_STATUS"
-              echo "  Vulnerabilities: $BASE_VULN_SUMMARY"
             fi
             
-            # Store base results for this Dockerfile
+            echo "  Status: $BASE_STATUS"
+            echo "  Vulnerabilities: $BASE_VULN_SUMMARY"
             BASE_SCAN_RESULTS[$DIR]="$BASE_STATUS|$BASE_MSG|$BASE_VULN_SUMMARY"
             
-            # Phase 2: Scan with Dockerfile context
+            # Phase 2: Dockerfile scan
             echo ""
             echo "Phase 2: Full Dockerfile Security Analysis"
             echo "------------------------------------------"
@@ -274,7 +232,6 @@ jobs:
             FULL_SCAN_OUTPUT="$RESULTS_DIR/${DIR}_full_scan_output.txt"
             FULL_SCAN_HUMAN="$RESULTS_DIR/${DIR}_full_scan_human.txt"
             
-            # Run full scan with Dockerfile
             set +e
             snyk container test "$BASE_IMAGE" \
               --file="$DOCKERFILE" \
@@ -284,7 +241,6 @@ jobs:
             DOCKERFILE_EXIT_CODE=$?
             set -e
             
-            # Also generate human-readable output
             set +e
             snyk container test "$BASE_IMAGE" \
               --file="$DOCKERFILE" \
@@ -292,10 +248,8 @@ jobs:
               > "$FULL_SCAN_HUMAN" 2>&1
             set -e
             
-            # Get vulnerability summary
-            DOCKERFILE_VULN_SUMMARY=$(get_vuln_summary "$FULL_SCAN_JSON" "Full")
+            DOCKERFILE_VULN_SUMMARY=$(get_vuln_summary "$FULL_SCAN_JSON")
             
-            # Determine Dockerfile scan status
             case $DOCKERFILE_EXIT_CODE in
               0)
                 DOCKERFILE_STATUS="PASSED"
@@ -304,10 +258,8 @@ jobs:
                 ;;
               1)
                 DOCKERFILE_STATUS="FAILED"
-                DOCKERFILE_MSG="High/critical vulnerabilities found in full scan"
                 DOCKERFILE_FAILED=$((DOCKERFILE_FAILED + 1))
                 
-                # Check if this is due to Dockerfile introducing new vulnerabilities
                 if [ "$BASE_STATUS" = "PASSED" ]; then
                   DOCKERFILE_MSG="Dockerfile introduces new vulnerabilities"
                   DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "
@@ -330,56 +282,19 @@ jobs:
                 ;;
             esac
             
-            # Store Dockerfile results
             DOCKERFILE_SCAN_RESULTS[$DIR]="$DOCKERFILE_STATUS|$DOCKERFILE_MSG|$DOCKERFILE_VULN_SUMMARY"
-            
             echo "Dockerfile scan completed"
             echo "  Status: $DOCKERFILE_STATUS"
             echo "  Vulnerabilities: $DOCKERFILE_VULN_SUMMARY"
             
-            # Build summary for this Dockerfile
+            # Build summary
             SCAN_SUMMARY="${SCAN_SUMMARY}=== $DIR ===\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}Base Image ($BASE_IMAGE):\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}  Status: $BASE_STATUS (Exit: ${BASE_EXIT_CODE})\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}  Vulnerabilities: $BASE_VULN_SUMMARY\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}Full Dockerfile Scan:\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}  Status: $DOCKERFILE_STATUS (Exit: ${DOCKERFILE_EXIT_CODE})\n"
-            SCAN_SUMMARY="${SCAN_SUMMARY}  Vulnerabilities: $DOCKERFILE_VULN_SUMMARY\n"
-            
-            # Check if Dockerfile introduces new vulnerabilities
-            if [ "$DOCKERFILE_STATUS" = "FAILED" ] && [ "$BASE_STATUS" = "PASSED" ]; then
-              SCAN_SUMMARY="${SCAN_SUMMARY}  ⚠️ WARNING: Dockerfile introduces new vulnerabilities!\n"
-            elif [ "$DOCKERFILE_STATUS" = "FAILED" ] && [ "$BASE_STATUS" = "FAILED" ]; then
-              base_total=$(echo "$BASE_VULN_SUMMARY" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
-              docker_total=$(echo "$DOCKERFILE_VULN_SUMMARY" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
-              if [ "$docker_total" -gt "$base_total" ]; then
-                diff=$((docker_total - base_total))
-                SCAN_SUMMARY="${SCAN_SUMMARY}  ⚠️ WARNING: Dockerfile adds $diff new vulnerabilities!\n"
-              fi
-            fi
-            SCAN_SUMMARY="${SCAN_SUMMARY}\n"
-            
-            # Generate analysis report
-            {
-              echo "SECURITY SCAN REPORT: $DIR"
-              echo "=========================="
-              echo ""
-              echo "BASE IMAGE ANALYSIS"
-              echo "Image: $BASE_IMAGE"
-              echo "Snyk Status: $BASE_STATUS"
-              echo "Vulnerabilities: $BASE_VULN_SUMMARY"
-              echo ""
-              echo "DOCKERFILE ANALYSIS"
-              echo "Snyk Status: $DOCKERFILE_STATUS"
-              echo "Total Vulnerabilities: $DOCKERFILE_VULN_SUMMARY"
-              echo ""
-              echo "INTERPRETATION GUIDE:"
-              echo "- Base Image: Shows vulnerabilities present in the base image alone"
-              echo "- Dockerfile: Shows total vulnerabilities when Dockerfile is applied"
-              echo "- If Dockerfile scan has more vulnerabilities than base, your Dockerfile may be introducing them"
-              echo "- Both scans use Snyk's --severity-threshold=high setting"
-              echo ""
-            } > "$RESULTS_DIR/${DIR}_analysis.txt"
+            SCAN_SUMMARY="${SCAN_SUMMARY}  Vulnerabilities: $DOCKERFILE_VULN_SUMMARY\n\n"
           done
           
           # Count unique base images with issues
@@ -391,33 +306,17 @@ jobs:
           done
           BASE_FAILED=$BASE_IMAGES_WITH_ISSUES
           
-          # Clean up the list of Dockerfiles with new vulnerabilities
+          # Clean up the list
           DOCKERFILES_WITH_NEW_VULNS=$(echo "$DOCKERFILES_WITH_NEW_VULNS" | sed 's/, $//')
           
-          # Calculate overall status based on Dockerfile scans (not base image scans)
-          # In debug mode, we report failures for any issues
+          # Calculate overall status
           if [ "$DEBUG_MODE" = "true" ]; then
-            # Debug mode: fail if ANY scan has issues
             if [ $SCAN_ERRORS -gt 0 ]; then
               OVERALL_STATUS="ERROR"
               OVERALL_MSG="Scan errors encountered (Debug Mode)"
-            elif [ $DOCKERFILE_FAILED -gt 0 ] && [ $BASE_FAILED -gt 0 ]; then
+            elif [ $DOCKERFILE_FAILED -gt 0 ] || [ $BASE_FAILED -gt 0 ]; then
               OVERALL_STATUS="FAILED"
-              if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-                OVERALL_MSG="Issues in: $DOCKERFILES_WITH_NEW_VULNS + base image issues (Debug)"
-              else
-                OVERALL_MSG="Dockerfile and base image vulnerabilities detected (Debug)"
-              fi
-            elif [ $DOCKERFILE_FAILED -gt 0 ]; then
-              OVERALL_STATUS="FAILED"
-              if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-                OVERALL_MSG="Dockerfile issues in: $DOCKERFILES_WITH_NEW_VULNS (Debug)"
-              else
-                OVERALL_MSG="Dockerfile vulnerabilities detected (Debug)"
-              fi
-            elif [ $BASE_FAILED -gt 0 ]; then
-              OVERALL_STATUS="FAILED"
-              OVERALL_MSG="Base image vulnerabilities detected (Debug Mode)"
+              OVERALL_MSG="Security vulnerabilities detected (Debug Mode)"
             elif [ $DOCKERFILE_PASSED -eq $TOTAL_SCANNED ]; then
               OVERALL_STATUS="PASSED"
               OVERALL_MSG="All scans passed (Debug Mode)"
@@ -426,7 +325,6 @@ jobs:
               OVERALL_MSG="Unexpected state (Debug Mode)"
             fi
           else
-            # Normal mode: only fail on Dockerfile issues, base image issues are informational
             if [ $SCAN_ERRORS -gt 0 ]; then
               OVERALL_STATUS="ERROR"
               OVERALL_MSG="Scan errors encountered"
@@ -450,6 +348,171 @@ jobs:
             fi
           fi
           
+          # Save state to files
+          cat > "$RESULTS_DIR/scan_state.env" << EOF
+          OVERALL_STATUS="$OVERALL_STATUS"
+          OVERALL_MSG="$OVERALL_MSG"
+          TOTAL_SCANNED=$TOTAL_SCANNED
+          DOCKERFILE_PASSED=$DOCKERFILE_PASSED
+          DOCKERFILE_FAILED=$DOCKERFILE_FAILED
+          BASE_FAILED=$BASE_FAILED
+          SCAN_ERRORS=$SCAN_ERRORS
+          DOCKERFILES_WITH_NEW_VULNS="$DOCKERFILES_WITH_NEW_VULNS"
+          EOF
+          
+          # Save associative arrays
+          for key in "${!BASE_IMAGES_SCANNED[@]}"; do
+            echo "$key=${BASE_IMAGES_SCANNED[$key]}" >> "$RESULTS_DIR/base_images.data"
+          done
+          
+          for key in "${!BASE_SCAN_RESULTS[@]}"; do
+            echo "$key=${BASE_SCAN_RESULTS[$key]}" >> "$RESULTS_DIR/base_results.data"
+          done
+          
+          for key in "${!DOCKERFILE_SCAN_RESULTS[@]}"; do
+            echo "$key=${DOCKERFILE_SCAN_RESULTS[$key]}" >> "$RESULTS_DIR/dockerfile_results.data"
+          done
+          
+          # Create Slack summary
+          SLACK_SUMMARY=""
+          if [ $DOCKERFILE_FAILED -gt 0 ]; then
+            if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
+              SLACK_SUMMARY="⚠️ New vulnerabilities in: $DOCKERFILES_WITH_NEW_VULNS"
+            else
+              SLACK_SUMMARY="⚠️ ${DOCKERFILE_FAILED} Dockerfile(s) inherit base image vulnerabilities"
+            fi
+          elif [ $BASE_FAILED -gt 0 ]; then
+            SLACK_SUMMARY="✅ All Dockerfiles clean (${BASE_FAILED} base image(s) have issues - informational)"
+          else
+            SLACK_SUMMARY="✅ All scans passed - no security issues found"
+          fi
+          
+          # Set outputs for GitHub Actions
+          echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          echo "scan_status=$OVERALL_MSG" >> $GITHUB_OUTPUT
+          echo "total_scanned=$TOTAL_SCANNED" >> $GITHUB_OUTPUT
+          echo "dockerfile_passed=$DOCKERFILE_PASSED" >> $GITHUB_OUTPUT
+          echo "dockerfile_failed=$DOCKERFILE_FAILED" >> $GITHUB_OUTPUT
+          echo "base_failed=$BASE_FAILED" >> $GITHUB_OUTPUT
+          echo "scan_errors=$SCAN_ERRORS" >> $GITHUB_OUTPUT
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$SCAN_SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "slack_summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SLACK_SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Final status
+          log_section "FINAL SCAN RESULTS"
+          echo "Overall Status: $OVERALL_STATUS"
+          echo "Message: $OVERALL_MSG"
+          echo "Mode: $([ "$DEBUG_MODE" = "true" ] && echo "Debug" || echo "Normal")"
+          echo ""
+          echo "Total Dockerfiles Scanned: $TOTAL_SCANNED"
+          echo "  Passed: $DOCKERFILE_PASSED"
+          echo "  Failed: $DOCKERFILE_FAILED"
+          echo "  Errors: $SCAN_ERRORS"
+          echo ""
+          echo "Base Images: $BASE_FAILED with issues (informational)"
+          
+          # Exit based on mode and results
+          if [ "$DEBUG_MODE" = "true" ]; then
+            if [ "$OVERALL_STATUS" != "PASSED" ]; then
+              echo ""
+              echo "Debug Mode: Workflow failed - Issues detected"
+              exit 1
+            fi
+          else
+            if [ $DOCKERFILE_FAILED -gt 0 ] || [ $SCAN_ERRORS -gt 0 ]; then
+              echo ""
+              echo "Workflow failed - Dockerfile security issues found"
+              exit 1
+            fi
+          fi
+          SCRIPT_EOF
+          
+          # Make script executable and run it
+          chmod +x .github/scripts/snyk-scan.sh
+          .github/scripts/snyk-scan.sh
+
+      - name: Generate GitHub Summary
+        if: always()
+        env:
+          SNYK_VERSION: ${{ steps.verify_token.outputs.version }}
+          DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
+        run: |
+          cat > .github/scripts/generate-summary.sh << 'SUMMARY_EOF'
+          #!/bin/bash
+          # Generate GitHub Step Summary from scan results
+          
+          RESULTS_DIR="scan_results"
+          SNYK_VERSION="${SNYK_VERSION:-Unknown}"
+          DEBUG_MODE="${DEBUG_MODE:-false}"
+          
+          get_top_vulnerabilities() {
+            local json_file="$1"
+            local count="${2:-3}"
+            
+            if [ ! -f "$json_file" ] || [ ! -s "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1; then
+              echo ""
+              return
+            fi
+            
+            jq -r --arg count "$count" '
+              [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
+              | sort_by(-.cvssScore) 
+              | .[0:($count|tonumber)] 
+              | .[] 
+              | "- **\(.id // "Unknown")** (\(.severity|ascii_upcase)): \(.title // "No description") - Package: \(.packageName // "Unknown")@\(.version // "Unknown")"
+            ' "$json_file" 2>/dev/null || echo ""
+          }
+          
+          # Read scan results from files
+          if [ -f "$RESULTS_DIR/scan_state.env" ]; then
+            source "$RESULTS_DIR/scan_state.env"
+          else
+            echo "# 🔒 Snyk Dockerfile Security Scan Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## ⚠️ Scan Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The security scan encountered an error. Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          
+          # Read arrays from files
+          declare -A BASE_IMAGES_SCANNED
+          declare -A BASE_SCAN_RESULTS
+          declare -A DOCKERFILE_SCAN_RESULTS
+          
+          # Read base images data
+          if [ -f "$RESULTS_DIR/base_images.data" ]; then
+            while IFS='=' read -r key value; do
+              BASE_IMAGES_SCANNED["$key"]="$value"
+            done < "$RESULTS_DIR/base_images.data"
+          fi
+          
+          # Read base scan results
+          if [ -f "$RESULTS_DIR/base_results.data" ]; then
+            while IFS='=' read -r key value; do
+              BASE_SCAN_RESULTS["$key"]="$value"
+            done < "$RESULTS_DIR/base_results.data"
+          fi
+          
+          # Read dockerfile scan results
+          if [ -f "$RESULTS_DIR/dockerfile_results.data" ]; then
+            while IFS='=' read -r key value; do
+              DOCKERFILE_SCAN_RESULTS["$key"]="$value"
+            done < "$RESULTS_DIR/dockerfile_results.data"
+          fi
+          
+          # Read target directories
+          TARGET_DIRS=()
+          if [ -f "$RESULTS_DIR/target_dirs.txt" ]; then
+            while IFS= read -r dir; do
+              TARGET_DIRS+=("$dir")
+            done < "$RESULTS_DIR/target_dirs.txt"
+          fi
+          
           # Generate GitHub Step Summary
           {
             echo "# 🔒 Snyk Dockerfile Security Scan Results"
@@ -457,17 +520,10 @@ jobs:
             echo "## Executive Summary"
             echo ""
             
-            # Status badge
             case "$OVERALL_STATUS" in
-              "PASSED")
-                echo "### ✅ Status: PASSED"
-                ;;
-              "FAILED")
-                echo "### ❌ Status: FAILED"
-                ;;
-              "ERROR")
-                echo "### ⚠️ Status: ERROR"
-                ;;
+              "PASSED") echo "### ✅ Status: PASSED" ;;
+              "FAILED") echo "### ❌ Status: FAILED" ;;
+              "ERROR") echo "### ⚠️ Status: ERROR" ;;
             esac
             
             echo ""
@@ -476,23 +532,18 @@ jobs:
             echo "| Metric | Value |"
             echo "|:-------|:------|"
             echo "| **Scan Date** | $(date -u '+%B %d, %Y at %H:%M UTC') |"
-            echo "| **Snyk Version** | ${{ steps.verify_token.outputs.version }} |"
+            echo "| **Snyk Version** | $SNYK_VERSION |"
             echo "| **Severity Threshold** | High (Critical + High) |"
             echo "| **Mode** | $([ "$DEBUG_MODE" = "true" ] && echo "Debug" || echo "Normal") |"
             echo ""
             
-            # Quick Stats
             echo "### 📊 Scan Statistics"
             echo ""
             echo "| Category | Total | Passed | Failed | Errors |"
             echo "|:---------|:-----:|:------:|:------:|:------:|"
             echo "| **Dockerfiles** | $TOTAL_SCANNED | $DOCKERFILE_PASSED | $DOCKERFILE_FAILED | $SCAN_ERRORS |"
             
-            # Count unique base images
-            UNIQUE_BASE_COUNT=0
-            if [ ${#BASE_IMAGES_SCANNED[@]} -gt 0 ]; then
-              UNIQUE_BASE_COUNT=${#BASE_IMAGES_SCANNED[@]}
-            fi
+            UNIQUE_BASE_COUNT=${#BASE_IMAGES_SCANNED[@]}
             BASE_PASSED_COUNT=0
             BASE_FAILED_COUNT=0
             for key in "${!BASE_IMAGES_SCANNED[@]}"; do
@@ -506,7 +557,6 @@ jobs:
             echo "| **Base Images** | $UNIQUE_BASE_COUNT | $BASE_PASSED_COUNT | $BASE_FAILED_COUNT | 0 |"
             echo ""
             
-            # Base Image Results (Informational)
             echo "## 📦 Base Image Security Status"
             echo "> **Note:** Base image vulnerabilities are informational only and do not fail the build"
             echo ""
@@ -529,7 +579,6 @@ jobs:
                     echo "**Status:** High/critical vulnerabilities detected (informational)"
                     echo "**Vulnerabilities:** $vulns"
                     
-                    # Show top vulnerabilities if available
                     BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"
                     TOP_VULNS=$(get_top_vulnerabilities "$BASE_SCAN_JSON" 3)
                     if [ -n "$TOP_VULNS" ]; then
@@ -551,12 +600,10 @@ jobs:
               done
             fi
             
-            # Dockerfile Results (These determine pass/fail)
             echo "## 🐳 Dockerfile Scan Results"
             echo "> **Important:** These results determine the build pass/fail status"
             echo ""
             
-            # Summary table
             echo "| Dockerfile | Status | Vulnerabilities | Assessment |"
             echo "|:-----------|:-------|:----------------|:-----------|"
             
@@ -565,18 +612,15 @@ jobs:
                 IFS='|' read -r dockerfile_status dockerfile_msg dockerfile_vulns <<< "${DOCKERFILE_SCAN_RESULTS[$DIR]}"
                 IFS='|' read -r base_status base_msg base_vulns <<< "${BASE_SCAN_RESULTS[$DIR]}"
                 
-                # Status icon
                 case "$dockerfile_status" in
                   "PASSED") icon="✅" ;;
                   "FAILED") icon="❌" ;;
                   *) icon="⚠️" ;;
                 esac
                 
-                # Assessment
                 if [ "$dockerfile_status" = "FAILED" ] && [ "$base_status" = "PASSED" ]; then
                   assessment="**Dockerfile introduces vulnerabilities**"
                 elif [ "$dockerfile_status" = "FAILED" ] && [ "$base_status" = "FAILED" ]; then
-                  # Check if vulnerabilities increased
                   base_total=$(echo "$base_vulns" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
                   docker_total=$(echo "$dockerfile_vulns" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
                   if [ "$docker_total" -gt "$base_total" ]; then
@@ -595,7 +639,7 @@ jobs:
             done
             echo ""
             
-            # Detailed vulnerability information for failed Dockerfiles
+            # Detailed vulnerability information
             FAILED_DOCKERFILES=()
             for DIR in "${TARGET_DIRS[@]}"; do
               if [ -n "${DOCKERFILE_SCAN_RESULTS[$DIR]}" ]; then
@@ -615,7 +659,6 @@ jobs:
                 echo "<summary>📋 $DIR - Vulnerability Details</summary>"
                 echo ""
                 
-                # Get base and full scan vulnerability details
                 FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"
                 TOP_VULNS=$(get_top_vulnerabilities "$FULL_SCAN_JSON" 5)
                 
@@ -633,7 +676,6 @@ jobs:
               done
             fi
             
-            # Comparison table
             echo "## 📊 Vulnerability Comparison"
             echo ""
             echo "| Dockerfile | Base Image | → | Full Scan | Change |"
@@ -644,7 +686,6 @@ jobs:
                 IFS='|' read -r dockerfile_status dockerfile_msg dockerfile_vulns <<< "${DOCKERFILE_SCAN_RESULTS[$DIR]}"
                 IFS='|' read -r base_status base_msg base_vulns <<< "${BASE_SCAN_RESULTS[$DIR]}"
                 
-                # Extract totals for comparison
                 base_total=$(echo "$base_vulns" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
                 docker_total=$(echo "$dockerfile_vulns" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
                 
@@ -663,7 +704,6 @@ jobs:
             done
             echo ""
             
-            # Action items
             if [ "$OVERALL_STATUS" = "FAILED" ] || ([ "$DEBUG_MODE" = "true" ] && [ $BASE_FAILED -gt 0 ]); then
               echo "## ⚠️ Action Required"
               echo ""
@@ -696,80 +736,10 @@ jobs:
             echo "---"
             echo "*Scan performed by Snyk Container Security | Results based on Snyk's security intelligence*"
           } >> $GITHUB_STEP_SUMMARY
+          SUMMARY_EOF
           
-          # Set outputs
-          {
-            echo "overall_status=$OVERALL_STATUS"
-            echo "scan_status=$OVERALL_MSG"
-            echo "total_scanned=$TOTAL_SCANNED"
-            echo "dockerfile_passed=$DOCKERFILE_PASSED"
-            echo "dockerfile_failed=$DOCKERFILE_FAILED"
-            echo "base_failed=$BASE_FAILED"
-            echo "scan_errors=$SCAN_ERRORS"
-            echo "summary<<EOF"
-            echo -e "$SCAN_SUMMARY"
-            echo "EOF"
-            
-            # Create a detailed summary for Slack
-            SLACK_SUMMARY=""
-            if [ $DOCKERFILE_FAILED -gt 0 ]; then
-              if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-                SLACK_SUMMARY="⚠️ New vulnerabilities in: $DOCKERFILES_WITH_NEW_VULNS"
-              else
-                SLACK_SUMMARY="⚠️ ${DOCKERFILE_FAILED} Dockerfile(s) inherit base image vulnerabilities"
-              fi
-            elif [ $BASE_FAILED -gt 0 ]; then
-              SLACK_SUMMARY="✅ All Dockerfiles clean (${BASE_FAILED} base image(s) have issues - informational)"
-            else
-              SLACK_SUMMARY="✅ All scans passed - no security issues found"
-            fi
-            echo "slack_summary<<EOF" >> $GITHUB_OUTPUT
-            echo "$SLACK_SUMMARY" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            echo "dockerfiles_with_new_vulns<<EOF" >> $GITHUB_OUTPUT
-            echo "$DOCKERFILES_WITH_NEW_VULNS" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-          } >> $GITHUB_OUTPUT
-          
-          # Final status
-          log_section "FINAL SCAN RESULTS"
-          echo "Overall Status: $OVERALL_STATUS"
-          echo "Message: $OVERALL_MSG"
-          echo "Mode: $([ "$DEBUG_MODE" = "true" ] && echo "Debug" || echo "Normal")"
-          echo ""
-          echo "Base Image Results:"
-          echo "  Unique Images: $([ ${#BASE_IMAGES_SCANNED[@]} -gt 0 ] && echo ${#BASE_IMAGES_SCANNED[@]} || echo "0")"
-          echo "  With Issues: $BASE_FAILED (informational only)"
-          echo ""
-          echo "Dockerfile Scan Results:"
-          echo "  Passed: $DOCKERFILE_PASSED"
-          echo "  Failed: $DOCKERFILE_FAILED"
-          if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-            echo "  Introducing New Vulnerabilities: $DOCKERFILES_WITH_NEW_VULNS"
-          fi
-          echo "  Errors: $SCAN_ERRORS"
-          echo ""
-          echo "Total Dockerfiles Scanned: $TOTAL_SCANNED"
-          
-          # Exit based on mode and results
-          if [ "$DEBUG_MODE" = "true" ]; then
-            # Debug mode: fail on any issues
-            if [ "$OVERALL_STATUS" != "PASSED" ]; then
-              echo ""
-              echo "Debug Mode: Workflow failed - Issues detected"
-              exit 1
-            fi
-          else
-            # Normal mode: only fail on Dockerfile issues
-            if [ $DOCKERFILE_FAILED -gt 0 ] || [ $SCAN_ERRORS -gt 0 ]; then
-              echo ""
-              echo "Workflow failed - Dockerfile security issues found"
-              exit 1
-            elif [ $BASE_FAILED -gt 0 ]; then
-              echo ""
-              echo "Workflow passed - Base image issues are informational only"
-            fi
-          fi
+          chmod +x .github/scripts/generate-summary.sh
+          .github/scripts/generate-summary.sh
 
       - name: Upload Scan Results
         if: always()
