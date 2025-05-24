@@ -250,6 +250,9 @@ jobs:
             
             DOCKERFILE_VULN_SUMMARY=$(get_vuln_summary "$FULL_SCAN_JSON")
             
+            DOCKERFILE_VULN_SUMMARY=$(get_vuln_summary "$FULL_SCAN_JSON")
+            
+            # Determine Dockerfile scan status
             case $DOCKERFILE_EXIT_CODE in
               0)
                 DOCKERFILE_STATUS="PASSED"
@@ -257,22 +260,51 @@ jobs:
                 DOCKERFILE_PASSED=$((DOCKERFILE_PASSED + 1))
                 ;;
               1)
-                DOCKERFILE_STATUS="FAILED"
-                DOCKERFILE_FAILED=$((DOCKERFILE_FAILED + 1))
-                
+                # Exit code 1 means vulnerabilities found, but we need to check if they're new
+                # Compare with base image to determine if Dockerfile introduces new vulnerabilities
                 if [ "$BASE_STATUS" = "PASSED" ]; then
+                  # Base was clean but Dockerfile has vulnerabilities = Dockerfile introduced them
+                  DOCKERFILE_STATUS="FAILED"
                   DOCKERFILE_MSG="Dockerfile introduces new vulnerabilities"
                   DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "
+                  DOCKERFILE_FAILED=$((DOCKERFILE_FAILED + 1))
                 elif [ "$BASE_STATUS" = "FAILED" ]; then
+                  # Both have vulnerabilities - need to check if Dockerfile added more
                   base_total=$(echo "$BASE_VULN_SUMMARY" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
                   docker_total=$(echo "$DOCKERFILE_VULN_SUMMARY" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
-                  if [ "$docker_total" -gt "$base_total" ]; then
+                  
+                  # Also check individual severity counts for more accurate comparison
+                  base_critical=$(echo "$BASE_VULN_SUMMARY" | grep -o "[0-9]*C" | grep -o "[0-9]*" || echo "0")
+                  base_high=$(echo "$BASE_VULN_SUMMARY" | grep -o "[0-9]*H" | grep -o "[0-9]*" || echo "0")
+                  docker_critical=$(echo "$DOCKERFILE_VULN_SUMMARY" | grep -o "[0-9]*C" | grep -o "[0-9]*" || echo "0")
+                  docker_high=$(echo "$DOCKERFILE_VULN_SUMMARY" | grep -o "[0-9]*H" | grep -o "[0-9]*" || echo "0")
+                  
+                  if [ "$docker_total" -gt "$base_total" ] || [ "$docker_critical" -gt "$base_critical" ] || [ "$docker_high" -gt "$base_high" ]; then
+                    # Dockerfile introduces new vulnerabilities
+                    DOCKERFILE_STATUS="FAILED"
                     diff=$((docker_total - base_total))
                     DOCKERFILE_MSG="Dockerfile adds $diff new vulnerabilities to base image"
                     DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "
+                    DOCKERFILE_FAILED=$((DOCKERFILE_FAILED + 1))
                   else
-                    DOCKERFILE_MSG="Inherits vulnerabilities from base image"
+                    # Dockerfile only inherits base image vulnerabilities
+                    if [ "$DEBUG_MODE" = "true" ]; then
+                      # In debug mode, inherited vulnerabilities still fail
+                      DOCKERFILE_STATUS="FAILED"
+                      DOCKERFILE_MSG="Inherits base image vulnerabilities (Debug Mode)"
+                      DOCKERFILE_FAILED=$((DOCKERFILE_FAILED + 1))
+                    else
+                      # In normal mode, inherited vulnerabilities pass
+                      DOCKERFILE_STATUS="PASSED"
+                      DOCKERFILE_MSG="Inherits base image vulnerabilities only (no new issues)"
+                      DOCKERFILE_PASSED=$((DOCKERFILE_PASSED + 1))
+                    fi
                   fi
+                else
+                  # Base scan had an error, treat dockerfile scan as failed
+                  DOCKERFILE_STATUS="FAILED"
+                  DOCKERFILE_MSG="Unable to compare with base image"
+                  DOCKERFILE_FAILED=$((DOCKERFILE_FAILED + 1))
                 fi
                 ;;
               *)
@@ -286,6 +318,7 @@ jobs:
             echo "Dockerfile scan completed"
             echo "  Status: $DOCKERFILE_STATUS"
             echo "  Vulnerabilities: $DOCKERFILE_VULN_SUMMARY"
+            echo "  Message: $DOCKERFILE_MSG"
             
             # Build summary
             SCAN_SUMMARY="${SCAN_SUMMARY}=== $DIR ===\n"
@@ -294,7 +327,8 @@ jobs:
             SCAN_SUMMARY="${SCAN_SUMMARY}  Vulnerabilities: $BASE_VULN_SUMMARY\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}Full Dockerfile Scan:\n"
             SCAN_SUMMARY="${SCAN_SUMMARY}  Status: $DOCKERFILE_STATUS (Exit: ${DOCKERFILE_EXIT_CODE})\n"
-            SCAN_SUMMARY="${SCAN_SUMMARY}  Vulnerabilities: $DOCKERFILE_VULN_SUMMARY\n\n"
+            SCAN_SUMMARY="${SCAN_SUMMARY}  Vulnerabilities: $DOCKERFILE_VULN_SUMMARY\n"
+            SCAN_SUMMARY="${SCAN_SUMMARY}  Message: $DOCKERFILE_MSG\n\n"
           done
           
           # Count unique base images with issues
@@ -325,16 +359,13 @@ jobs:
               OVERALL_MSG="Unexpected state (Debug Mode)"
             fi
           else
+            # Normal mode: only fail on NEW vulnerabilities
             if [ $SCAN_ERRORS -gt 0 ]; then
               OVERALL_STATUS="ERROR"
               OVERALL_MSG="Scan errors encountered"
-            elif [ $DOCKERFILE_FAILED -gt 0 ]; then
+            elif [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
               OVERALL_STATUS="FAILED"
-              if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-                OVERALL_MSG="Security issues in: $DOCKERFILES_WITH_NEW_VULNS"
-              else
-                OVERALL_MSG="Dockerfile security issues found (inherited from base)"
-              fi
+              OVERALL_MSG="New vulnerabilities introduced in: $DOCKERFILES_WITH_NEW_VULNS"
             elif [ $DOCKERFILE_PASSED -eq $TOTAL_SCANNED ]; then
               OVERALL_STATUS="PASSED"
               if [ $BASE_FAILED -gt 0 ]; then
@@ -375,14 +406,10 @@ jobs:
           
           # Create Slack summary
           SLACK_SUMMARY=""
-          if [ $DOCKERFILE_FAILED -gt 0 ]; then
-            if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-              SLACK_SUMMARY="⚠️ New vulnerabilities in: $DOCKERFILES_WITH_NEW_VULNS"
-            else
-              SLACK_SUMMARY="⚠️ ${DOCKERFILE_FAILED} Dockerfile(s) inherit base image vulnerabilities"
-            fi
+          if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
+            SLACK_SUMMARY="⚠️ New vulnerabilities introduced in: $DOCKERFILES_WITH_NEW_VULNS"
           elif [ $BASE_FAILED -gt 0 ]; then
-            SLACK_SUMMARY="✅ All Dockerfiles clean (${BASE_FAILED} base image(s) have issues - informational)"
+            SLACK_SUMMARY="✅ All Dockerfiles clean (${BASE_FAILED} base image(s) have vulnerabilities - informational only)"
           else
             SLACK_SUMMARY="✅ All scans passed - no security issues found"
           fi
@@ -401,6 +428,7 @@ jobs:
           echo "slack_summary<<EOF" >> $GITHUB_OUTPUT
           echo "$SLACK_SUMMARY" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+          echo "dockerfiles_with_new_vulns=$DOCKERFILES_WITH_NEW_VULNS" >> $GITHUB_OUTPUT
           
           # Final status
           log_section "FINAL SCAN RESULTS"
@@ -423,10 +451,14 @@ jobs:
               exit 1
             fi
           else
-            if [ $DOCKERFILE_FAILED -gt 0 ] || [ $SCAN_ERRORS -gt 0 ]; then
+            # Normal mode: only fail on NEW vulnerabilities introduced by Dockerfiles
+            if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ] || [ $SCAN_ERRORS -gt 0 ]; then
               echo ""
-              echo "Workflow failed - Dockerfile security issues found"
+              echo "Workflow failed - Dockerfiles introduce new security issues"
               exit 1
+            else
+              echo ""
+              echo "Workflow passed - No new vulnerabilities introduced by Dockerfiles"
             fi
           fi
           SCRIPT_EOF
@@ -621,14 +653,10 @@ jobs:
                 if [ "$dockerfile_status" = "FAILED" ] && [ "$base_status" = "PASSED" ]; then
                   assessment="**Dockerfile introduces vulnerabilities**"
                 elif [ "$dockerfile_status" = "FAILED" ] && [ "$base_status" = "FAILED" ]; then
-                  base_total=$(echo "$base_vulns" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
-                  docker_total=$(echo "$dockerfile_vulns" | grep -o "Total: [0-9]*" | grep -o "[0-9]*" || echo "0")
-                  if [ "$docker_total" -gt "$base_total" ]; then
-                    assessment="**New vulnerabilities introduced**"
-                  else
-                    assessment="Inherits base image issues"
-                  fi
-                elif [ "$dockerfile_status" = "PASSED" ]; then
+                  assessment="**New vulnerabilities introduced**"
+                elif [ "$dockerfile_status" = "PASSED" ] && [ "$base_status" = "FAILED" ]; then
+                  assessment="Inherits base image issues only"
+                elif [ "$dockerfile_status" = "PASSED" ] && [ "$base_status" = "PASSED" ]; then
                   assessment="Clean - no issues"
                 else
                   assessment="Check logs"
@@ -704,13 +732,14 @@ jobs:
             done
             echo ""
             
-            if [ "$OVERALL_STATUS" = "FAILED" ] || ([ "$DEBUG_MODE" = "true" ] && [ $BASE_FAILED -gt 0 ]); then
+            if [ "$OVERALL_STATUS" = "FAILED" ] || ([ "$DEBUG_MODE" = "true" ] && [ $DOCKERFILE_FAILED -gt 0 ]); then
               echo "## ⚠️ Action Required"
               echo ""
               
-              if [ $DOCKERFILE_FAILED -gt 0 ]; then
-                echo "### Dockerfile Issues:"
-                echo "One or more Dockerfiles are introducing security vulnerabilities."
+              if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
+                echo "### New Vulnerabilities Detected:"
+                echo "The following Dockerfiles are introducing new security vulnerabilities:"
+                echo "**$DOCKERFILES_WITH_NEW_VULNS**"
                 echo ""
                 echo "**Recommended Actions:**"
                 echo "1. Review the vulnerability details above"
@@ -718,18 +747,20 @@ jobs:
                 echo "3. Consider using more secure base images"
                 echo "4. Re-run the scan after making changes"
                 echo ""
-              fi
-              
-              if [ "$DEBUG_MODE" = "true" ] && [ $BASE_FAILED -gt 0 ]; then
-                echo "### Base Image Issues (Debug Mode):"
-                echo "Base images contain vulnerabilities. In normal mode, these are informational only."
+              elif [ "$DEBUG_MODE" = "true" ] && [ $DOCKERFILE_FAILED -gt 0 ]; then
+                echo "### Debug Mode - Inherited Vulnerabilities:"
+                echo "Some Dockerfiles inherit vulnerabilities from their base images."
+                echo "In normal mode, these would not cause build failure."
                 echo ""
               fi
             elif [ $BASE_FAILED -gt 0 ]; then
               echo "## 📋 Recommendations"
               echo ""
-              echo "While your Dockerfiles are clean, the base images contain vulnerabilities."
-              echo "Consider updating to newer base image versions when available."
+              echo "While your Dockerfiles are clean and don't introduce new vulnerabilities,"
+              echo "the base images contain security issues. Consider:"
+              echo "- Updating to newer base image versions when available"
+              echo "- Using alternative base images with fewer vulnerabilities"
+              echo "- Monitoring for base image updates regularly"
               echo ""
             fi
             
@@ -754,7 +785,7 @@ jobs:
           always() && (
             (github.event.inputs.debug == 'true') ||
             (github.event_name == 'schedule' && steps.scan.outputs.overall_status != 'PASSED') ||
-            (github.event_name != 'schedule' && steps.scan.outputs.dockerfile_failed != '0')
+            (github.event_name != 'schedule' && steps.scan.outputs.dockerfiles_with_new_vulns != '')
           )
         continue-on-error: true
         uses: 8398a7/action-slack@v3
