@@ -695,35 +695,39 @@ jobs:
                   BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"
                   TOTAL_CRIT_HIGH=$(get_vulnerability_count "$BASE_SCAN_JSON" "total")
                   
-                  echo "<details>"
-                  echo "<summary><strong>$base_image_name</strong> - $total vulnerabilities ($critical critical, $high high)</summary>"
+                  echo "### $base_image_name"
+                  echo "**$total vulnerabilities detected** ($critical critical, $high high)"
                   echo ""
                   
+                  # Always show top 10 vulnerabilities (not expandable)
                   TOP_10_VULNS=$(get_top_vulnerabilities "$BASE_SCAN_JSON" 10)
                   if [ -n "$TOP_10_VULNS" ]; then
                     echo "**Top 10 Vulnerabilities (by CVSS Score):**"
                     echo "\`\`\`"
                     echo "$TOP_10_VULNS"
                     echo "\`\`\`"
+                    echo ""
                     
+                    # Only show expandable section for remaining vulnerabilities if there are more than 10
                     if [ "$TOTAL_CRIT_HIGH" -gt 10 ]; then
                       REMAINING_COUNT=$((TOTAL_CRIT_HIGH - 10))
                       REMAINING_VULNS=$(get_remaining_vulnerabilities "$BASE_SCAN_JSON" 10)
                       if [ -n "$REMAINING_VULNS" ]; then
-                        echo ""
                         echo "<details>"
-                        echo "<summary>Show Remaining $REMAINING_COUNT Vulnerabilities</summary>"
+                        echo "<summary><strong>▼ Show Remaining $REMAINING_COUNT Vulnerabilities</strong></summary>"
                         echo ""
                         echo "\`\`\`"
                         echo "$REMAINING_VULNS"
                         echo "\`\`\`"
+                        echo ""
                         echo "</details>"
+                        echo ""
                       fi
                     fi
+                  else
+                    echo "**Vulnerability details not available in scan results.**"
+                    echo ""
                   fi
-                  echo ""
-                  echo "</details>"
-                  echo ""
                 fi
               done
               
