@@ -843,43 +843,52 @@ jobs:
               echo "The following Dockerfiles introduce new critical/high vulnerabilities:"
               echo "**$DOCKERFILES_WITH_NEW_VULNS**"
               echo ""
-              echo "**Recommended Actions:**"
-              echo "1. Review the vulnerability details above"
+              echo "**Required Actions:**"
+              echo "1. Review the new vulnerability details above"
               echo "2. Update vulnerable packages in your Dockerfiles"
               echo "3. Consider using alternative packages without known vulnerabilities"
               echo "4. Re-run the scan after making changes"
+              echo ""
+              echo "**Build Status:** ❌ BLOCKED until resolved"
             elif [ "$OVERALL_STATUS" = "WARNING" ]; then
               echo "### Advisory"
               echo ""
-              echo "While no critical/high vulnerabilities were introduced, some Dockerfiles add medium/low severity issues."
+              echo "Dockerfiles introduce only medium/low severity vulnerabilities."
               echo "Consider reviewing and updating these when possible."
+              echo ""
+              echo "**Build Status:** ✅ ALLOWED (no critical/high vulnerabilities)"
             elif [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
               echo "### Base Image Advisory"
               echo ""
-              echo "**Good News:** Your Dockerfiles are clean and don't introduce new vulnerabilities."
+              echo "**Build Status:** ✅ PASSED - Your Dockerfiles are clean"
               echo ""
-              echo "**Advisory:** The base images contain vulnerabilities that should be addressed upstream."
+              echo "**Base Image Considerations:**"
+              echo "- Update to newer base image versions when available"
+              echo "- Monitor security advisories for base image updates"
+              echo "- Consider implementing automated base image update policies"
               echo ""
-              echo "**Recommended Actions:**"
-              echo "- Check for updated base image versions (newer tags may have security fixes)"
-              echo "- Use alternative base images with fewer vulnerabilities"  
-              echo "- Implement regular base image updates in your CI/CD pipeline"
-              echo "- Work with base image maintainers (Red Hat UBI team) to address vulnerabilities"
-              echo "- Monitor security advisories for your base images"
-              echo ""
-              echo "**Current Base Image:** \`registry.access.redhat.com/ubi9/python-311:9.5-1741671866\`"
-              echo ""
-              echo "**Next Steps:**"
-              echo "1. Check if newer UBI9 Python 3.11 images are available"
-              echo "2. Review Red Hat security advisories for updates"
-              echo "3. Consider setting up automated base image updates"
+              
+              # Dynamically show current base image(s) and their vulnerability counts
+              for key in "${!BASE_IMAGE_RESULTS[@]}"; do
+                IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
+                base_image_name="${BASE_IMAGE_NAMES[$key]}"
+                if [ -z "$base_image_name" ]; then
+                  base_image_name=$(echo "$key" | sed 's/_/\//g' | sed 's/\//:/2')
+                fi
+                
+                if [ "$total" -gt 0 ]; then
+                  echo "**Current Base Image:** \`$base_image_name\`"
+                  echo "- **Detected vulnerabilities:** $total ($critical critical, $high high, $medium medium, $low low)"
+                  echo ""
+                fi
+              done
             else
               echo "### Excellent Security Posture"
               echo ""
-              echo "No vulnerabilities detected in either Dockerfiles or base images."
+              echo "**Build Status:** ✅ PASSED - No vulnerabilities detected"
               echo ""
-              echo "**Continue to:**"
-              echo "- Run regular security scans"
+              echo "**Maintain Security:**"
+              echo "- Continue running regular security scans"
               echo "- Keep dependencies updated"
               echo "- Monitor for new vulnerabilities"
             fi
@@ -904,10 +913,8 @@ jobs:
       - name: Slack Notification
         if: |
           always() && 
-          github.event_name != 'pull_request' && (
-            (github.event.inputs.debug == 'true' && steps.scan.outputs.overall_status != 'PASSED') ||
-            (github.event.inputs.debug != 'true' && steps.scan.outputs.dockerfile_failures_exist == 'true')
-          )
+          github.event_name != 'pull_request' && 
+          steps.scan.outputs.dockerfile_failures_exist == 'true'
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
@@ -926,8 +933,8 @@ jobs:
                       "short": true
                     },
                     {
-                      "title": "Mode",
-                      "value": "${{ github.event.inputs.debug == 'true' && 'Debug' || 'Normal' }}",
+                      "title": "Repository",
+                      "value": "${{ github.repository }}",
                       "short": true
                     },
                     {
@@ -941,17 +948,22 @@ jobs:
                       "short": true
                     },
                     {
-                      "title": "Base Image Analysis", 
-                      "value": "${{ steps.scan.outputs.base_issues_count }} base image(s) with vulnerabilities (report-only)",
+                      "title": "Base Image Security", 
+                      "value": "${{ steps.scan.outputs.base_total_count }} vulnerabilities detected (${{ steps.scan.outputs.base_critical_count }} critical, ${{ steps.scan.outputs.base_high_count }} high) - report-only",
                       "short": true
                     },
                     {
-                      "title": "View Details",
-                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Full Report>",
+                      "title": "Action Required",
+                      "value": "Review Dockerfile vulnerabilities and update packages before merge",
+                      "short": false
+                    },
+                    {
+                      "title": "View Full Security Report",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Click here for detailed vulnerability analysis and recommendations>",
                       "short": false
                     }
                   ],
-                  "footer": "Snyk Container Security",
+                  "footer": "Snyk Container Security | Only notifies on Dockerfile failures",
                   "footer_icon": "https://res.cloudinary.com/snyk/image/upload/v1537345894/press-kit/brand/logo-black.png",
                   "ts": ${{ github.event.head_commit.timestamp && 'new Date(github.event.head_commit.timestamp).getTime() / 1000' || 'Math.floor(Date.now() / 1000)' }}
                 }
