@@ -1,4 +1,17 @@
 name: Snyk Dockerfile Security Scan
+# 
+# This workflow scans Dockerfiles and base images for security vulnerabilities using Snyk.
+# 
+# Scope:
+# - ✅ Container/base image vulnerabilities (Snyk)
+# - ✅ Dockerfile security issues (Snyk) 
+# - ✅ Training environment Dockerfiles only
+#
+# Triggers:
+# - 🌙 Nightly at 3:00 UTC (catches new CVEs retroactively)
+# - 🔄 Pull requests (with 'safe-to-test' label for security)
+# - 📝 Push to main branch with Dockerfile changes
+# - 🎛️ Manual dispatch with debug options
 
 on:
   push:
