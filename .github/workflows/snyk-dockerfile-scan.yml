@@ -30,7 +30,7 @@ on:
 
 jobs:
   snyk-dockerfile-scan:
-    name: Snyk Security Scan
+    name: Snyk Dockerfile Security Scan
     runs-on: ubuntu-latest
     if: >
       github.event_name != 'pull_request_target' || 
@@ -443,9 +443,9 @@ jobs:
           if [ -f "$RESULTS_DIR/scan_state.env" ]; then
             source "$RESULTS_DIR/scan_state.env"
           else
-            echo "# 🔒 Snyk Dockerfile Security Scan Results" >> $GITHUB_STEP_SUMMARY
+            echo "# Snyk Dockerfile Security Scan Results" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "## ⚠️ Scan Failed" >> $GITHUB_STEP_SUMMARY
+            echo "## Scan Failed" >> $GITHUB_STEP_SUMMARY
             echo "The security scan encountered an error. Please check the logs for details." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
@@ -490,7 +490,7 @@ jobs:
           
           # Generate GitHub Step Summary
           {
-            echo "# 🔒 Snyk Dockerfile Security Scan Results"
+            echo "# Snyk Dockerfile Security Scan Results"
             echo ""
             
             # Executive Summary
@@ -511,7 +511,7 @@ jobs:
                 echo "> Dockerfiles introduce new critical/high vulnerabilities that must be addressed"
                 ;;
               "ERROR") 
-                echo "### 🚨 Status: ERROR"
+                echo "### Status: ERROR"
                 echo "> Scan encountered errors - check logs for details"
                 ;;
             esac
@@ -527,7 +527,7 @@ jobs:
             echo ""
             
             # Dockerfile Scan Results
-            echo "## 🐳 Dockerfile Scan Results"
+            echo "## Dockerfile Scan Results"
             echo "> These results determine the build pass/fail status"
             echo ""
             
@@ -542,7 +542,7 @@ jobs:
                   "PASSED") icon="✅" ;;
                   "WARNING") icon="⚠️" ;;
                   "FAILED") icon="❌" ;;
-                  *) icon="🚨" ;;
+                  *) icon="ERROR" ;;
                 esac
                 
                 echo "| **$DIR** | $icon $status | $msg | C:$critical H:$high M:$medium L:$low |"
@@ -551,7 +551,7 @@ jobs:
             echo ""
             
             # Base Image Security Status
-            echo "## 📦 Base Image Security Status"
+            echo "## Base Image Security Status"
             echo "> **Note:** Base image vulnerabilities are report-only and do not fail the build"
             echo "> Showing all vulnerabilities at High severity threshold and above"
             echo ""
@@ -562,30 +562,40 @@ jobs:
             # Display unique base images with their vulnerability data
             declare -A DISPLAYED_IMAGES
             
-            for key in "${!BASE_IMAGE_RESULTS[@]}"; do
-              if [ -z "${DISPLAYED_IMAGES[$key]}" ]; then
-                DISPLAYED_IMAGES[$key]="1"
-                IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
-                base_image_name="${BASE_IMAGE_NAMES[$key]}"
-                
-                if [ "$total" -eq 0 ]; then
-                  echo "| $base_image_name | ✅ Clean | No vulnerabilities |"
-                else
-                  # Determine icon based on severity
-                  if [ "$critical" -gt 0 ] || [ "$high" -gt 0 ]; then
-                    icon="⚠️"
-                  else
-                    icon="ℹ️"
+            # Debug: Check if we have any base image results
+            if [ ${#BASE_IMAGE_RESULTS[@]} -eq 0 ]; then
+              echo "| No base images scanned | ERROR | Data not available |"
+            else
+              for key in "${!BASE_IMAGE_RESULTS[@]}"; do
+                if [ -z "${DISPLAYED_IMAGES[$key]}" ]; then
+                  DISPLAYED_IMAGES[$key]="1"
+                  IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
+                  base_image_name="${BASE_IMAGE_NAMES[$key]}"
+                  
+                  # Handle missing base image name
+                  if [ -z "$base_image_name" ]; then
+                    base_image_name=$(echo "$key" | sed 's/_/\//g' | sed 's/\//:/2')
                   fi
-                  echo "| $base_image_name | $icon $total vulnerabilities | C:$critical H:$high M:$medium L:$low |"
+                  
+                  if [ "$total" -eq 0 ]; then
+                    echo "| \`$base_image_name\` | ✅ Clean | No vulnerabilities |"
+                  else
+                    # Determine icon based on severity
+                    if [ "$critical" -gt 0 ] || [ "$high" -gt 0 ]; then
+                      icon="⚠️"
+                    else
+                      icon="INFO"
+                    fi
+                    echo "| \`$base_image_name\` | $icon **$total vulnerabilities** | Critical: **$critical** \\| High: **$high** \\| Medium: **$medium** \\| Low: **$low** |"
+                  fi
                 fi
-              fi
-            done
+              done
+            fi
             echo ""
             
             # Base Image Vulnerability Details
             if [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
-              echo "### 📋 Base Image Vulnerability Details"
+              echo "### Base Image Vulnerability Details"
               echo "> Detailed breakdown of vulnerabilities found in base images"
               echo ""
               
@@ -593,19 +603,41 @@ jobs:
                 IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
                 if [ "$total" -gt 0 ]; then
                   base_image_name="${BASE_IMAGE_NAMES[$key]}"
+                  
+                  # Handle missing base image name
+                  if [ -z "$base_image_name" ]; then
+                    base_image_name=$(echo "$key" | sed 's/_/\//g' | sed 's/\//:/2')
+                  fi
+                  
                   BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"
                   
                   echo "<details>"
-                  echo "<summary>**$base_image_name** - $total vulnerabilities (Critical: $critical, High: $high, Medium: $medium, Low: $low)</summary>"
+                  echo "<summary><strong>$base_image_name</strong> - $total vulnerabilities (Critical: $critical, High: $high, Medium: $medium, Low: $low)</summary>"
                   echo ""
                   
                   TOP_VULNS=$(get_top_vulnerabilities "$BASE_SCAN_JSON" 10)
                   if [ -n "$TOP_VULNS" ]; then
                     echo "**Top Critical/High Vulnerabilities:**"
                     echo ""
+                    echo "\`\`\`"
                     echo "$TOP_VULNS"
+                    echo "\`\`\`"
+                    echo ""
+                    echo "**Summary:**"
+                    echo "- Critical vulnerabilities: $critical"
+                    echo "- High vulnerabilities: $high" 
+                    echo "- Medium vulnerabilities: $medium"
+                    echo "- Low vulnerabilities: $low"
+                    echo "- Total unique vulnerabilities: $total"
                   else
-                    echo "No detailed vulnerability information available for critical/high severity issues."
+                    echo "**Vulnerability Summary:**"
+                    echo "- Critical vulnerabilities: $critical"
+                    echo "- High vulnerabilities: $high"
+                    echo "- Medium vulnerabilities: $medium" 
+                    echo "- Low vulnerabilities: $low"
+                    echo "- Total unique vulnerabilities: $total"
+                    echo ""
+                    echo "Detailed vulnerability information is not available in the scan results."
                   fi
                   
                   echo ""
@@ -617,14 +649,14 @@ jobs:
             
             # New Vulnerability Details from Dockerfiles
             if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-              echo "## 🔍 New Vulnerability Details"
+              echo "## New Vulnerability Details"
               echo "> Vulnerabilities introduced by Dockerfiles (not present in base images)"
               echo ""
               
               for DIR in ${DOCKERFILES_WITH_NEW_VULNS//,/ }; do
                 DIR=$(echo "$DIR" | xargs)  # Trim whitespace
                 if [ -n "${VULNERABILITY_DETAILS[$DIR]}" ]; then
-                  echo "### 📋 $DIR"
+                  echo "### $DIR"
                   echo ""
                   echo "${VULNERABILITY_DETAILS[$DIR]}"
                   echo ""
@@ -633,11 +665,11 @@ jobs:
             fi
             
             # Recommendations
-            echo "## 💡 Recommendations"
+            echo "## Recommendations"
             echo ""
             
             if [ "$OVERALL_STATUS" = "FAILED" ]; then
-              echo "### ⚠️ Action Required"
+              echo "### Action Required"
               echo ""
               echo "The following Dockerfiles introduce new critical/high vulnerabilities:"
               echo "**$DOCKERFILES_WITH_NEW_VULNS**"
@@ -648,22 +680,32 @@ jobs:
               echo "3. Consider using alternative packages without known vulnerabilities"
               echo "4. Re-run the scan after making changes"
             elif [ "$OVERALL_STATUS" = "WARNING" ]; then
-              echo "### 📋 Advisory"
+              echo "### Advisory"
               echo ""
               echo "While no critical/high vulnerabilities were introduced, some Dockerfiles add medium/low severity issues."
               echo "Consider reviewing and updating these when possible."
             elif [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
-              echo "### 📋 Base Image Advisory"
+              echo "### Base Image Advisory"
               echo ""
-              echo "Your Dockerfiles are clean, but the base images contain vulnerabilities."
+              echo "**Good News:** Your Dockerfiles are clean and don't introduce new vulnerabilities."
               echo ""
-              echo "**Consider:**"
-              echo "- Checking for updated base image versions"
-              echo "- Using alternative base images with fewer vulnerabilities"  
-              echo "- Implementing regular base image updates"
-              echo "- Working with base image maintainers to address vulnerabilities"
+              echo "**Advisory:** The base images contain vulnerabilities that should be addressed upstream."
+              echo ""
+              echo "**Recommended Actions:**"
+              echo "- Check for updated base image versions (newer tags may have security fixes)"
+              echo "- Use alternative base images with fewer vulnerabilities"  
+              echo "- Implement regular base image updates in your CI/CD pipeline"
+              echo "- Work with base image maintainers (Red Hat UBI team) to address vulnerabilities"
+              echo "- Monitor security advisories for your base images"
+              echo ""
+              echo "**Current Base Image:** \`registry.access.redhat.com/ubi9/python-311:9.5-1741671866\`"
+              echo ""
+              echo "**Next Steps:**"
+              echo "1. Check if newer UBI9 Python 3.11 images are available"
+              echo "2. Review Red Hat security advisories for updates"
+              echo "3. Consider setting up automated base image updates"
             else
-              echo "### ✅ Excellent Security Posture"
+              echo "### Excellent Security Posture"
               echo ""
               echo "No vulnerabilities detected in either Dockerfiles or base images."
               echo ""
@@ -707,7 +749,7 @@ jobs:
               "attachments": [
                 {
                   "color": "${{ steps.scan.outputs.overall_status == 'PASSED' && 'good' || steps.scan.outputs.overall_status == 'WARNING' && 'warning' || 'danger' }}",
-                  "title": "${{ steps.scan.outputs.overall_status == 'PASSED' && '✅ Snyk Security Scan Passed' || steps.scan.outputs.overall_status == 'WARNING' && '⚠️ Snyk Security Scan Warning' || steps.scan.outputs.overall_status == 'ERROR' && '🚨 Snyk Security Scan Error' || '❌ Snyk Security Scan Failed' }}",
+                  "title": "${{ steps.scan.outputs.overall_status == 'PASSED' && 'Snyk Security Scan Passed' || steps.scan.outputs.overall_status == 'WARNING' && 'Snyk Security Scan Warning' || steps.scan.outputs.overall_status == 'ERROR' && 'Snyk Security Scan Error' || 'Snyk Security Scan Failed' }}",
                   "fields": [
                     {
                       "title": "Status",
@@ -726,7 +768,7 @@ jobs:
                     },
                     {
                       "title": "Dockerfile Analysis",
-                      "value": "✅ Clean: ${{ steps.scan.outputs.dockerfile_clean_count }}\n⚠️ New Medium/Low: ${{ steps.scan.outputs.dockerfile_warning_count }}\n❌ New Critical/High: ${{ steps.scan.outputs.dockerfile_failed_count }}\n🚨 Errors: ${{ steps.scan.outputs.scan_errors_count }}",
+                      "value": "Clean: ${{ steps.scan.outputs.dockerfile_clean_count }}\nNew Medium/Low: ${{ steps.scan.outputs.dockerfile_warning_count }}\nNew Critical/High: ${{ steps.scan.outputs.dockerfile_failed_count }}\nErrors: ${{ steps.scan.outputs.scan_errors_count }}",
                       "short": true
                     },
                     {
