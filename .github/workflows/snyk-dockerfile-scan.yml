@@ -187,10 +187,19 @@ jobs:
               # Use precise signature matching to identify truly NEW vulnerabilities
               BASE_VULN_SIGS=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")
               
-              NEW_CRITICAL=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "critical")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-              NEW_HIGH=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "high")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-              NEW_MEDIUM=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "medium")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-              NEW_LOW=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              if [ -z "$BASE_VULN_SIGS" ]; then
+                # No base vulnerabilities to filter against - count all Dockerfile vulnerabilities as new
+                NEW_CRITICAL=$(jq '[.vulnerabilities[]? | select(.severity == "critical")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+                NEW_HIGH=$(jq '[.vulnerabilities[]? | select(.severity == "high")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+                NEW_MEDIUM=$(jq '[.vulnerabilities[]? | select(.severity == "medium")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+                NEW_LOW=$(jq '[.vulnerabilities[]? | select(.severity == "low")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              else
+                # Filter out base image vulnerabilities and count what's truly new
+                NEW_CRITICAL=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "critical")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+                NEW_HIGH=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "high")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+                NEW_MEDIUM=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "medium")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+                NEW_LOW=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              fi
               NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
             else
               NEW_CRITICAL=0; NEW_HIGH=0; NEW_MEDIUM=0; NEW_LOW=0; NEW_TOTAL=0
@@ -343,29 +352,33 @@ jobs:
             local base_vuln_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$base_json" 2>/dev/null || echo "")
             
             # Count NEW vulnerabilities by severity, ensuring complete segregation from base image
-            case "$severity" in
-              "all") 
-                jq -r --arg base_sigs "$base_vuln_sigs" '
-                  [.vulnerabilities[]?] 
-                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | 
-                      if ($base_sigs == "") then true 
-                      else ($base_sigs | split(",") | index($sig) | not) end))
-                  | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-              "total") 
-                jq -r --arg base_sigs "$base_vuln_sigs" '
-                  [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
-                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | 
-                      if ($base_sigs == "") then true 
-                      else ($base_sigs | split(",") | index($sig) | not) end))
-                  | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-              *) 
-                jq -r --arg sev "$severity" --arg base_sigs "$base_vuln_sigs" '
-                  [.vulnerabilities[]? | select(.severity == $sev)] 
-                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | 
-                      if ($base_sigs == "") then true 
-                      else ($base_sigs | split(",") | index($sig) | not) end))
-                  | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-            esac
+            if [ -z "$base_vuln_sigs" ]; then
+              # No base vulnerabilities to filter against - count all vulnerabilities
+              case "$severity" in
+                "all") jq '[.vulnerabilities[]?] | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
+                "total") jq '[.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
+                *) jq --arg sev "$severity" '[.vulnerabilities[]? | select(.severity == $sev)] | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
+              esac
+            else
+              # Filter out base image vulnerabilities and count
+              case "$severity" in
+                "all") 
+                  jq -r --arg base_sigs "$base_vuln_sigs" '
+                    [.vulnerabilities[]?] 
+                    | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
+                    | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
+                "total") 
+                  jq -r --arg base_sigs "$base_vuln_sigs" '
+                    [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
+                    | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
+                    | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
+                *) 
+                  jq -r --arg sev "$severity" --arg base_sigs "$base_vuln_sigs" '
+                    [.vulnerabilities[]? | select(.severity == $sev)] 
+                    | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
+                    | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
+              esac
+            fi
           }
           
           # Read results
