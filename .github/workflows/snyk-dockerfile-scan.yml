@@ -364,8 +364,6 @@ jobs:
           {
             echo "# Snyk Dockerfile Security Scan Results"
             echo ""
-            echo "## Executive Summary"
-            echo ""
             case "$OVERALL_STATUS" in
               "PASSED") echo "**Status:** PASSED"; echo ""; echo "All Dockerfiles are clean - no new critical or high severity vulnerabilities introduced." ;;
               "WARNING") echo "**Status:** WARNING"; echo ""; echo "Dockerfiles introduce only medium or low severity vulnerabilities." ;;
@@ -440,7 +438,13 @@ jobs:
             
             # Dockerfile security analysis
             echo "## Dockerfile Security Analysis"
-            echo ""; echo "Detailed security analysis for each Dockerfile showing inherited and newly introduced vulnerabilities:"; echo ""
+            echo ""; echo "Detailed security analysis for each Dockerfile showing inherited and newly introduced vulnerabilities:"
+            echo ""
+            echo "**Scan Configuration:**"
+            echo "- Snyk Version: ${SNYK_VERSION}"
+            echo "- Scan Threshold: High severity and above"
+            echo "- Base Image: $([ -f "images/runtime/training/${TARGET_DIRS[0]}/Dockerfile" ] && grep -m 1 "^FROM" "images/runtime/training/${TARGET_DIRS[0]}/Dockerfile" | awk '{print $2}' | sed 's/ AS .*//g' 2>/dev/null || echo "Multiple base images")"
+            echo ""
             
             for DIR in "${TARGET_DIRS[@]}"; do
               if [ -n "${DOCKERFILE_RESULTS[$DIR]}" ]; then
@@ -490,23 +494,22 @@ jobs:
                 if [ -f "$FULL_SCAN_JSON" ]; then
                   echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
                   
-                  if [ $NEW_VULN_COUNT -gt 0 ]; then
-                    ALL_NEW_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
-                    if [ -n "$ALL_NEW_VULNS" ]; then
-                      echo "\`\`\`"; echo "$ALL_NEW_VULNS"; echo "\`\`\`"; echo ""
-                    else
-                      echo "\`\`\`"; echo "No vulnerabilities detected that are specifically introduced by this Dockerfile."; echo "\`\`\`"; echo ""
-                    fi
+                  # Always attempt to get vulnerabilities specific to this Dockerfile
+                  ALL_NEW_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
+                  
+                  if [ -n "$ALL_NEW_VULNS" ] && [ "$ALL_NEW_VULNS" != "" ]; then
+                    # This Dockerfile has specific vulnerabilities - show them
+                    echo "\`\`\`"; echo "$ALL_NEW_VULNS"; echo "\`\`\`"; echo ""
                   else
+                    # This specific Dockerfile introduces no new vulnerabilities
                     echo "\`\`\`"; echo "No new vulnerabilities - This Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."; echo "\`\`\`"; echo ""
                   fi
                   echo "**Scan Details:**"
-                  echo "- Base Image: $(grep -m 1 "^FROM" "$DOCKERFILE_PATH" | awk '{print $2}' | sed 's/ AS .*//g' 2>/dev/null || echo "Unknown")"
-                  echo "- Snyk Version: ${SNYK_VERSION}"; echo "- Scan Threshold: High severity and above"; echo ""
+                  echo "- Dockerfile Path: $DOCKERFILE_PATH"
+                  echo ""
                 else
                   echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
                   echo "\`\`\`"; echo "Scan data unavailable - Unable to determine Dockerfile-specific vulnerabilities."; echo "\`\`\`"; echo ""
-                  echo "**Scan Details:**"; echo "- Scan Status: No scan data available"; echo ""
                 fi
                 echo "</details>"; echo ""
               fi
