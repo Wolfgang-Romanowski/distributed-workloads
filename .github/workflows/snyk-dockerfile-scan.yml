@@ -160,11 +160,11 @@ jobs:
             BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
             BASE_IMAGE_NAMES[$BASE_SCAN_KEY]="$BASE_IMAGE"
             
-            # Base image scan
+            # Base image scan - get ALL vulnerabilities for proper segregation
             if [ -z "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}" ]; then
               echo "Scanning base image: $BASE_IMAGE"
               set +e
-              snyk container test "$BASE_IMAGE" --json --severity-threshold=high > "$BASE_SCAN_JSON" 2>/dev/null
+              snyk container test "$BASE_IMAGE" --json > "$BASE_SCAN_JSON" 2>/dev/null
               BASE_EXIT_CODE=$?
               set -e
               IFS='|' read -r base_critical base_high base_medium base_low base_total <<< "$(get_vuln_counts "$BASE_SCAN_JSON")"
@@ -174,11 +174,11 @@ jobs:
               IFS='|' read -r BASE_EXIT_CODE base_critical base_high base_medium base_low base_total <<< "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}"
             fi
             
-            # Dockerfile scan
+            # Dockerfile scan - get ALL vulnerabilities and additional Snyk insights
             FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"
             echo "Scanning Dockerfile: $DIR"
             set +e
-            snyk container test "$BASE_IMAGE" --file="$DOCKERFILE" --json --severity-threshold=high > "$FULL_SCAN_JSON" 2>/dev/null
+            snyk container test "$BASE_IMAGE" --file="$DOCKERFILE" --json > "$FULL_SCAN_JSON" 2>/dev/null
             set -e
             IFS='|' read -r docker_critical docker_high docker_medium docker_low docker_total <<< "$(get_vuln_counts "$FULL_SCAN_JSON")"
             
@@ -489,8 +489,9 @@ jobs:
             echo ""
             echo "**Scan Configuration:**"
             echo "- Snyk Version: ${SNYK_VERSION}"
-            echo "- Scan Threshold: High severity and above"
+            echo "- Scan Scope: All severities (Critical, High, Medium, Low)"
             echo "- Scan Date: $(date -u '+%B %d, %Y at %H:%M UTC')"
+            echo "- Analysis: Full Snyk container scan with base image recommendations"
             
             # Dynamically detect unique base images
             UNIQUE_BASE_IMAGES=()
