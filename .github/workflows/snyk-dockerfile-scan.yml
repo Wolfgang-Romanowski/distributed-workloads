@@ -428,7 +428,11 @@ jobs:
               for DIR in ${DOCKERFILES_WITH_NEW_VULNS//,/ }; do
                 DIR=$(echo "$DIR" | xargs)
                 if [ -n "${VULNERABILITY_DETAILS[$DIR]}" ]; then
-                  echo "### $DIR"; echo ""; echo "\`\`\`"; echo "${VULNERABILITY_DETAILS[$DIR]}"; echo "\`\`\`"; echo ""
+                  echo "### $DIR"; echo ""
+                  echo "\`\`\`"; echo "${VULNERABILITY_DETAILS[$DIR]}"; echo "\`\`\`"; echo ""
+                else
+                  echo "### $DIR"; echo ""
+                  echo "\`\`\`"; echo "Critical/high vulnerabilities detected but detailed information unavailable."; echo "\`\`\`"; echo ""
                 fi
               done
               echo "### Required Actions"; echo ""; echo "1. Update vulnerable packages in the affected Dockerfiles"; echo "2. Consider alternative packages without known vulnerabilities"; echo "3. Re-run the scan after making changes"; echo ""
@@ -484,22 +488,25 @@ jobs:
                 echo ""
                 
                 if [ -f "$FULL_SCAN_JSON" ]; then
+                  echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
+                  
                   if [ $NEW_VULN_COUNT -gt 0 ]; then
-                    echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
                     ALL_NEW_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
                     if [ -n "$ALL_NEW_VULNS" ]; then
                       echo "\`\`\`"; echo "$ALL_NEW_VULNS"; echo "\`\`\`"; echo ""
                     else
-                      echo "No vulnerabilities found that are specifically introduced by this Dockerfile."; echo ""
+                      echo "\`\`\`"; echo "No vulnerabilities detected that are specifically introduced by this Dockerfile."; echo "\`\`\`"; echo ""
                     fi
                   else
-                    echo "**New Vulnerabilities:** None"; echo ""; echo "This Dockerfile does not introduce any new vulnerabilities beyond those inherited from the base image."; echo ""
+                    echo "\`\`\`"; echo "No new vulnerabilities - This Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."; echo "\`\`\`"; echo ""
                   fi
                   echo "**Scan Details:**"
                   echo "- Base Image: $(grep -m 1 "^FROM" "$DOCKERFILE_PATH" | awk '{print $2}' | sed 's/ AS .*//g' 2>/dev/null || echo "Unknown")"
                   echo "- Snyk Version: ${SNYK_VERSION}"; echo "- Scan Threshold: High severity and above"; echo ""
                 else
-                  echo "**Scan Results:** No scan data available"; echo ""
+                  echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
+                  echo "\`\`\`"; echo "Scan data unavailable - Unable to determine Dockerfile-specific vulnerabilities."; echo "\`\`\`"; echo ""
+                  echo "**Scan Details:**"; echo "- Scan Status: No scan data available"; echo ""
                 fi
                 echo "</details>"; echo ""
               fi
