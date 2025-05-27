@@ -182,20 +182,39 @@ jobs:
             set -e
             IFS='|' read -r docker_critical docker_high docker_medium docker_low docker_total <<< "$(get_vuln_counts "$FULL_SCAN_JSON")"
             
-            # Analyze results using improved NEW vulnerability detection
-            # Calculate NEW vulnerabilities using signature-based filtering instead of simple arithmetic
-            NEW_CRITICAL=$(jq -r --arg base_sigs "$([ -f "$BASE_SCAN_JSON" ] && jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")" '[.vulnerabilities[]? | select(.severity == "critical")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-            NEW_HIGH=$(jq -r --arg base_sigs "$([ -f "$BASE_SCAN_JSON" ] && jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")" '[.vulnerabilities[]? | select(.severity == "high")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-            NEW_MEDIUM=$(jq -r --arg base_sigs "$([ -f "$BASE_SCAN_JSON" ] && jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")" '[.vulnerabilities[]? | select(.severity == "medium")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-            NEW_LOW=$(jq -r --arg base_sigs "$([ -f "$BASE_SCAN_JSON" ] && jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-            NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
+            # Analyze results using signature-based NEW vulnerability detection for complete segregation
+            if [ -f "$BASE_SCAN_JSON" ] && [ -f "$FULL_SCAN_JSON" ]; then
+              # Use precise signature matching to identify truly NEW vulnerabilities
+              BASE_VULN_SIGS=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")
+              
+              NEW_CRITICAL=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "critical")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              NEW_HIGH=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "high")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              NEW_MEDIUM=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "medium")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              NEW_LOW=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | if ($base_sigs == "") then true else ($base_sigs | split(",") | index($sig) | not) end)) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
+            else
+              NEW_CRITICAL=0; NEW_HIGH=0; NEW_MEDIUM=0; NEW_LOW=0; NEW_TOTAL=0
+            fi
             
+            # Generate completely dynamic status message based on actual scan results for this Dockerfile
             if [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ]; then
-              DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_CRITICAL critical, $NEW_HIGH high vulnerabilities"
-              DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "; DOCKERFILE_WITH_NEW_ISSUES=$((DOCKERFILE_WITH_NEW_ISSUES + 1))
+              if [ $NEW_CRITICAL -gt 0 ] && [ $NEW_HIGH -gt 0 ]; then
+                DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_CRITICAL critical and $NEW_HIGH high severity vulnerabilities"
+              elif [ $NEW_CRITICAL -gt 0 ]; then
+                DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_CRITICAL critical severity $([ $NEW_CRITICAL -eq 1 ] && echo "vulnerability" || echo "vulnerabilities")"
+              elif [ $NEW_HIGH -gt 0 ]; then
+                DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_HIGH high severity $([ $NEW_HIGH -eq 1 ] && echo "vulnerability" || echo "vulnerabilities")"
+              fi
+              DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "
+              DOCKERFILE_WITH_NEW_ISSUES=$((DOCKERFILE_WITH_NEW_ISSUES + 1))
               VULNERABILITY_DETAILS[$DIR]=$(get_new_vulnerabilities "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
             elif [ $NEW_TOTAL -gt 0 ]; then
-              DOCKERFILE_STATUS="WARNING"; DOCKERFILE_MSG="Introduces $NEW_TOTAL medium/low vulnerabilities"; DOCKERFILE_INHERIT_ONLY=$((DOCKERFILE_INHERIT_ONLY + 1))
+              DOCKERFILE_STATUS="WARNING"; DOCKERFILE_MSG="Introduces $NEW_TOTAL medium/low severity $([ $NEW_TOTAL -eq 1 ] && echo "vulnerability" || echo "vulnerabilities")"
+              DOCKERFILE_INHERIT_ONLY=$((DOCKERFILE_INHERIT_ONLY + 1))
+            else
+              DOCKERFILE_STATUS="PASSED"; DOCKERFILE_MSG="No new vulnerabilities introduced"
+              DOCKERFILE_CLEAN=$((DOCKERFILE_CLEAN + 1))
+            fi
             else
               DOCKERFILE_STATUS="PASSED"; DOCKERFILE_MSG="No new vulnerabilities introduced"; DOCKERFILE_CLEAN=$((DOCKERFILE_CLEAN + 1))
             fi
@@ -311,32 +330,40 @@ jobs:
           
           get_new_vuln_count() {
             local dockerfile_json="$1" base_json="$2" severity="${3:-all}"
+            
+            # Validate input files
             [ ! -f "$dockerfile_json" ] || ! jq -e . "$dockerfile_json" >/dev/null 2>&1 && echo "0" && return
             
-            # If no base image scan, return 0 (can't determine what's new)
+            # If no base image scan, return 0 (cannot determine what's new without baseline)
             if [ ! -f "$base_json" ] || ! jq -e . "$base_json" >/dev/null 2>&1; then
               echo "0"; return
             fi
             
-            # Get base image vulnerability signatures for precise filtering
-            local base_vuln_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$base_json" 2>/dev/null || echo "")
+            # Create comprehensive signatures for precise vulnerability matching
+            local base_vuln_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$base_json" 2>/dev/null || echo "")
             
-            # Count NEW vulnerabilities that don't exist in base image
+            # Count NEW vulnerabilities by severity, ensuring complete segregation from base image
             case "$severity" in
               "all") 
                 jq -r --arg base_sigs "$base_vuln_sigs" '
                   [.vulnerabilities[]?] 
-                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
+                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | 
+                      if ($base_sigs == "") then true 
+                      else ($base_sigs | split(",") | index($sig) | not) end))
                   | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
               "total") 
                 jq -r --arg base_sigs "$base_vuln_sigs" '
                   [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
-                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
+                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | 
+                      if ($base_sigs == "") then true 
+                      else ($base_sigs | split(",") | index($sig) | not) end))
                   | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
               *) 
                 jq -r --arg sev "$severity" --arg base_sigs "$base_vuln_sigs" '
                   [.vulnerabilities[]? | select(.severity == $sev)] 
-                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
+                  | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | 
+                      if ($base_sigs == "") then true 
+                      else ($base_sigs | split(",") | index($sig) | not) end))
                   | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
             esac
           }
@@ -363,6 +390,8 @@ jobs:
           # Generate summary
           {
             echo "# Snyk Dockerfile Security Scan Results"
+            echo ""
+            echo "## Executive Summary"
             echo ""
             case "$OVERALL_STATUS" in
               "PASSED") echo "**Status:** PASSED"; echo ""; echo "All Dockerfiles are clean - no new critical or high severity vulnerabilities introduced." ;;
@@ -396,23 +425,26 @@ jobs:
             for DIR in "${TARGET_DIRS[@]}"; do
               if [ -n "${DOCKERFILE_RESULTS[$DIR]}" ]; then
                 IFS='|' read -r status msg docker_critical docker_high docker_medium docker_low docker_total <<< "${DOCKERFILE_RESULTS[$DIR]}"
-                DOCKERFILE_PATH="images/runtime/training/$DIR/Dockerfile"; IMPACT_STATUS="Build Safe"
-                
+                # Calculate NEW vulnerabilities using improved filtering for this specific Dockerfile
                 if [ -f "$DOCKERFILE_PATH" ]; then
                   BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE_PATH" | awk '{print $2}' | sed 's/ AS .*//g')
                   BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
                   FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"
                   BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
                   
-                  # Calculate NEW vulnerabilities using improved filtering
+                  # Calculate NEW vulnerabilities using precise signature-based filtering
                   NEW_CRITICAL=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "critical")
                   NEW_HIGH=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "high")
                   NEW_MEDIUM=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "medium")
                   NEW_LOW=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "low")
                   NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
                   
+                  # Dynamic status determination based on actual NEW vulnerability counts for this Dockerfile
                   if [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ]; then IMPACT_STATUS="Fails Build"
-                  elif [ $NEW_TOTAL -gt 0 ]; then IMPACT_STATUS="Warning"; fi
+                  elif [ $NEW_TOTAL -gt 0 ]; then IMPACT_STATUS="Warning"
+                  else IMPACT_STATUS="Build Safe"; fi
+                else
+                  NEW_CRITICAL=0; NEW_HIGH=0; NEW_MEDIUM=0; NEW_LOW=0; NEW_TOTAL=0; IMPACT_STATUS="Unknown"
                 fi
                 echo "| **$DIR** | $NEW_CRITICAL | $NEW_HIGH | $NEW_MEDIUM | $NEW_LOW | $NEW_TOTAL | $IMPACT_STATUS |"
               fi
@@ -443,7 +475,24 @@ jobs:
             echo "**Scan Configuration:**"
             echo "- Snyk Version: ${SNYK_VERSION}"
             echo "- Scan Threshold: High severity and above"
-            echo "- Base Image: $([ -f "images/runtime/training/${TARGET_DIRS[0]}/Dockerfile" ] && grep -m 1 "^FROM" "images/runtime/training/${TARGET_DIRS[0]}/Dockerfile" | awk '{print $2}' | sed 's/ AS .*//g' 2>/dev/null || echo "Multiple base images")"
+            echo "- Scan Date: $(date -u '+%B %d, %Y at %H:%M UTC')"
+            
+            # Dynamically detect unique base images
+            UNIQUE_BASE_IMAGES=()
+            for DIR in "${TARGET_DIRS[@]}"; do
+              if [ -f "images/runtime/training/$DIR/Dockerfile" ]; then
+                BASE_IMG=$(grep -m 1 "^FROM" "images/runtime/training/$DIR/Dockerfile" | awk '{print $2}' | sed 's/ AS .*//g' 2>/dev/null || echo "Unknown")
+                if [[ ! " ${UNIQUE_BASE_IMAGES[@]} " =~ " ${BASE_IMG} " ]]; then
+                  UNIQUE_BASE_IMAGES+=("$BASE_IMG")
+                fi
+              fi
+            done
+            
+            if [ ${#UNIQUE_BASE_IMAGES[@]} -eq 1 ]; then
+              echo "- Base Image: ${UNIQUE_BASE_IMAGES[0]}"
+            else
+              echo "- Base Images: Multiple (${#UNIQUE_BASE_IMAGES[@]} unique images detected)"
+            fi
             echo ""
             
             for DIR in "${TARGET_DIRS[@]}"; do
