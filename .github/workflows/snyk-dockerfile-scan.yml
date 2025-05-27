@@ -580,7 +580,7 @@ jobs:
               fi
             done
             
-            # Base image details
+            # Base image details - separate vulnerability lists by severity
             if [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
               echo "## Base Image Security Details"
               echo ""; echo "Security analysis of base images used by Dockerfiles. These vulnerabilities are inherited and do not fail builds:"; echo ""
@@ -589,21 +589,143 @@ jobs:
                 if [ "$total" -gt 0 ]; then
                   base_image_name="${BASE_IMAGE_NAMES[$key]}"
                   [ -z "$base_image_name" ] && base_image_name=$(echo "$key" | sed 's/_/\//g' | sed 's/\//:/2')
-                  BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"; TOTAL_CRIT_HIGH=$(get_vuln_count "$BASE_SCAN_JSON" "total")
+                  BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"
+                  
                   echo "<details>"
                   echo "<summary><strong>$base_image_name</strong> - $total total vulnerabilities ($critical critical, $high high, $medium medium, $low low)</summary>"; echo ""
-                  TOP_10_VULNS=$(get_vulns "$BASE_SCAN_JSON" 10)
-                  if [ -n "$TOP_10_VULNS" ]; then
-                    echo "**Top 10 Critical/High Vulnerabilities (by CVSS Score):**"; echo ""; echo "\`\`\`"; echo "$TOP_10_VULNS"; echo "\`\`\`"; echo ""
-                    if [ "$TOTAL_CRIT_HIGH" -gt 10 ]; then
-                      REMAINING_COUNT=$((TOTAL_CRIT_HIGH - 10))
-                      echo "<details>"; echo "<summary><strong>Show Remaining $REMAINING_COUNT Critical/High Vulnerabilities</strong></summary>"; echo ""
-                      REMAINING_VULNS=$(get_vulns "$BASE_SCAN_JSON" 999 | sed '1,10d')
-                      [ -n "$REMAINING_VULNS" ] && echo "\`\`\`" && echo "$REMAINING_VULNS" && echo "\`\`\`"
-                      echo ""; echo "</details>"; echo ""
+                  
+                  # Critical vulnerabilities
+                  if [ "$critical" -gt 0 ]; then
+                    CRITICAL_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "critical" 10)
+                    if [ -n "$CRITICAL_BASE_VULNS" ]; then
+                      echo "<details open>"
+                      echo "<summary><strong>Critical Vulnerabilities ($critical total)</strong></summary>"
+                      echo ""
+                      echo "\`\`\`"
+                      echo "$CRITICAL_BASE_VULNS"
+                      echo "\`\`\`"
+                      echo ""
+                      
+                      if [ "$critical" -gt 10 ]; then
+                        REMAINING_CRITICAL=$((critical - 10))
+                        REMAINING_CRITICAL_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "critical" 999 | sed '1,10d')
+                        if [ -n "$REMAINING_CRITICAL_VULNS" ]; then
+                          echo "<details>"
+                          echo "<summary><strong>Show Remaining $REMAINING_CRITICAL Critical Vulnerabilities</strong></summary>"
+                          echo ""
+                          echo "\`\`\`"
+                          echo "$REMAINING_CRITICAL_VULNS"
+                          echo "\`\`\`"
+                          echo ""
+                          echo "</details>"
+                        fi
+                      fi
+                      echo ""
+                      echo "</details>"
+                      echo ""
                     fi
-                  else
-                    echo "**Vulnerability Analysis:** No critical or high severity vulnerabilities found, or detailed information unavailable."; echo ""
+                  fi
+                  
+                  # High vulnerabilities
+                  if [ "$high" -gt 0 ]; then
+                    HIGH_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "high" 10)
+                    if [ -n "$HIGH_BASE_VULNS" ]; then
+                      echo "<details open>"
+                      echo "<summary><strong>High Vulnerabilities ($high total)</strong></summary>"
+                      echo ""
+                      echo "\`\`\`"
+                      echo "$HIGH_BASE_VULNS"
+                      echo "\`\`\`"
+                      echo ""
+                      
+                      if [ "$high" -gt 10 ]; then
+                        REMAINING_HIGH=$((high - 10))
+                        REMAINING_HIGH_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "high" 999 | sed '1,10d')
+                        if [ -n "$REMAINING_HIGH_VULNS" ]; then
+                          echo "<details>"
+                          echo "<summary><strong>Show Remaining $REMAINING_HIGH High Vulnerabilities</strong></summary>"
+                          echo ""
+                          echo "\`\`\`"
+                          echo "$REMAINING_HIGH_VULNS"
+                          echo "\`\`\`"
+                          echo ""
+                          echo "</details>"
+                        fi
+                      fi
+                      echo ""
+                      echo "</details>"
+                      echo ""
+                    fi
+                  fi
+                  
+                  # Medium vulnerabilities
+                  if [ "$medium" -gt 0 ]; then
+                    MEDIUM_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "medium" 10)
+                    if [ -n "$MEDIUM_BASE_VULNS" ]; then
+                      echo "<details>"
+                      echo "<summary><strong>Medium Vulnerabilities ($medium total)</strong></summary>"
+                      echo ""
+                      echo "\`\`\`"
+                      echo "$MEDIUM_BASE_VULNS"
+                      echo "\`\`\`"
+                      echo ""
+                      
+                      if [ "$medium" -gt 10 ]; then
+                        REMAINING_MEDIUM=$((medium - 10))
+                        REMAINING_MEDIUM_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "medium" 999 | sed '1,10d')
+                        if [ -n "$REMAINING_MEDIUM_VULNS" ]; then
+                          echo "<details>"
+                          echo "<summary><strong>Show Remaining $REMAINING_MEDIUM Medium Vulnerabilities</strong></summary>"
+                          echo ""
+                          echo "\`\`\`"
+                          echo "$REMAINING_MEDIUM_VULNS"
+                          echo "\`\`\`"
+                          echo ""
+                          echo "</details>"
+                        fi
+                      fi
+                      echo ""
+                      echo "</details>"
+                      echo ""
+                    fi
+                  fi
+                  
+                  # Low vulnerabilities
+                  if [ "$low" -gt 0 ]; then
+                    LOW_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "low" 10)
+                    if [ -n "$LOW_BASE_VULNS" ]; then
+                      echo "<details>"
+                      echo "<summary><strong>Low Vulnerabilities ($low total)</strong></summary>"
+                      echo ""
+                      echo "\`\`\`"
+                      echo "$LOW_BASE_VULNS"
+                      echo "\`\`\`"
+                      echo ""
+                      
+                      if [ "$low" -gt 10 ]; then
+                        REMAINING_LOW=$((low - 10))
+                        REMAINING_LOW_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "low" 999 | sed '1,10d')
+                        if [ -n "$REMAINING_LOW_VULNS" ]; then
+                          echo "<details>"
+                          echo "<summary><strong>Show Remaining $REMAINING_LOW Low Vulnerabilities</strong></summary>"
+                          echo ""
+                          echo "\`\`\`"
+                          echo "$REMAINING_LOW_VULNS"
+                          echo "\`\`\`"
+                          echo ""
+                          echo "</details>"
+                        fi
+                      fi
+                      echo ""
+                      echo "</details>"
+                      echo ""
+                    fi
+                  fi
+                  
+                  # No vulnerabilities found message
+                  if [ "$total" -eq 0 ]; then
+                    echo "**Vulnerability Analysis:** No vulnerabilities found."
+                    echo ""
                   fi
                   echo "**Advisory:** Consider updating to newer base image versions when available to reduce inherited vulnerabilities."; echo ""
                   echo "</details>"; echo ""
