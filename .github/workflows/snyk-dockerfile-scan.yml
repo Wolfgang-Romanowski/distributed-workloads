@@ -5,8 +5,6 @@ on:
     branches: [ main ]
     paths:
       - 'images/runtime/training/*/Dockerfile'
-  pull_request_target:
-    types: [ labeled ]
   pull_request:
     paths:
       - 'images/runtime/training/*/Dockerfile'
@@ -14,14 +12,6 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
-      debug:
-        description: 'Enable debug mode'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
       target_dir:
         description: 'Specific directory to scan (leave empty for all)'
         required: false
@@ -29,787 +19,357 @@ on:
         type: string
 
 jobs:
-  snyk-dockerfile-scan:
-    name: Snyk Dockerfile Security Scan
+  snyk-scan:
+    name: Snyk Security Analysis
     runs-on: ubuntu-latest
-    if: >
-      github.event_name != 'pull_request_target' || 
-      github.event.label.name == 'safe-to-test' || 
-      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       security-events: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.ref || '' }}
-          repository: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || '' }}
 
       - name: Setup Snyk
         uses: snyk/actions/setup@master
 
-      - name: Configure Snyk Authentication
-        id: verify_token
+      - name: Authenticate Snyk
         run: |
           if [ -z "${{ secrets.SNYK_TOKEN }}" ]; then
             echo "::error::SNYK_TOKEN secret is not configured"
             exit 1
           fi
           snyk auth "${{ secrets.SNYK_TOKEN }}"
-          echo "version=$(snyk --version)" >> $GITHUB_OUTPUT
 
-      - name: Execute Dockerfile Security Scans
+      - name: Discover and Scan Components
         id: scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
           TARGET_DIR: ${{ github.event.inputs.target_dir }}
         run: |
-          mkdir -p scan_results
-          RESULTS_DIR="scan_results"
-          TRAINING_DIR="images/runtime/training"
-          
-          # Counters
-          TOTAL_SCANNED=0; BASE_IMAGES_WITH_ISSUES=0; DOCKERFILE_CLEAN=0
-          DOCKERFILE_WITH_NEW_ISSUES=0; DOCKERFILE_INHERIT_ONLY=0; SCAN_ERRORS=0
-          
-          # Storage
-          declare -A BASE_IMAGE_RESULTS DOCKERFILE_RESULTS VULNERABILITY_DETAILS BASE_IMAGE_NAMES
-          DOCKERFILES_WITH_NEW_VULNS=""
-          
-          # Functions
-          extract_base_image() {
-            local dockerfile="$1"
-            local base_image=$(grep -m 1 "^FROM" "$dockerfile" | awk '{print $2}' | sed 's/ AS .*//g')
-            while IFS= read -r line; do
-              if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
-                local var_name="${BASH_REMATCH[1]}"
-                local var_value="${BASH_REMATCH[2]//[\"\']}"
-                base_image="${base_image//\$\{$var_name\}/$var_value}"
-                base_image="${base_image//\$var_name/$var_value}"
-              fi
-            done < "$dockerfile"
-            echo "$base_image"
-          }
-          
-          get_vuln_counts() {
-            local json_file="$1"
-            if [ ! -f "$json_file" ] || [ ! -s "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1; then
-              echo "0|0|0|0|0"; return
-            fi
-            local critical=$(jq '[.vulnerabilities[]? | select(.severity == "critical")] | length' "$json_file" 2>/dev/null || echo "0")
-            local high=$(jq '[.vulnerabilities[]? | select(.severity == "high")] | length' "$json_file" 2>/dev/null || echo "0")
-            local medium=$(jq '[.vulnerabilities[]? | select(.severity == "medium")] | length' "$json_file" 2>/dev/null || echo "0")
-            local low=$(jq '[.vulnerabilities[]? | select(.severity == "low")] | length' "$json_file" 2>/dev/null || echo "0")
-            local total=$(jq '.uniqueCount // 0' "$json_file" 2>/dev/null || echo "0")
-            echo "$critical|$high|$medium|$low|$total"
-          }
-          
-          get_new_vulnerabilities() {
-            local dockerfile_json="$1" base_json="$2" count="${3:-999}"
-            if [ ! -f "$dockerfile_json" ] || ! jq -e . "$dockerfile_json" >/dev/null 2>&1; then
-              echo ""; return
-            fi
-            
-            # If no base image scan available, show nothing (since we can't determine what's new)
-            if [ ! -f "$base_json" ] || ! jq -e . "$base_json" >/dev/null 2>&1; then
-              echo ""; return
-            fi
-            
-            # Get base image vulnerability signatures (ID + package + version) for precise filtering
-            local base_vuln_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$base_json" 2>/dev/null || echo "")
-            
-            # Only show critical/high NEW vulnerabilities that don't exist in base image
-            jq -r --arg count "$count" --arg base_sigs "$base_vuln_sigs" '
-              [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
-              | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
-              | sort_by(-.cvssScore) 
-              | .[0:($count|tonumber)] 
-              | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
-              | join("\n")' "$dockerfile_json" 2>/dev/null || echo ""
-          }
+          set -e
+          mkdir -p results
           
           # Target directories
+          TRAINING_DIR="images/runtime/training"
           if [ -n "$TARGET_DIR" ]; then
             if [ -d "$TRAINING_DIR/$TARGET_DIR" ]; then
               TARGET_DIRS=("$TARGET_DIR")
             else
-              echo "Target directory $TRAINING_DIR/$TARGET_DIR does not exist"; exit 1
+              echo "::error::Directory $TARGET_DIR not found"
+              exit 1
             fi
           else
-            TARGET_DIRS=("py311-cuda121-torch241" "py311-cuda124-torch251" "py311-rocm62-torch241" "py311-rocm62-torch251")
+            TARGET_DIRS=($(find "$TRAINING_DIR" -name "Dockerfile" -exec dirname {} \; | xargs -I {} basename {}))
           fi
-          printf "%s\n" "${TARGET_DIRS[@]}" > "$RESULTS_DIR/target_dirs.txt"
           
-          # Process each directory
+          echo "Scanning directories: ${TARGET_DIRS[*]}"
+          
+          # Step 1: Discover unique base images
+          declare -A BASE_IMAGES
+          declare -A DOCKERFILE_BASE_MAP
+          
           for DIR in "${TARGET_DIRS[@]}"; do
-            echo "Processing $DIR"
             DOCKERFILE="$TRAINING_DIR/$DIR/Dockerfile"
-            TOTAL_SCANNED=$((TOTAL_SCANNED + 1))
-            
             if [ ! -f "$DOCKERFILE" ]; then
-              echo "ERROR: Dockerfile not found: $DOCKERFILE"
-              SCAN_ERRORS=$((SCAN_ERRORS + 1))
-              DOCKERFILE_RESULTS[$DIR]="ERROR|Dockerfile not found|0|0|0|0|0"
+              echo "::warning::Dockerfile not found: $DOCKERFILE"
               continue
             fi
             
-            BASE_IMAGE=$(extract_base_image "$DOCKERFILE")
-            BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
-            BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
-            BASE_IMAGE_NAMES[$BASE_SCAN_KEY]="$BASE_IMAGE"
+            # Extract base image (simple approach)
+            BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE" | awk '{print $2}' | cut -d' ' -f1)
+            if [ -n "$BASE_IMAGE" ]; then
+              BASE_IMAGES["$BASE_IMAGE"]=1
+              DOCKERFILE_BASE_MAP["$DIR"]="$BASE_IMAGE"
+              echo "Dockerfile $DIR uses base image: $BASE_IMAGE"
+            fi
+          done
+          
+          # Step 2: Scan each unique base image once
+          declare -A BASE_RESULTS
+          echo "Scanning ${#BASE_IMAGES[@]} unique base images..."
+          
+          for BASE_IMAGE in "${!BASE_IMAGES[@]}"; do
+            echo "Scanning base image: $BASE_IMAGE"
+            BASE_KEY=$(echo "$BASE_IMAGE" | tr '/:' '_')
+            BASE_FILE="results/base_${BASE_KEY}.json"
             
-            # Base image scan - get ALL vulnerabilities for proper segregation
-            if [ -z "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}" ]; then
-              echo "Scanning base image: $BASE_IMAGE"
-              set +e
-              snyk container test "$BASE_IMAGE" --json > "$BASE_SCAN_JSON" 2>/dev/null
-              BASE_EXIT_CODE=$?
-              set -e
-              IFS='|' read -r base_critical base_high base_medium base_low base_total <<< "$(get_vuln_counts "$BASE_SCAN_JSON")"
-              BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]="$BASE_EXIT_CODE|$base_critical|$base_high|$base_medium|$base_low|$base_total"
-              if [ "$base_total" -gt 0 ]; then BASE_IMAGES_WITH_ISSUES=$((BASE_IMAGES_WITH_ISSUES + 1)); fi
+            # Scan base image
+            if snyk container test "$BASE_IMAGE" --json > "$BASE_FILE" 2>/dev/null; then
+              BASE_EXIT=0
             else
-              IFS='|' read -r BASE_EXIT_CODE base_critical base_high base_medium base_low base_total <<< "${BASE_IMAGE_RESULTS[$BASE_SCAN_KEY]}"
+              BASE_EXIT=$?
             fi
             
-            # Dockerfile scan - get ALL vulnerabilities and additional Snyk insights
-            FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"
-            echo "Scanning Dockerfile: $DIR"
-            set +e
-            snyk container test "$BASE_IMAGE" --file="$DOCKERFILE" --json > "$FULL_SCAN_JSON" 2>/dev/null
-            set -e
-            IFS='|' read -r docker_critical docker_high docker_medium docker_low docker_total <<< "$(get_vuln_counts "$FULL_SCAN_JSON")"
-            
-            # Analyze results using signature-based NEW vulnerability detection for complete segregation
-            if [ -f "$BASE_SCAN_JSON" ] && [ -f "$FULL_SCAN_JSON" ]; then
-              # Use precise signature matching to identify truly NEW vulnerabilities
-              BASE_VULN_SIGS=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")
-              
-              if [ -z "$BASE_VULN_SIGS" ]; then
-                # No base vulnerabilities to filter against - count all Dockerfile vulnerabilities as new
-                NEW_CRITICAL=$(jq '[.vulnerabilities[]? | select(.severity == "critical")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-                NEW_HIGH=$(jq '[.vulnerabilities[]? | select(.severity == "high")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-                NEW_MEDIUM=$(jq '[.vulnerabilities[]? | select(.severity == "medium")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-                NEW_LOW=$(jq '[.vulnerabilities[]? | select(.severity == "low")] | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-              else
-                # Filter out base image vulnerabilities and count what's truly new
-                NEW_CRITICAL=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "critical")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-                NEW_HIGH=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "high")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-                NEW_MEDIUM=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "medium")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-                NEW_LOW=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-              fi
-              NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
+            # Count vulnerabilities by severity
+            if [ -f "$BASE_FILE" ] && jq -e . "$BASE_FILE" >/dev/null 2>&1; then
+              CRITICAL=$(jq '[.vulnerabilities[]? | select(.severity == "critical")] | length' "$BASE_FILE")
+              HIGH=$(jq '[.vulnerabilities[]? | select(.severity == "high")] | length' "$BASE_FILE")
+              MEDIUM=$(jq '[.vulnerabilities[]? | select(.severity == "medium")] | length' "$BASE_FILE")
+              LOW=$(jq '[.vulnerabilities[]? | select(.severity == "low")] | length' "$BASE_FILE")
+              TOTAL=$(jq '.vulnerabilities | length' "$BASE_FILE" 2>/dev/null || echo "0")
             else
-              NEW_CRITICAL=0; NEW_HIGH=0; NEW_MEDIUM=0; NEW_LOW=0; NEW_TOTAL=0
+              CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0; TOTAL=0
             fi
             
-            # Generate completely dynamic status message based on actual scan results for this Dockerfile
+            BASE_RESULTS["$BASE_IMAGE"]="$BASE_EXIT|$CRITICAL|$HIGH|$MEDIUM|$LOW|$TOTAL"
+            echo "Base image $BASE_IMAGE: $TOTAL vulnerabilities (C:$CRITICAL H:$HIGH M:$MEDIUM L:$LOW)"
+          done
+          
+          # Step 3: Analyze Dockerfiles using Snyk's --file flag
+          declare -A DOCKERFILE_RESULTS
+          FAILED_DOCKERFILES=""
+          TOTAL_SCANNED=0
+          CLEAN_COUNT=0
+          WARNING_COUNT=0
+          FAILED_COUNT=0
+          
+          echo "Analyzing Dockerfiles for additional vulnerabilities..."
+          
+          for DIR in "${TARGET_DIRS[@]}"; do
+            DOCKERFILE="$TRAINING_DIR/$DIR/Dockerfile"
+            BASE_IMAGE="${DOCKERFILE_BASE_MAP[$DIR]}"
+            
+            if [ ! -f "$DOCKERFILE" ] || [ -z "$BASE_IMAGE" ]; then
+              continue
+            fi
+            
+            TOTAL_SCANNED=$((TOTAL_SCANNED + 1))
+            echo "Analyzing Dockerfile: $DIR (base: $BASE_IMAGE)"
+            
+            # Scan Dockerfile to see what it would add
+            DOCKERFILE_FILE="results/${DIR}_dockerfile.json"
+            if snyk container test "$BASE_IMAGE" --file="$DOCKERFILE" --json > "$DOCKERFILE_FILE" 2>/dev/null; then
+              DOCKERFILE_EXIT=0
+            else
+              DOCKERFILE_EXIT=$?
+            fi
+            
+            # Get base image results
+            IFS='|' read -r BASE_EXIT BASE_CRIT BASE_HIGH BASE_MED BASE_LOW BASE_TOTAL <<< "${BASE_RESULTS[$BASE_IMAGE]}"
+            
+            # Count Dockerfile scan results
+            if [ -f "$DOCKERFILE_FILE" ] && jq -e . "$DOCKERFILE_FILE" >/dev/null 2>&1; then
+              DF_CRITICAL=$(jq '[.vulnerabilities[]? | select(.severity == "critical")] | length' "$DOCKERFILE_FILE")
+              DF_HIGH=$(jq '[.vulnerabilities[]? | select(.severity == "high")] | length' "$DOCKERFILE_FILE")
+              DF_MEDIUM=$(jq '[.vulnerabilities[]? | select(.severity == "medium")] | length' "$DOCKERFILE_FILE")
+              DF_LOW=$(jq '[.vulnerabilities[]? | select(.severity == "low")] | length' "$DOCKERFILE_FILE")
+              DF_TOTAL=$(jq '.vulnerabilities | length' "$DOCKERFILE_FILE" 2>/dev/null || echo "0")
+            else
+              DF_CRITICAL=0; DF_HIGH=0; DF_MEDIUM=0; DF_LOW=0; DF_TOTAL=0
+            fi
+            
+            # Calculate new vulnerabilities (simple subtraction)
+            NEW_CRITICAL=$((DF_CRITICAL > BASE_CRIT ? DF_CRITICAL - BASE_CRIT : 0))
+            NEW_HIGH=$((DF_HIGH > BASE_HIGH ? DF_HIGH - BASE_HIGH : 0))
+            NEW_MEDIUM=$((DF_MEDIUM > BASE_MED ? DF_MEDIUM - BASE_MED : 0))
+            NEW_LOW=$((DF_LOW > BASE_LOW ? DF_LOW - BASE_LOW : 0))
+            NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
+            
+            # Determine status
             if [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ]; then
-              if [ $NEW_CRITICAL -gt 0 ] && [ $NEW_HIGH -gt 0 ]; then
-                DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_CRITICAL critical and $NEW_HIGH high severity vulnerabilities"
-              elif [ $NEW_CRITICAL -gt 0 ]; then
-                DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_CRITICAL critical severity $([ $NEW_CRITICAL -eq 1 ] && echo "vulnerability" || echo "vulnerabilities")"
-              elif [ $NEW_HIGH -gt 0 ]; then
-                DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_HIGH high severity $([ $NEW_HIGH -eq 1 ] && echo "vulnerability" || echo "vulnerabilities")"
-              fi
-              DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "
-              DOCKERFILE_WITH_NEW_ISSUES=$((DOCKERFILE_WITH_NEW_ISSUES + 1))
-              VULNERABILITY_DETAILS[$DIR]=$(get_new_vulnerabilities "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
+              STATUS="FAILED"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              FAILED_DOCKERFILES="$FAILED_DOCKERFILES$DIR "
+              MESSAGE="Introduces $NEW_CRITICAL critical, $NEW_HIGH high vulnerabilities"
             elif [ $NEW_TOTAL -gt 0 ]; then
-              DOCKERFILE_STATUS="WARNING"; DOCKERFILE_MSG="Introduces $NEW_TOTAL medium/low severity $([ $NEW_TOTAL -eq 1 ] && echo "vulnerability" || echo "vulnerabilities")"
-              DOCKERFILE_INHERIT_ONLY=$((DOCKERFILE_INHERIT_ONLY + 1))
+              STATUS="WARNING"
+              WARNING_COUNT=$((WARNING_COUNT + 1))
+              MESSAGE="Introduces $NEW_TOTAL medium/low vulnerabilities"
             else
-              DOCKERFILE_STATUS="PASSED"; DOCKERFILE_MSG="No new vulnerabilities introduced"
-              DOCKERFILE_CLEAN=$((DOCKERFILE_CLEAN + 1))
+              STATUS="PASSED"
+              CLEAN_COUNT=$((CLEAN_COUNT + 1))
+              MESSAGE="No new vulnerabilities"
             fi
             
-            DOCKERFILE_RESULTS[$DIR]="$DOCKERFILE_STATUS|$DOCKERFILE_MSG|$docker_critical|$docker_high|$docker_medium|$docker_low|$docker_total"
+            DOCKERFILE_RESULTS["$DIR"]="$STATUS|$MESSAGE|$NEW_CRITICAL|$NEW_HIGH|$NEW_MEDIUM|$NEW_LOW|$NEW_TOTAL|$DF_CRITICAL|$DF_HIGH|$DF_MEDIUM|$DF_LOW|$DF_TOTAL"
+            echo "Dockerfile $DIR: $STATUS - $MESSAGE"
           done
           
           # Overall status
-          DOCKERFILES_WITH_NEW_VULNS=$(echo "$DOCKERFILES_WITH_NEW_VULNS" | sed 's/, $//')
-          DOCKERFILE_FAILURES_EXIST=false
-          if [ $SCAN_ERRORS -gt 0 ]; then
-            OVERALL_STATUS="ERROR"; OVERALL_MSG="Scan errors encountered"; DOCKERFILE_FAILURES_EXIST=true
-          elif [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-            OVERALL_STATUS="FAILED"; OVERALL_MSG="Dockerfiles introduce new critical/high vulnerabilities: $DOCKERFILES_WITH_NEW_VULNS"; DOCKERFILE_FAILURES_EXIST=true
-          elif [ $DOCKERFILE_CLEAN -eq $TOTAL_SCANNED ]; then
-            OVERALL_STATUS="PASSED"; OVERALL_MSG="All Dockerfiles clean - no new vulnerabilities introduced"
+          if [ $FAILED_COUNT -gt 0 ]; then
+            OVERALL_STATUS="FAILED"
+            OVERALL_MESSAGE="$FAILED_COUNT Dockerfile(s) introduce critical/high vulnerabilities"
+          elif [ $WARNING_COUNT -gt 0 ]; then
+            OVERALL_STATUS="WARNING"
+            OVERALL_MESSAGE="$WARNING_COUNT Dockerfile(s) introduce medium/low vulnerabilities"
           else
-            OVERALL_STATUS="WARNING"; OVERALL_MSG="Dockerfiles introduce only medium/low vulnerabilities"
+            OVERALL_STATUS="PASSED"
+            OVERALL_MESSAGE="All Dockerfiles are clean"
           fi
           
-          if [ "$DEBUG_MODE" = "true" ] && [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
-            OVERALL_STATUS="FAILED"; OVERALL_MSG="$OVERALL_MSG (Debug Mode: Base images have vulnerabilities)"; DOCKERFILE_FAILURES_EXIST=true
-          fi
+          # Save results for summary
+          {
+            echo "OVERALL_STATUS=$OVERALL_STATUS"
+            echo "OVERALL_MESSAGE=$OVERALL_MESSAGE"
+            echo "TOTAL_SCANNED=$TOTAL_SCANNED"
+            echo "CLEAN_COUNT=$CLEAN_COUNT"
+            echo "WARNING_COUNT=$WARNING_COUNT"
+            echo "FAILED_COUNT=$FAILED_COUNT"
+            echo "FAILED_DOCKERFILES=$FAILED_DOCKERFILES"
+          } > results/summary.env
           
-          # Save results
-          cat > "$RESULTS_DIR/scan_state.env" << EOF
-          OVERALL_STATUS="$OVERALL_STATUS"
-          OVERALL_MSG="$OVERALL_MSG"
-          TOTAL_SCANNED=$TOTAL_SCANNED
-          BASE_IMAGES_WITH_ISSUES=$BASE_IMAGES_WITH_ISSUES
-          DOCKERFILE_CLEAN=$DOCKERFILE_CLEAN
-          DOCKERFILE_WITH_NEW_ISSUES=$DOCKERFILE_WITH_NEW_ISSUES
-          DOCKERFILE_INHERIT_ONLY=$DOCKERFILE_INHERIT_ONLY
-          SCAN_ERRORS=$SCAN_ERRORS
-          DOCKERFILES_WITH_NEW_VULNS="$DOCKERFILES_WITH_NEW_VULNS"
-          DOCKERFILE_FAILURES_EXIST=$DOCKERFILE_FAILURES_EXIST
-          EOF
+          # Save detailed results
+          for key in "${!BASE_RESULTS[@]}"; do
+            echo "$key=${BASE_RESULTS[$key]}" >> results/base_results.txt
+          done
           
-          for key in "${!BASE_IMAGE_RESULTS[@]}"; do echo "$key=${BASE_IMAGE_RESULTS[$key]}" >> "$RESULTS_DIR/base_images.data"; done
-          for key in "${!DOCKERFILE_RESULTS[@]}"; do echo "$key=${DOCKERFILE_RESULTS[$key]}" >> "$RESULTS_DIR/dockerfile_results.data"; done
-          for key in "${!VULNERABILITY_DETAILS[@]}"; do echo "$key=${VULNERABILITY_DETAILS[$key]}" >> "$RESULTS_DIR/vulnerability_details.data"; done
-          for key in "${!BASE_IMAGE_NAMES[@]}"; do echo "$key=${BASE_IMAGE_NAMES[$key]}" >> "$RESULTS_DIR/base_image_names.data"; done
+          for key in "${!DOCKERFILE_RESULTS[@]}"; do
+            echo "$key=${DOCKERFILE_RESULTS[$key]}" >> results/dockerfile_results.txt
+          done
+          
+          for key in "${!DOCKERFILE_BASE_MAP[@]}"; do
+            echo "$key=${DOCKERFILE_BASE_MAP[$key]}" >> results/dockerfile_base_map.txt
+          done
           
           # Set outputs
-          echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
-          echo "scan_status=$OVERALL_MSG" >> $GITHUB_OUTPUT
-          echo "dockerfile_failures_exist=$DOCKERFILE_FAILURES_EXIST" >> $GITHUB_OUTPUT
-          echo "slack_msg=$OVERALL_MSG" >> $GITHUB_OUTPUT
-          echo "base_issues_count=$BASE_IMAGES_WITH_ISSUES" >> $GITHUB_OUTPUT
-          echo "dockerfile_clean_count=$DOCKERFILE_CLEAN" >> $GITHUB_OUTPUT
-          echo "dockerfile_warning_count=$DOCKERFILE_INHERIT_ONLY" >> $GITHUB_OUTPUT
-          echo "dockerfile_failed_count=$DOCKERFILE_WITH_NEW_ISSUES" >> $GITHUB_OUTPUT
-          echo "scan_errors_count=$SCAN_ERRORS" >> $GITHUB_OUTPUT
+          echo "status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          echo "message=$OVERALL_MESSAGE" >> $GITHUB_OUTPUT
+          echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
           
-          # Exit logic
-          if [ "$DEBUG_MODE" = "true" ] && [ "$DOCKERFILE_FAILURES_EXIST" = "true" ]; then
-            echo "Debug Mode: Workflow failed due to vulnerabilities"; exit 1
-          elif [ "$DOCKERFILE_WITH_NEW_ISSUES" -gt 0 ] || [ $SCAN_ERRORS -gt 0 ]; then
-            echo "Workflow failed - Dockerfiles introduce new critical/high vulnerabilities"; exit 1
-          else
-            echo "Workflow passed - No new critical/high vulnerabilities introduced by Dockerfiles"; exit 0
+          # Exit with failure if critical/high vulnerabilities found
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo "Build failed: Critical/high vulnerabilities detected"
+            exit 1
           fi
 
-      - name: Generate GitHub Summary
+      - name: Generate Security Report
         if: always()
-        env:
-          SNYK_VERSION: ${{ steps.verify_token.outputs.version }}
-          DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
         run: |
-          RESULTS_DIR="scan_results"
-          
-          # Helper functions
-          get_vulns() {
-            local json_file="$1" count="${2:-10}" severity_filter="${3:-critical,high}"
-            [ ! -f "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1 && echo "" && return
-            jq -r --arg count "$count" --arg sevs "$severity_filter" '
-              [.vulnerabilities[]? | select(.severity as $s | ($sevs | split(",") | index($s)))] 
-              | sort_by(-.cvssScore) | .[0:($count|tonumber)] 
-              | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
-              | join("\n")' "$json_file" 2>/dev/null || echo ""
-          }
-          
-          get_new_vulns() {
-            local dockerfile_json="$1" base_json="$2" count="${3:-999}"
-            [ ! -f "$dockerfile_json" ] || ! jq -e . "$dockerfile_json" >/dev/null 2>&1 && echo "" && return
-            
-            # If no base image scan available, show nothing (since we can't determine what's new)
-            if [ ! -f "$base_json" ] || ! jq -e . "$base_json" >/dev/null 2>&1; then
-              echo ""; return
-            fi
-            
-            # Get base image vulnerability IDs and package combinations for more precise filtering
-            local base_vuln_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")"] | join(",")' "$base_json" 2>/dev/null || echo "")
-            
-            # Filter out vulnerabilities that exist in base image by comparing ID + package + version
-            jq -r --arg count "$count" --arg base_sigs "$base_vuln_sigs" '
-              [.vulnerabilities[]?] 
-              | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
-              | sort_by(-.cvssScore) 
-              | .[0:($count|tonumber)] 
-              | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
-              | join("\n")' "$dockerfile_json" 2>/dev/null || echo ""
-          }
-          
-          get_vuln_count() {
-            local json_file="$1" severity="${2:-all}"
-            [ ! -f "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1 && echo "0" && return
-            
-            case "$severity" in
-              "all") 
-                jq '[.vulnerabilities[]?] | length' "$json_file" 2>/dev/null || echo "0" ;;
-              "total") 
-                jq '[.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] | length' "$json_file" 2>/dev/null || echo "0" ;;
-              *) 
-                jq --arg sev "$severity" '[.vulnerabilities[]? | select(.severity == $sev)] | length' "$json_file" 2>/dev/null || echo "0" ;;
-            esac
-          }
-          
-          get_new_vuln_count() {
-            local dockerfile_json="$1" base_json="$2" severity="${3:-all}"
-            
-            # Validate input files
-            [ ! -f "$dockerfile_json" ] || ! jq -e . "$dockerfile_json" >/dev/null 2>&1 && echo "0" && return
-            
-            # If no base image scan, return 0 (cannot determine what's new without baseline)
-            if [ ! -f "$base_json" ] || ! jq -e . "$base_json" >/dev/null 2>&1; then
-              echo "0"; return
-            fi
-            
-            # Create comprehensive signatures for precise vulnerability matching
-            local base_vuln_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$base_json" 2>/dev/null || echo "")
-            
-            # Count NEW vulnerabilities by severity, ensuring complete segregation from base image
-            if [ -z "$base_vuln_sigs" ]; then
-              # No base vulnerabilities to filter against - count all vulnerabilities
-              case "$severity" in
-                "all") jq '[.vulnerabilities[]?] | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-                "total") jq '[.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-                *) jq --arg sev "$severity" '[.vulnerabilities[]? | select(.severity == $sev)] | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-              esac
-            else
-              # Filter out base image vulnerabilities and count
-              case "$severity" in
-                "all") 
-                  jq -r --arg base_sigs "$base_vuln_sigs" '
-                    [.vulnerabilities[]?] 
-                    | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
-                    | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-                "total") 
-                  jq -r --arg base_sigs "$base_vuln_sigs" '
-                    [.vulnerabilities[]? | select(.severity == "critical" or .severity == "high")] 
-                    | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
-                    | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-                *) 
-                  jq -r --arg sev "$severity" --arg base_sigs "$base_vuln_sigs" '
-                    [.vulnerabilities[]? | select(.severity == $sev)] 
-                    | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
-                    | length' "$dockerfile_json" 2>/dev/null || echo "0" ;;
-              esac
-            fi
-          }
-          
-          # Read results
-          if [ ! -f "$RESULTS_DIR/scan_state.env" ]; then
-            echo "# Snyk Dockerfile Security Scan Results" >> $GITHUB_STEP_SUMMARY
-            echo "## Scan Failed" >> $GITHUB_STEP_SUMMARY
-            echo "The security scan encountered an error." >> $GITHUB_STEP_SUMMARY
+          if [ ! -f results/summary.env ]; then
+            echo "# Security Scan Failed" >> $GITHUB_STEP_SUMMARY
+            echo "No scan results available." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
-          source "$RESULTS_DIR/scan_state.env"
           
-          # Load data
-          declare -A BASE_IMAGE_RESULTS DOCKERFILE_RESULTS VULNERABILITY_DETAILS BASE_IMAGE_NAMES
-          [ -f "$RESULTS_DIR/base_images.data" ] && while IFS='=' read -r key value; do BASE_IMAGE_RESULTS["$key"]="$value"; done < "$RESULTS_DIR/base_images.data"
-          [ -f "$RESULTS_DIR/dockerfile_results.data" ] && while IFS='=' read -r key value; do DOCKERFILE_RESULTS["$key"]="$value"; done < "$RESULTS_DIR/dockerfile_results.data"
-          [ -f "$RESULTS_DIR/vulnerability_details.data" ] && while IFS='=' read -r key value; do VULNERABILITY_DETAILS["$key"]="$value"; done < "$RESULTS_DIR/vulnerability_details.data"
-          [ -f "$RESULTS_DIR/base_image_names.data" ] && while IFS='=' read -r key value; do BASE_IMAGE_NAMES["$key"]="$value"; done < "$RESULTS_DIR/base_image_names.data"
+          source results/summary.env
           
-          TARGET_DIRS=()
-          [ -f "$RESULTS_DIR/target_dirs.txt" ] && while IFS= read -r dir; do TARGET_DIRS+=("$dir"); done < "$RESULTS_DIR/target_dirs.txt"
+          # Load results
+          declare -A BASE_RESULTS DOCKERFILE_RESULTS DOCKERFILE_BASE_MAP
+          [ -f results/base_results.txt ] && while IFS='=' read -r key value; do BASE_RESULTS["$key"]="$value"; done < results/base_results.txt
+          [ -f results/dockerfile_results.txt ] && while IFS='=' read -r key value; do DOCKERFILE_RESULTS["$key"]="$value"; done < results/dockerfile_results.txt
+          [ -f results/dockerfile_base_map.txt ] && while IFS='=' read -r key value; do DOCKERFILE_BASE_MAP["$key"]="$value"; done < results/dockerfile_base_map.txt
           
-          # Generate summary
           {
-            echo "# Snyk Dockerfile Security Scan Results"
-            echo ""
-            echo "## Executive Summary"
+            echo "# 🛡️ Snyk Security Scan Results"
             echo ""
             case "$OVERALL_STATUS" in
-              "PASSED") echo "**Status:** PASSED"; echo ""; echo "All Dockerfiles are clean - no new critical or high severity vulnerabilities introduced." ;;
-              "WARNING") echo "**Status:** WARNING"; echo ""; echo "Dockerfiles introduce only medium or low severity vulnerabilities." ;;
-              "FAILED") echo "**Status:** FAILED"; echo ""; echo "Dockerfiles introduce new critical or high severity vulnerabilities that must be addressed." ;;
-              "ERROR") echo "**Status:** ERROR"; echo ""; echo "Scan encountered errors - check logs for details." ;;
+              "PASSED") echo "✅ **Status: PASSED** - All Dockerfiles are secure" ;;
+              "WARNING") echo "⚠️ **Status: WARNING** - Some medium/low vulnerabilities found" ;;
+              "FAILED") echo "❌ **Status: FAILED** - Critical/high vulnerabilities detected" ;;
             esac
             echo ""
-            echo "| Metric | Value |"
+            echo "**Summary:** $OVERALL_MESSAGE"
+            echo ""
+            
+            # Overview table
+            echo "## 📊 Scan Overview"
+            echo ""
+            echo "| Metric | Count |"
             echo "|:-------|:------|"
-            echo "| **Scan Date** | $(date -u '+%B %d, %Y at %H:%M UTC') |"
-            echo "| **Snyk Version** | ${SNYK_VERSION} |"
-            echo "| **Dockerfiles Scanned** | $TOTAL_SCANNED |"
-            echo "| **Build Status** | $([ $DOCKERFILE_WITH_NEW_ISSUES -gt 0 ] && echo "BLOCKED" || echo "ALLOWED") |"
+            echo "| Dockerfiles Scanned | $TOTAL_SCANNED |"
+            echo "| Clean (No new vulnerabilities) | $CLEAN_COUNT |"
+            echo "| Warning (Medium/Low vulnerabilities) | $WARNING_COUNT |"
+            echo "| Failed (Critical/High vulnerabilities) | $FAILED_COUNT |"
+            echo "| Unique Base Images | ${#BASE_RESULTS[@]} |"
             echo ""
             
-            # Vulnerability overview
-            echo "## Vulnerability Overview"
-            echo ""
-            TOTAL_BASE_CRITICAL=0; TOTAL_BASE_HIGH=0; TOTAL_BASE_MEDIUM=0; TOTAL_BASE_LOW=0; TOTAL_BASE_TOTAL=0
-            for key in "${!BASE_IMAGE_RESULTS[@]}"; do
-              IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
-              TOTAL_BASE_CRITICAL=$((TOTAL_BASE_CRITICAL + critical)); TOTAL_BASE_HIGH=$((TOTAL_BASE_HIGH + high))
-              TOTAL_BASE_MEDIUM=$((TOTAL_BASE_MEDIUM + medium)); TOTAL_BASE_LOW=$((TOTAL_BASE_LOW + low)); TOTAL_BASE_TOTAL=$((TOTAL_BASE_TOTAL + total))
-            done
-            
-            echo "| Component | Critical | High | Medium | Low | Total | Build Impact |"
-            echo "|:----------|:---------|:-----|:-------|:----|:------|:-------------|"
-            echo "| **Base Images** | $TOTAL_BASE_CRITICAL | $TOTAL_BASE_HIGH | $TOTAL_BASE_MEDIUM | $TOTAL_BASE_LOW | $TOTAL_BASE_TOTAL | Report Only |"
-            
-            for DIR in "${TARGET_DIRS[@]}"; do
-              if [ -n "${DOCKERFILE_RESULTS[$DIR]}" ]; then
-                IFS='|' read -r status msg docker_critical docker_high docker_medium docker_low docker_total <<< "${DOCKERFILE_RESULTS[$DIR]}"
-                # Calculate NEW vulnerabilities using improved filtering for this specific Dockerfile
-                if [ -f "$DOCKERFILE_PATH" ]; then
-                  BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE_PATH" | awk '{print $2}' | sed 's/ AS .*//g')
-                  BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
-                  FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"
-                  BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
-                  
-                  # Calculate NEW vulnerabilities using precise signature-based filtering
-                  NEW_CRITICAL=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "critical")
-                  NEW_HIGH=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "high")
-                  NEW_MEDIUM=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "medium")
-                  NEW_LOW=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "low")
-                  NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
-                  
-                  # Dynamic status determination based on actual NEW vulnerability counts for this Dockerfile
-                  if [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ]; then IMPACT_STATUS="Fails Build"
-                  elif [ $NEW_TOTAL -gt 0 ]; then IMPACT_STATUS="Warning"
-                  else IMPACT_STATUS="Build Safe"; fi
-                else
-                  NEW_CRITICAL=0; NEW_HIGH=0; NEW_MEDIUM=0; NEW_LOW=0; NEW_TOTAL=0; IMPACT_STATUS="Unknown"
-                fi
-                echo "| **$DIR** | $NEW_CRITICAL | $NEW_HIGH | $NEW_MEDIUM | $NEW_LOW | $NEW_TOTAL | $IMPACT_STATUS |"
-              fi
-            done
-            echo ""
-            
-            # Critical vulnerabilities section
-            if [ -n "$DOCKERFILES_WITH_NEW_VULNS" ]; then
-              echo "## Critical Vulnerabilities"
-              echo ""; echo "The following Dockerfiles introduce new critical or high severity vulnerabilities that block the build:"; echo ""
-              for DIR in ${DOCKERFILES_WITH_NEW_VULNS//,/ }; do
-                DIR=$(echo "$DIR" | xargs)
-                if [ -n "${VULNERABILITY_DETAILS[$DIR]}" ]; then
-                  echo "### $DIR"; echo ""
-                  echo "\`\`\`"; echo "${VULNERABILITY_DETAILS[$DIR]}"; echo "\`\`\`"; echo ""
-                else
-                  echo "### $DIR"; echo ""
-                  echo "\`\`\`"; echo "Critical/high vulnerabilities detected but detailed information unavailable."; echo "\`\`\`"; echo ""
-                fi
+            # Base images section
+            if [ ${#BASE_RESULTS[@]} -gt 0 ]; then
+              echo "## 🐳 Base Image Analysis"
+              echo ""
+              echo "| Base Image | Critical | High | Medium | Low | Total |"
+              echo "|:-----------|:---------|:-----|:-------|:----|:------|"
+              
+              for base_image in "${!BASE_RESULTS[@]}"; do
+                IFS='|' read -r exit_code critical high medium low total <<< "${BASE_RESULTS[$base_image]}"
+                echo "| \`${base_image}\` | $critical | $high | $medium | $low | $total |"
               done
-              echo "### Required Actions"; echo ""; echo "1. Update vulnerable packages in the affected Dockerfiles"; echo "2. Consider alternative packages without known vulnerabilities"; echo "3. Re-run the scan after making changes"; echo ""
+              echo ""
             fi
             
-            # Dockerfile security analysis
-            echo "## Dockerfile Security Analysis"
-            echo ""; echo "Detailed security analysis for each Dockerfile showing inherited and newly introduced vulnerabilities:"
+            # Dockerfile analysis
+            echo "## 📝 Dockerfile Analysis"
             echo ""
-            echo "**Scan Configuration:**"
-            echo "- Snyk Version: ${SNYK_VERSION}"
-            echo "- Scan Scope: All severities (Critical, High, Medium, Low)"
-            echo "- Scan Date: $(date -u '+%B %d, %Y at %H:%M UTC')"
-            echo "- Analysis: Full Snyk container scan with base image recommendations"
+            echo "| Dockerfile | Status | New Vulnerabilities | Base Image |"
+            echo "|:-----------|:-------|:-------------------|:-----------|"
             
-            # Dynamically detect unique base images
-            UNIQUE_BASE_IMAGES=()
-            for DIR in "${TARGET_DIRS[@]}"; do
-              if [ -f "images/runtime/training/$DIR/Dockerfile" ]; then
-                BASE_IMG=$(grep -m 1 "^FROM" "images/runtime/training/$DIR/Dockerfile" | awk '{print $2}' | sed 's/ AS .*//g' 2>/dev/null || echo "Unknown")
-                if [[ ! " ${UNIQUE_BASE_IMAGES[@]} " =~ " ${BASE_IMG} " ]]; then
-                  UNIQUE_BASE_IMAGES+=("$BASE_IMG")
-                fi
-              fi
+            for dockerfile in "${!DOCKERFILE_RESULTS[@]}"; do
+              IFS='|' read -r status message new_crit new_high new_med new_low new_total df_crit df_high df_med df_low df_total <<< "${DOCKERFILE_RESULTS[$dockerfile]}"
+              base_image="${DOCKERFILE_BASE_MAP[$dockerfile]}"
+              
+              case "$status" in
+                "PASSED") status_icon="✅" ;;
+                "WARNING") status_icon="⚠️" ;;
+                "FAILED") status_icon="❌" ;;
+              esac
+              
+              echo "| \`$dockerfile\` | $status_icon $status | C:$new_crit H:$new_high M:$new_med L:$new_low | \`${base_image}\` |"
             done
-            
-            if [ ${#UNIQUE_BASE_IMAGES[@]} -eq 1 ]; then
-              echo "- Base Image: ${UNIQUE_BASE_IMAGES[0]}"
-            else
-              echo "- Base Images: Multiple (${#UNIQUE_BASE_IMAGES[@]} unique images detected)"
-            fi
             echo ""
             
-            for DIR in "${TARGET_DIRS[@]}"; do
-              if [ -n "${DOCKERFILE_RESULTS[$DIR]}" ]; then
-                IFS='|' read -r status msg docker_critical docker_high docker_medium docker_low docker_total <<< "${DOCKERFILE_RESULTS[$DIR]}"
-                DOCKERFILE_PATH="images/runtime/training/$DIR/Dockerfile"; BASE_SCAN_KEY=""
-                
-                if [ -f "$DOCKERFILE_PATH" ]; then
-                  BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE_PATH" | awk '{print $2}' | sed 's/ AS .*//g')
-                  BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
-                  FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"
-                  BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
+            # Failed Dockerfiles details
+            if [ -n "$FAILED_DOCKERFILES" ]; then
+              echo "## ⚠️ Failed Dockerfiles - Action Required"
+              echo ""
+              for dockerfile in $FAILED_DOCKERFILES; do
+                if [ -n "${DOCKERFILE_RESULTS[$dockerfile]}" ]; then
+                  IFS='|' read -r status message new_crit new_high new_med new_low new_total df_crit df_high df_med df_low df_total <<< "${DOCKERFILE_RESULTS[$dockerfile]}"
+                  base_image="${DOCKERFILE_BASE_MAP[$dockerfile]}"
                   
-                  # Calculate NEW vulnerabilities using improved filtering
-                  NEW_CRITICAL=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "critical")
-                  NEW_HIGH=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "high")
-                  NEW_MEDIUM=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "medium")
-                  NEW_LOW=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "low")
-                  NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
-                else
-                  NEW_CRITICAL=0; NEW_HIGH=0; NEW_MEDIUM=0; NEW_LOW=0; NEW_TOTAL=0
-                fi
-                
-                STATUS_MSG="Clean - No new vulnerabilities introduced"
-                [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ] && STATUS_MSG="Introduces $NEW_CRITICAL critical, $NEW_HIGH high vulnerabilities"
-                [ $NEW_TOTAL -gt 0 ] && [ $NEW_CRITICAL -eq 0 ] && [ $NEW_HIGH -eq 0 ] && STATUS_MSG="Introduces $NEW_TOTAL medium/low vulnerabilities"
-                
-                FULL_SCAN_JSON="$RESULTS_DIR/${DIR}_full_scan.json"; BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
-                
-                # Count NEW vulnerabilities using improved filtering
-                NEW_VULN_COUNT=$(get_new_vuln_count "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" "all")
-                
-                echo "<details>"; echo "<summary><strong>$DIR</strong> - $STATUS_MSG</summary>"; echo ""
-                echo "**Security Status Summary:**"; echo ""
-                echo "| Metric | Inherited | New | Total |"
-                echo "|:-------|:----------|:----|:------|"
-                
-                INHERITED_CRITICAL=$((docker_critical - NEW_CRITICAL)); INHERITED_HIGH=$((docker_high - NEW_HIGH)); INHERITED_MEDIUM=$((docker_medium - NEW_MEDIUM)); INHERITED_LOW=$((docker_low - NEW_LOW)); INHERITED_TOTAL=$((docker_total - NEW_TOTAL))
-                [ $INHERITED_CRITICAL -lt 0 ] && INHERITED_CRITICAL=0; [ $INHERITED_HIGH -lt 0 ] && INHERITED_HIGH=0; [ $INHERITED_MEDIUM -lt 0 ] && INHERITED_MEDIUM=0; [ $INHERITED_LOW -lt 0 ] && INHERITED_LOW=0; [ $INHERITED_TOTAL -lt 0 ] && INHERITED_TOTAL=0
-                
-                echo "| Critical | $INHERITED_CRITICAL | $NEW_CRITICAL | $docker_critical |"
-                echo "| High | $INHERITED_HIGH | $NEW_HIGH | $docker_high |"
-                echo "| Medium | $INHERITED_MEDIUM | $NEW_MEDIUM | $docker_medium |"
-                echo "| Low | $INHERITED_LOW | $NEW_LOW | $docker_low |"
-                echo "| **Total** | **$INHERITED_TOTAL** | **$NEW_TOTAL** | **$docker_total** |"
-                echo ""
-                
-                if [ -f "$FULL_SCAN_JSON" ]; then
-                  echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
-                  
-                  # Always attempt to get vulnerabilities specific to this Dockerfile
-                  ALL_NEW_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
-                  
-                  if [ -n "$ALL_NEW_VULNS" ] && [ "$ALL_NEW_VULNS" != "" ]; then
-                    # This Dockerfile has specific vulnerabilities - show them
-                    echo "\`\`\`"; echo "$ALL_NEW_VULNS"; echo "\`\`\`"; echo ""
-                  else
-                    # This specific Dockerfile introduces no new vulnerabilities
-                    echo "\`\`\`"; echo "No new vulnerabilities - This Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."; echo "\`\`\`"; echo ""
-                  fi
-                  echo "**Scan Details:**"
-                  echo "- Dockerfile Path: $DOCKERFILE_PATH"
+                  echo "### 🔴 $dockerfile"
                   echo ""
-                else
-                  echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
-                  echo "\`\`\`"; echo "Scan data unavailable - Unable to determine Dockerfile-specific vulnerabilities."; echo "\`\`\`"; echo ""
-                fi
-                echo "</details>"; echo ""
-              fi
-            done
-            
-            # Base image details - separate vulnerability lists by severity
-            if [ $BASE_IMAGES_WITH_ISSUES -gt 0 ]; then
-              echo "## Base Image Security Details"
-              echo ""; echo "Security analysis of base images used by Dockerfiles. These vulnerabilities are inherited and do not fail builds:"; echo ""
-              for key in "${!BASE_IMAGE_RESULTS[@]}"; do
-                IFS='|' read -r exit_code critical high medium low total <<< "${BASE_IMAGE_RESULTS[$key]}"
-                if [ "$total" -gt 0 ]; then
-                  base_image_name="${BASE_IMAGE_NAMES[$key]}"
-                  [ -z "$base_image_name" ] && base_image_name=$(echo "$key" | sed 's/_/\//g' | sed 's/\//:/2')
-                  BASE_SCAN_JSON="$RESULTS_DIR/base_${key}.json"
+                  echo "- **Issue:** $message"
+                  echo "- **Base Image:** \`$base_image\`"
+                  echo "- **New Critical:** $new_crit"
+                  echo "- **New High:** $new_high"
+                  echo ""
                   
-                  echo "<details>"
-                  echo "<summary><strong>$base_image_name</strong> - $total total vulnerabilities ($critical critical, $high high, $medium medium, $low low)</summary>"; echo ""
-                  
-                  # Critical vulnerabilities
-                  if [ "$critical" -gt 0 ]; then
-                    CRITICAL_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "critical" 10)
-                    if [ -n "$CRITICAL_BASE_VULNS" ]; then
-                      echo "<details open>"
-                      echo "<summary><strong>Critical Vulnerabilities ($critical total)</strong></summary>"
-                      echo ""
-                      echo "\`\`\`"
-                      echo "$CRITICAL_BASE_VULNS"
-                      echo "\`\`\`"
-                      echo ""
-                      
-                      if [ "$critical" -gt 10 ]; then
-                        REMAINING_CRITICAL=$((critical - 10))
-                        REMAINING_CRITICAL_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "critical" 999 | sed '1,10d')
-                        if [ -n "$REMAINING_CRITICAL_VULNS" ]; then
-                          echo "<details>"
-                          echo "<summary><strong>Show Remaining $REMAINING_CRITICAL Critical Vulnerabilities</strong></summary>"
-                          echo ""
-                          echo "\`\`\`"
-                          echo "$REMAINING_CRITICAL_VULNS"
-                          echo "\`\`\`"
-                          echo ""
-                          echo "</details>"
-                        fi
-                      fi
-                      echo ""
-                      echo "</details>"
-                      echo ""
-                    fi
-                  fi
-                  
-                  # High vulnerabilities
-                  if [ "$high" -gt 0 ]; then
-                    HIGH_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "high" 10)
-                    if [ -n "$HIGH_BASE_VULNS" ]; then
-                      echo "<details open>"
-                      echo "<summary><strong>High Vulnerabilities ($high total)</strong></summary>"
-                      echo ""
-                      echo "\`\`\`"
-                      echo "$HIGH_BASE_VULNS"
-                      echo "\`\`\`"
-                      echo ""
-                      
-                      if [ "$high" -gt 10 ]; then
-                        REMAINING_HIGH=$((high - 10))
-                        REMAINING_HIGH_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "high" 999 | sed '1,10d')
-                        if [ -n "$REMAINING_HIGH_VULNS" ]; then
-                          echo "<details>"
-                          echo "<summary><strong>Show Remaining $REMAINING_HIGH High Vulnerabilities</strong></summary>"
-                          echo ""
-                          echo "\`\`\`"
-                          echo "$REMAINING_HIGH_VULNS"
-                          echo "\`\`\`"
-                          echo ""
-                          echo "</details>"
-                        fi
-                      fi
-                      echo ""
-                      echo "</details>"
-                      echo ""
-                    fi
-                  fi
-                  
-                  # Medium vulnerabilities
-                  if [ "$medium" -gt 0 ]; then
-                    MEDIUM_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "medium" 10)
-                    if [ -n "$MEDIUM_BASE_VULNS" ]; then
-                      echo "<details>"
-                      echo "<summary><strong>Medium Vulnerabilities ($medium total)</strong></summary>"
-                      echo ""
-                      echo "\`\`\`"
-                      echo "$MEDIUM_BASE_VULNS"
-                      echo "\`\`\`"
-                      echo ""
-                      
-                      if [ "$medium" -gt 10 ]; then
-                        REMAINING_MEDIUM=$((medium - 10))
-                        REMAINING_MEDIUM_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "medium" 999 | sed '1,10d')
-                        if [ -n "$REMAINING_MEDIUM_VULNS" ]; then
-                          echo "<details>"
-                          echo "<summary><strong>Show Remaining $REMAINING_MEDIUM Medium Vulnerabilities</strong></summary>"
-                          echo ""
-                          echo "\`\`\`"
-                          echo "$REMAINING_MEDIUM_VULNS"
-                          echo "\`\`\`"
-                          echo ""
-                          echo "</details>"
-                        fi
-                      fi
-                      echo ""
-                      echo "</details>"
-                      echo ""
-                    fi
-                  fi
-                  
-                  # Low vulnerabilities
-                  if [ "$low" -gt 0 ]; then
-                    LOW_BASE_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "low" 10)
-                    if [ -n "$LOW_BASE_VULNS" ]; then
-                      echo "<details>"
-                      echo "<summary><strong>Low Vulnerabilities ($low total)</strong></summary>"
-                      echo ""
-                      echo "\`\`\`"
-                      echo "$LOW_BASE_VULNS"
-                      echo "\`\`\`"
-                      echo ""
-                      
-                      if [ "$low" -gt 10 ]; then
-                        REMAINING_LOW=$((low - 10))
-                        REMAINING_LOW_VULNS=$(get_vulns_by_severity "$BASE_SCAN_JSON" "low" 999 | sed '1,10d')
-                        if [ -n "$REMAINING_LOW_VULNS" ]; then
-                          echo "<details>"
-                          echo "<summary><strong>Show Remaining $REMAINING_LOW Low Vulnerabilities</strong></summary>"
-                          echo ""
-                          echo "\`\`\`"
-                          echo "$REMAINING_LOW_VULNS"
-                          echo "\`\`\`"
-                          echo ""
-                          echo "</details>"
-                        fi
-                      fi
-                      echo ""
-                      echo "</details>"
-                      echo ""
-                    fi
-                  fi
-                  
-                  # No vulnerabilities found message
-                  if [ "$total" -eq 0 ]; then
-                    echo "**Vulnerability Analysis:** No vulnerabilities found."
+                  # Show actual vulnerabilities if available
+                  dockerfile_file="results/${dockerfile}_dockerfile.json"
+                  if [ -f "$dockerfile_file" ] && jq -e . "$dockerfile_file" >/dev/null 2>&1; then
+                    echo "<details>"
+                    echo "<summary>View detailed vulnerabilities</summary>"
+                    echo ""
+                    echo "\`\`\`"
+                    jq -r '.vulnerabilities[]? | select(.severity == "critical" or .severity == "high") | "• \(.severity | ascii_upcase) - \(.id // "Unknown") - \(.title // "No description") [\(.packageName // "Unknown")]"' "$dockerfile_file" | head -10
+                    echo "\`\`\`"
+                    echo ""
+                    echo "</details>"
                     echo ""
                   fi
-                  echo "**Advisory:** Consider updating to newer base image versions when available to reduce inherited vulnerabilities."; echo ""
-                  echo "</details>"; echo ""
                 fi
               done
+              
+              echo "### 🔧 Recommended Actions"
+              echo ""
+              echo "1. **Update base images** to newer versions with security patches"
+              echo "2. **Review package installations** in Dockerfiles"
+              echo "3. **Use minimal base images** when possible"
+              echo "4. **Consider alternative packages** without known vulnerabilities"
+              echo ""
             fi
             
-            # Scan metadata
-            echo "## Scan Metadata"
-            echo ""
-            echo "| Parameter | Value |"
-            echo "|:----------|:------|"
-            echo "| **Workflow Run** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
-            echo "| **Repository** | ${{ github.repository }} |"
-            echo "| **Branch/Ref** | ${{ github.ref_name }} |"
-            echo "| **Commit SHA** | ${{ github.sha }} |"
-            echo "| **Triggered By** | ${{ github.event_name }} |"
-            echo "| **Debug Mode** | $DEBUG_MODE |"
-            echo ""
             echo "---"
-            echo "*Powered by Snyk Container Security v${SNYK_VERSION}*"
+            echo "*Scan completed at $(date -u '+%Y-%m-%d %H:%M UTC') | Powered by Snyk*"
           } >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload Scan Results
+      - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: snyk-scan-results-${{ github.run_number }}
-          path: scan_results/
-          retention-days: 30
+          path: results/
+          retention-days: 7
 
-      - name: Slack Notification
-        if: |
-          always() && 
-          github.event_name != 'pull_request' && 
-          steps.scan.outputs.dockerfile_failures_exist == 'true'
-        continue-on-error: true
+      - name: Notify on Failures
+        if: failure() && steps.scan.outputs.failed_count > 0
         uses: 8398a7/action-slack@v3
         with:
-          status: custom
-          fields: repo,workflow,ref
-          custom_payload: |
-            {
-              "attachments": [
-                {
-                  "color": "${{ steps.scan.outputs.overall_status == 'PASSED' && 'good' || steps.scan.outputs.overall_status == 'WARNING' && 'warning' || 'danger' }}",
-                  "title": "${{ steps.scan.outputs.overall_status == 'PASSED' && 'Snyk Security Scan Passed' || steps.scan.outputs.overall_status == 'WARNING' && 'Snyk Security Scan Warning' || steps.scan.outputs.overall_status == 'ERROR' && 'Snyk Security Scan Error' || 'Snyk Security Scan Failed' }}",
-                  "fields": [
-                    {
-                      "title": "Status",
-                      "value": "${{ steps.scan.outputs.overall_status }}",
-                      "short": true
-                    },
-                    {
-                      "title": "Repository",
-                      "value": "${{ github.repository }}",
-                      "short": true
-                    },
-                    {
-                      "title": "Summary",
-                      "value": "${{ steps.scan.outputs.slack_msg }}",
-                      "short": false
-                    },
-                    {
-                      "title": "Dockerfile Analysis",
-                      "value": "Clean: ${{ steps.scan.outputs.dockerfile_clean_count }}\nNew Medium/Low: ${{ steps.scan.outputs.dockerfile_warning_count }}\nNew Critical/High: ${{ steps.scan.outputs.dockerfile_failed_count }}\nErrors: ${{ steps.scan.outputs.scan_errors_count }}",
-                      "short": true
-                    },
-                    {
-                      "title": "Action Required",
-                      "value": "Review Dockerfile vulnerabilities and update packages before merge",
-                      "short": false
-                    },
-                    {
-                      "title": "View Full Security Report",
-                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Click here for detailed vulnerability analysis and recommendations>",
-                      "short": false
-                    }
-                  ],
-                  "footer": "Snyk Container Security | Only notifies on Dockerfile failures",
-                  "footer_icon": "https://res.cloudinary.com/snyk/image/upload/v1537345894/press-kit/brand/logo-black.png",
-                  "ts": ${{ github.event.head_commit.timestamp && 'new Date(github.event.head_commit.timestamp).getTime() / 1000' || 'Math.floor(Date.now() / 1000)' }}
-                }
-              ]
-            }
+          status: failure
+          text: |
+            🚨 Security vulnerabilities detected in Dockerfiles
+            Failed: ${{ steps.scan.outputs.failed_count }} Dockerfile(s)
+            Message: ${{ steps.scan.outputs.message }}
+            View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL || '' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
