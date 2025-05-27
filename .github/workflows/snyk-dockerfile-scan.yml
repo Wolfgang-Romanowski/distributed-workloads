@@ -197,16 +197,16 @@ jobs:
             OVERALL_MESSAGE="All Dockerfiles are clean"
           fi
           
-          # Save results for summary
-          {
-            echo "OVERALL_STATUS=$OVERALL_STATUS"
-            echo "OVERALL_MESSAGE=$OVERALL_MESSAGE"
-            echo "TOTAL_SCANNED=$TOTAL_SCANNED"
-            echo "CLEAN_COUNT=$CLEAN_COUNT"
-            echo "WARNING_COUNT=$WARNING_COUNT"
-            echo "FAILED_COUNT=$FAILED_COUNT"
-            echo "FAILED_DOCKERFILES=$FAILED_DOCKERFILES"
-          } > results/summary.env
+          # Save results for summary - FIX: Ensure proper variable assignment format
+          cat > results/summary.env << EOF
+          OVERALL_STATUS=${OVERALL_STATUS}
+          OVERALL_MESSAGE=${OVERALL_MESSAGE}
+          TOTAL_SCANNED=${TOTAL_SCANNED}
+          CLEAN_COUNT=${CLEAN_COUNT}
+          WARNING_COUNT=${WARNING_COUNT}
+          FAILED_COUNT=${FAILED_COUNT}
+          FAILED_DOCKERFILES=${FAILED_DOCKERFILES}
+          EOF
           
           # Save detailed results
           for key in "${!BASE_RESULTS[@]}"; do
@@ -241,13 +241,42 @@ jobs:
             exit 0
           fi
           
+          # FIX: Safer way to source the environment file
+          set -a  # automatically export variables
           source results/summary.env
+          set +a  # turn off automatic export
           
-          # Load results
+          # Validate required variables are set
+          if [ -z "$OVERALL_STATUS" ]; then
+            echo "# Security Scan Report Error" >> $GITHUB_STEP_SUMMARY
+            echo "Environment variables not properly set from summary file." >> $GITHUB_STEP_SUMMARY
+            echo "Summary file contents:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat results/summary.env >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          
+          # Load results with error handling
           declare -A BASE_RESULTS DOCKERFILE_RESULTS DOCKERFILE_BASE_MAP
-          [ -f results/base_results.txt ] && while IFS='=' read -r key value; do BASE_RESULTS["$key"]="$value"; done < results/base_results.txt
-          [ -f results/dockerfile_results.txt ] && while IFS='=' read -r key value; do DOCKERFILE_RESULTS["$key"]="$value"; done < results/dockerfile_results.txt
-          [ -f results/dockerfile_base_map.txt ] && while IFS='=' read -r key value; do DOCKERFILE_BASE_MAP["$key"]="$value"; done < results/dockerfile_base_map.txt
+          
+          if [ -f results/base_results.txt ]; then
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              [ -n "$key" ] && BASE_RESULTS["$key"]="$value"
+            done < results/base_results.txt
+          fi
+          
+          if [ -f results/dockerfile_results.txt ]; then
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              [ -n "$key" ] && DOCKERFILE_RESULTS["$key"]="$value"
+            done < results/dockerfile_results.txt
+          fi
+          
+          if [ -f results/dockerfile_base_map.txt ]; then
+            while IFS='=' read -r key value || [ -n "$key" ]; do
+              [ -n "$key" ] && DOCKERFILE_BASE_MAP["$key"]="$value"
+            done < results/dockerfile_base_map.txt
+          fi
           
           {
             echo "# 🛡️ Snyk Security Scan Results"
@@ -266,10 +295,10 @@ jobs:
             echo ""
             echo "| Metric | Count |"
             echo "|:-------|:------|"
-            echo "| Dockerfiles Scanned | $TOTAL_SCANNED |"
-            echo "| Clean (No new vulnerabilities) | $CLEAN_COUNT |"
-            echo "| Warning (Medium/Low vulnerabilities) | $WARNING_COUNT |"
-            echo "| Failed (Critical/High vulnerabilities) | $FAILED_COUNT |"
+            echo "| Dockerfiles Scanned | ${TOTAL_SCANNED:-0} |"
+            echo "| Clean (No new vulnerabilities) | ${CLEAN_COUNT:-0} |"
+            echo "| Warning (Medium/Low vulnerabilities) | ${WARNING_COUNT:-0} |"
+            echo "| Failed (Critical/High vulnerabilities) | ${FAILED_COUNT:-0} |"
             echo "| Unique Base Images | ${#BASE_RESULTS[@]} |"
             echo ""
             
@@ -282,7 +311,7 @@ jobs:
               
               for base_image in "${!BASE_RESULTS[@]}"; do
                 IFS='|' read -r exit_code critical high medium low total <<< "${BASE_RESULTS[$base_image]}"
-                echo "| \`${base_image}\` | $critical | $high | $medium | $low | $total |"
+                echo "| \`${base_image}\` | ${critical:-0} | ${high:-0} | ${medium:-0} | ${low:-0} | ${total:-0} |"
               done
               echo ""
             fi
@@ -301,9 +330,10 @@ jobs:
                 "PASSED") status_icon="✅" ;;
                 "WARNING") status_icon="⚠️" ;;
                 "FAILED") status_icon="❌" ;;
+                *) status_icon="❓" ;;
               esac
               
-              echo "| \`$dockerfile\` | $status_icon $status | C:$new_crit H:$new_high M:$new_med L:$new_low | \`${base_image}\` |"
+              echo "| \`$dockerfile\` | $status_icon $status | C:${new_crit:-0} H:${new_high:-0} M:${new_med:-0} L:${new_low:-0} | \`${base_image}\` |"
             done
             echo ""
             
@@ -320,8 +350,8 @@ jobs:
                   echo ""
                   echo "- **Issue:** $message"
                   echo "- **Base Image:** \`$base_image\`"
-                  echo "- **New Critical:** $new_crit"
-                  echo "- **New High:** $new_high"
+                  echo "- **New Critical:** ${new_crit:-0}"
+                  echo "- **New High:** ${new_high:-0}"
                   echo ""
                   
                   # Show actual vulnerabilities if available
