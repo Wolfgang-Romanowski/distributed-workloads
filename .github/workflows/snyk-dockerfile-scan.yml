@@ -64,9 +64,10 @@ jobs:
           
           echo "Scanning directories: ${TARGET_DIRS[*]}"
           
-          # Step 1: Discover unique base images
+          # Step 1: Discover unique base images with variable resolution
           declare -A BASE_IMAGES
           declare -A DOCKERFILE_BASE_MAP
+          declare -A DOCKERFILE_BUILD_ARGS
           
           for DIR in "${TARGET_DIRS[@]}"; do
             DOCKERFILE="$TRAINING_DIR/$DIR/Dockerfile"
@@ -75,14 +76,66 @@ jobs:
               continue
             fi
             
-            # Extract base image (simple approach)
-            BASE_IMAGE=$(grep -m 1 "^FROM" "$DOCKERFILE" | awk '{print $2}' | cut -d' ' -f1)
-            if [ -n "$BASE_IMAGE" ]; then
-              BASE_IMAGES["$BASE_IMAGE"]=1
-              DOCKERFILE_BASE_MAP["$DIR"]="$BASE_IMAGE"
-              echo "Dockerfile $DIR uses base image: $BASE_IMAGE"
+            # Extract base image and build args
+            BASE_IMAGE_RAW=$(grep -m 1 "^FROM" "$DOCKERFILE" | awk '{print $2}' | cut -d' ' -f1)
+            
+            # Extract build args that might affect the base image
+            BUILD_ARGS=$(grep -E "^ARG" "$DOCKERFILE" | awk '{print $2}' | cut -d'=' -f1 || echo "")
+            
+            # Try to resolve common variables from directory name or build context
+            # Extract version info from directory name (e.g., py311-cuda124-torch251)
+            if [[ "$DIR" =~ py([0-9]+)-.*-torch([0-9]+) ]]; then
+              PYTHON_VER="${BASH_REMATCH[1]}"
+              PYTHON_VERSION="${PYTHON_VER:0:1}.${PYTHON_VER:1}"
+              TORCH_VER="${BASH_REMATCH[2]}"
+              
+              # Common image tag patterns
+              if [[ "$DIR" =~ cuda ]]; then
+                IMAGE_TAG="latest"  # or could be extracted from build args
+              elif [[ "$DIR" =~ rocm ]]; then
+                IMAGE_TAG="latest"
+              else
+                IMAGE_TAG="latest"
+              fi
+            else
+              PYTHON_VERSION="3.11"  # default fallback
+              IMAGE_TAG="latest"
+            fi
+            
+            # Resolve variables in base image
+            RESOLVED_BASE_IMAGE="$BASE_IMAGE_RAW"
+            RESOLVED_BASE_IMAGE="${RESOLVED_BASE_IMAGE//\$\{PYTHON_VERSION\}/$PYTHON_VERSION}"
+            RESOLVED_BASE_IMAGE="${RESOLVED_BASE_IMAGE//\$\{IMAGE_TAG\}/$IMAGE_TAG}"
+            
+            # If still contains variables, try different resolution strategies
+            if [[ "$RESOLVED_BASE_IMAGE" =~ \$ ]]; then
+              echo "::warning::Could not fully resolve base image variables in $DIR: $BASE_IMAGE_RAW"
+              echo "         Using pattern-based resolution..."
+              
+              # Pattern-based resolution
+              if [[ "$BASE_IMAGE_RAW" =~ python.*ubi9 ]] || [[ "$BASE_IMAGE_RAW" =~ ubi9.*python ]]; then
+                RESOLVED_BASE_IMAGE="registry.access.redhat.com/ubi9/python-${PYTHON_VERSION}:${IMAGE_TAG}"
+              fi
+            fi
+            
+            echo "Dockerfile $DIR:"
+            echo "  Raw base image: $BASE_IMAGE_RAW"
+            echo "  Resolved base image: $RESOLVED_BASE_IMAGE"
+            echo "  Extracted vars: PYTHON_VERSION=$PYTHON_VERSION, IMAGE_TAG=$IMAGE_TAG"
+            
+            if [ -n "$RESOLVED_BASE_IMAGE" ]; then
+              BASE_IMAGES["$RESOLVED_BASE_IMAGE"]=1
+              DOCKERFILE_BASE_MAP["$DIR"]="$RESOLVED_BASE_IMAGE"
+              DOCKERFILE_BUILD_ARGS["$DIR"]="PYTHON_VERSION=$PYTHON_VERSION,IMAGE_TAG=$IMAGE_TAG"
             fi
           done
+          
+          echo ""
+          echo "Summary of discovered base images:"
+          for base_image in "${!BASE_IMAGES[@]}"; do
+            echo "  - $base_image"
+          done
+          echo ""
           
           # Step 2: Scan each unique base image once with detailed analysis
           declare -A BASE_RESULTS
