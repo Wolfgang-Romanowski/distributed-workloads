@@ -197,16 +197,16 @@ jobs:
             OVERALL_MESSAGE="All Dockerfiles are clean"
           fi
           
-          # Save results for summary - FIX: Ensure proper variable assignment format
-          cat > results/summary.env << EOF
-          OVERALL_STATUS=${OVERALL_STATUS}
-          OVERALL_MESSAGE=${OVERALL_MESSAGE}
-          TOTAL_SCANNED=${TOTAL_SCANNED}
-          CLEAN_COUNT=${CLEAN_COUNT}
-          WARNING_COUNT=${WARNING_COUNT}
-          FAILED_COUNT=${FAILED_COUNT}
-          FAILED_DOCKERFILES=${FAILED_DOCKERFILES}
-          EOF
+          # Save results for summary - FIXED VERSION
+          {
+            echo "OVERALL_STATUS=$OVERALL_STATUS"
+            echo "OVERALL_MESSAGE=$OVERALL_MESSAGE" 
+            echo "TOTAL_SCANNED=$TOTAL_SCANNED"
+            echo "CLEAN_COUNT=$CLEAN_COUNT"
+            echo "WARNING_COUNT=$WARNING_COUNT"
+            echo "FAILED_COUNT=$FAILED_COUNT"
+            echo "FAILED_DOCKERFILES=$FAILED_DOCKERFILES"
+          } > results/summary.env
           
           # Save detailed results
           for key in "${!BASE_RESULTS[@]}"; do
@@ -235,16 +235,16 @@ jobs:
       - name: Generate Security Report
         if: always()
         run: |
-          if [ ! -f results/summary.env ]; then
+          # Source the environment file safely
+          if [ -f results/summary.env ]; then
+            set -a
+            source results/summary.env
+            set +a
+          else
             echo "# Security Scan Failed" >> $GITHUB_STEP_SUMMARY
             echo "No scan results available." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
-          
-          # FIX: Safer way to source the environment file
-          set -a  # automatically export variables
-          source results/summary.env
-          set +a  # turn off automatic export
           
           # Validate required variables are set
           if [ -z "$OVERALL_STATUS" ]; then
