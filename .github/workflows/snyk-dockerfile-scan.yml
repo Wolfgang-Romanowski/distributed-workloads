@@ -197,16 +197,36 @@ jobs:
             OVERALL_MESSAGE="All Dockerfiles are clean"
           fi
           
-          # Save results for summary - FIXED VERSION
-          {
-            echo "OVERALL_STATUS=$OVERALL_STATUS"
-            echo "OVERALL_MESSAGE=$OVERALL_MESSAGE" 
-            echo "TOTAL_SCANNED=$TOTAL_SCANNED"
-            echo "CLEAN_COUNT=$CLEAN_COUNT"
-            echo "WARNING_COUNT=$WARNING_COUNT"
-            echo "FAILED_COUNT=$FAILED_COUNT"
-            echo "FAILED_DOCKERFILES=$FAILED_DOCKERFILES"
-          } > results/summary.env
+          # Debug: Show variable values before writing
+          echo "DEBUG: Variables before writing to file:"
+          echo "OVERALL_STATUS='$OVERALL_STATUS'"
+          echo "OVERALL_MESSAGE='$OVERALL_MESSAGE'"
+          echo "TOTAL_SCANNED='$TOTAL_SCANNED'"
+          echo "CLEAN_COUNT='$CLEAN_COUNT'"
+          echo "WARNING_COUNT='$WARNING_COUNT'"
+          echo "FAILED_COUNT='$FAILED_COUNT'"
+          echo "FAILED_DOCKERFILES='$FAILED_DOCKERFILES'"
+          
+          # Save results for summary - COMPLETELY REWRITTEN VERSION
+          echo "OVERALL_STATUS=$OVERALL_STATUS" > results/summary.env
+          echo "OVERALL_MESSAGE=$OVERALL_MESSAGE" >> results/summary.env
+          echo "TOTAL_SCANNED=$TOTAL_SCANNED" >> results/summary.env
+          echo "CLEAN_COUNT=$CLEAN_COUNT" >> results/summary.env
+          echo "WARNING_COUNT=$WARNING_COUNT" >> results/summary.env
+          echo "FAILED_COUNT=$FAILED_COUNT" >> results/summary.env
+          echo "FAILED_DOCKERFILES=$FAILED_DOCKERFILES" >> results/summary.env
+          
+          # Debug: Show what was actually written to the file
+          echo "DEBUG: Contents of results/summary.env:"
+          cat results/summary.env
+          
+          # Verify file is valid
+          echo "DEBUG: Testing if file can be sourced:"
+          if source results/summary.env; then
+            echo "DEBUG: File sourced successfully"
+          else
+            echo "DEBUG: File sourcing failed"
+          fi
           
           # Save detailed results
           for key in "${!BASE_RESULTS[@]}"; do
@@ -235,25 +255,46 @@ jobs:
       - name: Generate Security Report
         if: always()
         run: |
-          # Source the environment file safely
-          if [ -f results/summary.env ]; then
-            set -a
-            source results/summary.env
-            set +a
-          else
+          echo "DEBUG: Starting report generation"
+          echo "DEBUG: Checking if results/summary.env exists..."
+          
+          if [ ! -f results/summary.env ]; then
+            echo "DEBUG: results/summary.env does not exist"
             echo "# Security Scan Failed" >> $GITHUB_STEP_SUMMARY
             echo "No scan results available." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
           
-          # Validate required variables are set
-          if [ -z "$OVERALL_STATUS" ]; then
+          echo "DEBUG: File exists, showing contents:"
+          cat results/summary.env
+          
+          echo "DEBUG: Attempting to source the file..."
+          # Source the environment file with error handling
+          set -a
+          if source results/summary.env 2>&1; then
+            echo "DEBUG: Successfully sourced environment file"
+          else
+            echo "DEBUG: Failed to source environment file"
             echo "# Security Scan Report Error" >> $GITHUB_STEP_SUMMARY
-            echo "Environment variables not properly set from summary file." >> $GITHUB_STEP_SUMMARY
-            echo "Summary file contents:" >> $GITHUB_STEP_SUMMARY
+            echo "Failed to load environment variables from summary file." >> $GITHUB_STEP_SUMMARY
+            echo "File contents:" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             cat results/summary.env >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          set +a
+          
+          echo "DEBUG: Variables after sourcing:"
+          echo "OVERALL_STATUS='$OVERALL_STATUS'"
+          echo "OVERALL_MESSAGE='$OVERALL_MESSAGE'"
+          echo "TOTAL_SCANNED='$TOTAL_SCANNED'"
+          
+          # Validate required variables are set
+          if [ -z "$OVERALL_STATUS" ]; then
+            echo "DEBUG: OVERALL_STATUS is empty"
+            echo "# Security Scan Report Error" >> $GITHUB_STEP_SUMMARY
+            echo "Environment variables not properly set from summary file." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
           
@@ -277,6 +318,8 @@ jobs:
               [ -n "$key" ] && DOCKERFILE_BASE_MAP["$key"]="$value"
             done < results/dockerfile_base_map.txt
           fi
+          
+          echo "DEBUG: Starting report generation..."
           
           {
             echo "# 🛡️ Snyk Security Scan Results"
@@ -382,6 +425,8 @@ jobs:
             echo "---"
             echo "*Scan completed at $(date -u '+%Y-%m-%d %H:%M UTC') | Powered by Snyk*"
           } >> $GITHUB_STEP_SUMMARY
+          
+          echo "DEBUG: Report generation completed successfully"
 
       - name: Upload Results
         if: always()
