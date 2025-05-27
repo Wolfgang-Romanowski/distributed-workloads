@@ -107,7 +107,7 @@ jobs:
           }
           
           get_new_vulnerabilities() {
-            local dockerfile_json="$1" base_json="$2" count="${3:-10}"
+            local dockerfile_json="$1" base_json="$2" count="${3:-999}"
             if [ ! -f "$dockerfile_json" ] || ! jq -e . "$dockerfile_json" >/dev/null 2>&1; then
               echo ""; return
             fi
@@ -178,7 +178,7 @@ jobs:
             if [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ]; then
               DOCKERFILE_STATUS="FAILED"; DOCKERFILE_MSG="Introduces $NEW_CRITICAL critical, $NEW_HIGH high vulnerabilities"
               DOCKERFILES_WITH_NEW_VULNS="${DOCKERFILES_WITH_NEW_VULNS}${DIR}, "; DOCKERFILE_WITH_NEW_ISSUES=$((DOCKERFILE_WITH_NEW_ISSUES + 1))
-              VULNERABILITY_DETAILS[$DIR]=$(get_new_vulnerabilities "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 10)
+              VULNERABILITY_DETAILS[$DIR]=$(get_new_vulnerabilities "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
             elif [ $NEW_TOTAL -gt 0 ]; then
               DOCKERFILE_STATUS="WARNING"; DOCKERFILE_MSG="Introduces $NEW_TOTAL medium/low vulnerabilities"; DOCKERFILE_INHERIT_ONLY=$((DOCKERFILE_INHERIT_ONLY + 1))
             else
@@ -263,7 +263,7 @@ jobs:
           }
           
           get_new_vulns() {
-            local dockerfile_json="$1" base_json="$2" count="${3:-10}"
+            local dockerfile_json="$1" base_json="$2" count="${3:-999}"
             [ ! -f "$dockerfile_json" ] || ! jq -e . "$dockerfile_json" >/dev/null 2>&1 && echo "" && return
             if [ ! -f "$base_json" ] || ! jq -e . "$base_json" >/dev/null 2>&1; then
               get_vulns "$dockerfile_json" "$count" "critical,high,medium,low"; return
@@ -421,16 +421,9 @@ jobs:
                 if [ -f "$FULL_SCAN_JSON" ]; then
                   if [ $NEW_VULN_COUNT -gt 0 ]; then
                     echo "**New Vulnerabilities Introduced by Dockerfile:**"; echo ""
-                    TOP_10_NEW_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 10)
-                    if [ -n "$TOP_10_NEW_VULNS" ]; then
-                      echo "\`\`\`"; echo "$TOP_10_NEW_VULNS"; echo "\`\`\`"; echo ""
-                      if [ "$NEW_VULN_COUNT" -gt 10 ]; then
-                        REMAINING_COUNT=$((NEW_VULN_COUNT - 10))
-                        echo "<details>"; echo "<summary><strong>Show Remaining $REMAINING_COUNT New Vulnerabilities</strong></summary>"; echo ""
-                        REMAINING_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999 | tail -n +11)
-                        [ -n "$REMAINING_VULNS" ] && echo "\`\`\`" && echo "$REMAINING_VULNS" && echo "\`\`\`"
-                        echo ""; echo "</details>"; echo ""
-                      fi
+                    ALL_NEW_VULNS=$(get_new_vulns "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 999)
+                    if [ -n "$ALL_NEW_VULNS" ]; then
+                      echo "\`\`\`"; echo "$ALL_NEW_VULNS"; echo "\`\`\`"; echo ""
                     else
                       echo "No detailed vulnerability information available for new issues."; echo ""
                     fi
