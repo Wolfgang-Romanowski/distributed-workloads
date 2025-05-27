@@ -224,9 +224,7 @@ jobs:
               DOCKERFILE_STATUS="PASSED"; DOCKERFILE_MSG="No new vulnerabilities introduced"
               DOCKERFILE_CLEAN=$((DOCKERFILE_CLEAN + 1))
             fi
-            else
-              DOCKERFILE_STATUS="PASSED"; DOCKERFILE_MSG="No new vulnerabilities introduced"; DOCKERFILE_CLEAN=$((DOCKERFILE_CLEAN + 1))
-            fi
+            
             DOCKERFILE_RESULTS[$DIR]="$DOCKERFILE_STATUS|$DOCKERFILE_MSG|$docker_critical|$docker_high|$docker_medium|$docker_low|$docker_total"
           done
           
