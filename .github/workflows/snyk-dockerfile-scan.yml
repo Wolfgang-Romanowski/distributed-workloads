@@ -684,8 +684,8 @@ jobs:
                 echo ""
                 echo "**Vulnerability Breakdown:**"
                 echo ""
-                echo "| Severity | Inherited from Base | New in Dockerfile | Total |"
-                echo "|:---------|:-------------------|:------------------|:------|"
+                echo "| Severity | Inherited from Base | New in $DIR | Total in Image |"
+                echo "|:---------|:-------------------|:------------|:---------------|"
                 echo "| Critical | $INHERITED_CRITICAL | **$NEW_CRITICAL** | $docker_critical |"
                 echo "| High | $INHERITED_HIGH | **$NEW_HIGH** | $docker_high |"
                 echo "| Medium | $INHERITED_MEDIUM | $NEW_MEDIUM | $docker_medium |"
@@ -694,7 +694,7 @@ jobs:
                 echo ""
                 
                 if [ -f "$FULL_SCAN_JSON" ]; then
-                  echo "**New Vulnerabilities Introduced:**"
+                  echo "**New Vulnerabilities Introduced by $DIR:**"
                   echo ""
                   
                   # Get ONLY new vulnerabilities for this specific Dockerfile
@@ -706,14 +706,14 @@ jobs:
                     echo "\`\`\`"
                   else
                     echo "\`\`\`"
-                    echo "✅ No new vulnerabilities - This Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."
+                    echo "✅ No new vulnerabilities - The $DIR Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."
                     echo "\`\`\`"
                   fi
                 else
-                  echo "**New Vulnerabilities Introduced:**"
+                  echo "**New Vulnerabilities Introduced by $DIR:**"
                   echo ""
                   echo "\`\`\`"
-                  echo "❌ Scan data unavailable - Unable to determine Dockerfile-specific vulnerabilities."
+                  echo "❌ Scan data unavailable - Unable to determine vulnerabilities specific to the $DIR Dockerfile."
                   echo "\`\`\`"
                 fi
                 
