@@ -335,6 +335,7 @@ jobs:
           echo "dockerfile_warning_count=$DOCKERFILE_INHERIT_ONLY" >> $GITHUB_OUTPUT
           echo "dockerfile_failed_count=$DOCKERFILE_WITH_NEW_ISSUES" >> $GITHUB_OUTPUT
           echo "scan_errors_count=$SCAN_ERRORS" >> $GITHUB_OUTPUT
+          echo "total_dockerfiles_scanned=$TOTAL_SCANNED" >> $GITHUB_OUTPUT
           
           # Exit with appropriate code
           if [ "$DOCKERFILE_WITH_NEW_ISSUES" -gt 0 ] || [ $SCAN_ERRORS -gt 0 ]; then
@@ -846,7 +847,7 @@ jobs:
                     },
                     {
                       "title": "Dockerfiles Scanned",
-                      "value": "${{ steps.scan.outputs.dockerfile_clean_count + steps.scan.outputs.dockerfile_warning_count + steps.scan.outputs.dockerfile_failed_count + steps.scan.outputs.scan_errors_count }} total",
+                      "value": "${{ steps.scan.outputs.total_dockerfiles_scanned }} total",
                       "short": true
                     },
                     {
