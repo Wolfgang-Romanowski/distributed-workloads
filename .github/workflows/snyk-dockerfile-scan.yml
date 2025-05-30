@@ -144,7 +144,7 @@ jobs:
               | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
               | sort_by(-.cvssScore) 
               | .[0:($count|tonumber)] 
-              | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
+              | map("- \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
               | join("\n")' "$dockerfile_json" 2>/dev/null || echo ""
           }
           
@@ -368,7 +368,7 @@ jobs:
               [.vulnerabilities[]? | select(.severity as $s | ($sevs | split(",") | index($s)))] 
               | sort_by(-.cvssScore) 
               | .[0:($count|tonumber)] 
-              | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
+              | map("- \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
               | join("\n")' "$json_file" 2>/dev/null || echo ""
           }
           
@@ -397,7 +397,7 @@ jobs:
                 [.vulnerabilities[]? | select(.severity as $s | ($sevs | split(",") | index($s)))] 
                 | sort_by(-.cvssScore) 
                 | .[0:($count|tonumber)] 
-                | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
+                | map("- \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
                 | join("\n")' "$dockerfile_json" 2>/dev/null || echo ""
             else
               # Filter out ALL base image vulnerabilities
@@ -406,7 +406,7 @@ jobs:
                 | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
                 | sort_by(-.cvssScore) 
                 | .[0:($count|tonumber)] 
-                | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
+                | map("- \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
                 | join("\n")' "$dockerfile_json" 2>/dev/null || echo ""
             fi
           }
@@ -710,14 +710,14 @@ jobs:
                     echo "\`\`\`"
                   else
                     echo "\`\`\`"
-                    echo "✅ No new vulnerabilities - The $DIR Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."
+                    echo "[PASSED] No new vulnerabilities - The $DIR Dockerfile does not introduce any vulnerabilities beyond those inherited from the base image."
                     echo "\`\`\`"
                   fi
                 else
                   echo "**New Vulnerabilities Introduced by $DIR:**"
                   echo ""
                   echo "\`\`\`"
-                  echo "❌ Scan data unavailable - Unable to determine vulnerabilities specific to the $DIR Dockerfile."
+                  echo "[ERROR] Scan data unavailable - Unable to determine vulnerabilities specific to the $DIR Dockerfile."
                   echo "\`\`\`"
                 fi
                 
@@ -751,7 +751,7 @@ jobs:
                     [.vulnerabilities[]?] 
                     | sort_by(-.cvssScore) 
                     | .[0:10] 
-                    | map("• \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
+                    | map("- \(.severity|ascii_upcase) - \(.id // "Unknown CVE") - \(.title // "No description") [Package: \(.packageName // "Unknown")@\(.version // "Unknown")] (CVSS: \(.cvssScore // "N/A"))")
                     | join("\n")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")
                   
                   if [ -n "$ALL_VULNS" ]; then
@@ -830,13 +830,43 @@ jobs:
                       "short": true
                     },
                     {
+                      "title": "Workflow Run",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>",
+                      "short": true
+                    },
+                    {
+                      "title": "Triggered By",
+                      "value": "${{ github.event_name }}",
+                      "short": true
+                    },
+                    {
                       "title": "Summary",
                       "value": "${{ steps.scan.outputs.slack_msg }}",
                       "short": false
                     },
                     {
+                      "title": "Dockerfiles Scanned",
+                      "value": "${{ steps.scan.outputs.dockerfile_clean_count + steps.scan.outputs.dockerfile_warning_count + steps.scan.outputs.dockerfile_failed_count + steps.scan.outputs.scan_errors_count }} total",
+                      "short": true
+                    },
+                    {
+                      "title": "Build Status",
+                      "value": "${{ steps.scan.outputs.dockerfile_failed_count > 0 && '❌ BLOCKED' || '✅ ALLOWED' }}",
+                      "short": true
+                    },
+                    {
                       "title": "Dockerfile Analysis",
                       "value": "✅ Clean: ${{ steps.scan.outputs.dockerfile_clean_count }}\n⚠️ New Medium/Low: ${{ steps.scan.outputs.dockerfile_warning_count }}\n❌ New Critical/High: ${{ steps.scan.outputs.dockerfile_failed_count }}\n🚫 Errors: ${{ steps.scan.outputs.scan_errors_count }}",
+                      "short": false
+                    },
+                    {
+                      "title": "Base Images with Issues",
+                      "value": "${{ steps.scan.outputs.base_issues_count }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Action Required",
+                      "value": "${{ steps.scan.outputs.dockerfile_failed_count > 0 && '⚠️ Fix critical/high vulnerabilities in Dockerfiles' || '✅ None - Build can proceed' }}",
                       "short": false
                     }
                   ],
