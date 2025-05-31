@@ -493,8 +493,6 @@ jobs:
           {
             echo "# Snyk Dockerfile Security Scan Results"
             echo ""
-            echo "## Summary"
-            echo ""
             
             case "$OVERALL_STATUS" in
               "PASSED")
