@@ -57,6 +57,15 @@ jobs:
           - { tag: "py311-rocm62-torch241", dockerfile: "images/runtime/training/py311-rocm62-torch241/Dockerfile" }
           - { tag: "py311-rocm62-torch251", dockerfile: "images/runtime/training/py311-rocm62-torch251/Dockerfile" }
       fail-fast: false
+    env:
+      QUAY_REGISTRY: "quay.io/modh/training"
+      MAX_RETRY_ATTEMPTS: 3
+      DOCKER_TIMEOUT: 1800  # 30 minutes for large images
+      SCAN_TIMEOUT: 3600    # 1 hour for comprehensive scanning
+      IMAGE_TAG: ${{ matrix.image_config.tag }}
+      DOCKERFILE_PATH: ${{ matrix.image_config.dockerfile }}
+      SCAN_MODE: ${{ github.event.inputs.scan_mode || 'image' }}
+      DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -91,57 +100,31 @@ jobs:
             echo "Processing $CURRENT_TAG"
           fi
 
-      - name: Execute Image Security Scan
+      - name: Initialize Scan Environment
         if: steps.check_target.outputs.skip == 'false'
-        id: scan
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          DEBUG_MODE: ${{ github.event.inputs.debug == 'true' }}
-          SCAN_MODE: ${{ github.event.inputs.scan_mode || 'image' }}
-          IMAGE_TAG: ${{ matrix.image_config.tag }}
-          DOCKERFILE_PATH: ${{ matrix.image_config.dockerfile }}
-          # Red Hat specific configurations
-          QUAY_REGISTRY: "quay.io/modh/training"
-          MAX_RETRY_ATTEMPTS: 3
-          DOCKER_TIMEOUT: 1800  # 30 minutes for large images
-          SCAN_TIMEOUT: 3600    # 1 hour for comprehensive scanning
+        id: init
         run: |
-          set -euo pipefail  # Strict error handling
+          set -euo pipefail
           
+          # Initialize scan environment
           mkdir -p scan_results
-          RESULTS_DIR="scan_results"
+          echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+          echo "BUILT_IMAGE=${QUAY_REGISTRY}:${IMAGE_TAG}" >> $GITHUB_ENV
           
-          # Image and scan configuration with validation
-          BUILT_IMAGE="${QUAY_REGISTRY}:${IMAGE_TAG}"
-          DOCKERFILE="$DOCKERFILE_PATH"
-          SCAN_MODE="${SCAN_MODE:-image}"
-          
-          # Initialize scan state with better error tracking
-          SCAN_SUCCESSFUL=false
-          BASE_SCAN_SUCCESSFUL=false
-          IMAGE_PULLED=false
-          SCAN_ERROR=""
-          RETRY_COUNT=0
-          START_TIME=$(date +%s)
-          
-          # Utility functions for Red Hat QA compliance
+          # Create utility functions script
+          cat > scan_results/utils.sh << 'EOF'
           log_with_timestamp() {
             echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') - $1"
           }
           
           cleanup_resources() {
             log_with_timestamp "Cleaning up resources..."
-            # Remove pulled images to save space
-            if [ "$IMAGE_PULLED" = "true" ]; then
+            if [ "${IMAGE_PULLED:-false}" = "true" ] && [ -n "${BUILT_IMAGE:-}" ]; then
               docker rmi "$BUILT_IMAGE" 2>/dev/null || true
               log_with_timestamp "Cleaned up pulled image: $BUILT_IMAGE"
             fi
-            # Clean up temporary files
             find scan_results -name "*.tmp" -delete 2>/dev/null || true
           }
-          
-          # Set up cleanup trap for robust resource management
-          trap cleanup_resources EXIT
           
           validate_image_reference() {
             local image="$1"
@@ -153,7 +136,7 @@ jobs:
           }
           
           check_disk_space() {
-            local required_gb=6  # Require 6GB free space for 4GB image + overhead
+            local required_gb=6
             local available_kb=$(df /var/lib/docker 2>/dev/null | tail -1 | awk '{print $4}' || echo "0")
             local available_gb=$((available_kb / 1024 / 1024))
             
@@ -194,13 +177,11 @@ jobs:
             return 1
           }
           
-          # Helper functions (keeping existing function structure for compatibility)
           extract_base_image() {
             local dockerfile="$1"
             local base_image=$(grep -m 1 "^FROM" "$dockerfile" | awk '{print $2}' | sed 's/ AS .*//g')
             local original_image="$base_image"
             
-            # Try to resolve ARG variables from the Dockerfile
             while IFS= read -r line; do
               if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
                 local var_name="${BASH_REMATCH[1]}"
@@ -210,31 +191,8 @@ jobs:
               fi
             done < "$dockerfile"
             
-            # If still contains variables, note it for display but return original for scanning
             if [[ "$base_image" =~ \$\{.*\} ]] || [[ "$base_image" =~ \$[A-Z_]+ ]]; then
               echo "$original_image"
-            else
-              echo "$base_image"
-            fi
-          }
-          
-          get_display_name() {
-            local dockerfile="$1"
-            local base_image=$(grep -m 1 "^FROM" "$dockerfile" | awk '{print $2}' | sed 's/ AS .*//g')
-            
-            # Try to resolve ARG variables from the Dockerfile
-            while IFS= read -r line; do
-              if [[ "$line" =~ ^ARG[[:space:]]+([^=[:space:]]+)=(.+)$ ]]; then
-                local var_name="${BASH_REMATCH[1]}"
-                local var_value="${BASH_REMATCH[2]//[\"\']}"
-                base_image="${base_image//\$\{$var_name\}/$var_value}"
-                base_image="${base_image//\$var_name/$var_value}"
-              fi
-            done < "$dockerfile"
-            
-            # If still contains variables, add note for display
-            if [[ "$base_image" =~ \$\{.*\} ]] || [[ "$base_image" =~ \$[A-Z_]+ ]]; then
-              echo "$base_image (contains build-time variables)"
             else
               echo "$base_image"
             fi
@@ -255,115 +213,117 @@ jobs:
             
             echo "$critical|$high|$medium|$low|$total"
           }
+          EOF
           
-          # Validate inputs and environment
+          chmod +x scan_results/utils.sh
+          source scan_results/utils.sh
+          
+          # Set up cleanup trap
+          trap cleanup_resources EXIT
+          
+          log_with_timestamp "Scan environment initialized for $IMAGE_TAG"
+
+      - name: Validate Environment
+        if: steps.check_target.outputs.skip == 'false'
+        run: |
+          source scan_results/utils.sh
+          
           log_with_timestamp "Starting security scan for $IMAGE_TAG"
           log_with_timestamp "Configuration validation..."
           
-          if [ ! -f "$DOCKERFILE" ]; then
-            SCAN_ERROR="Dockerfile not found: $DOCKERFILE"
-            log_with_timestamp "ERROR: $SCAN_ERROR"
-            echo "scan_status=ERROR" >> $GITHUB_OUTPUT
-            echo "scan_error=$SCAN_ERROR" >> $GITHUB_OUTPUT
+          if [ ! -f "$DOCKERFILE_PATH" ]; then
+            echo "scan_error=Dockerfile not found: $DOCKERFILE_PATH" >> $GITHUB_ENV
+            log_with_timestamp "ERROR: Dockerfile not found: $DOCKERFILE_PATH"
             exit 1
           fi
           
           if ! validate_image_reference "$BUILT_IMAGE"; then
-            SCAN_ERROR="Invalid image reference: $BUILT_IMAGE"
-            echo "scan_status=ERROR" >> $GITHUB_OUTPUT
-            echo "scan_error=$SCAN_ERROR" >> $GITHUB_OUTPUT
+            echo "scan_error=Invalid image reference: $BUILT_IMAGE" >> $GITHUB_ENV
             exit 1
           fi
           
           if [ "$SCAN_MODE" = "image" ] && ! check_disk_space; then
-            SCAN_ERROR="Insufficient disk space for image scanning"
-            echo "scan_status=ERROR" >> $GITHUB_OUTPUT
-            echo "scan_error=$SCAN_ERROR" >> $GITHUB_OUTPUT
+            echo "scan_error=Insufficient disk space for image scanning" >> $GITHUB_ENV
             exit 1
           fi
           
-          # Validate Snyk token is working
           if ! snyk auth test >/dev/null 2>&1; then
-            SCAN_ERROR="Snyk authentication failed"
-            log_with_timestamp "ERROR: $SCAN_ERROR"
-            echo "scan_status=ERROR" >> $GITHUB_OUTPUT
-            echo "scan_error=$SCAN_ERROR" >> $GITHUB_OUTPUT
+            echo "scan_error=Snyk authentication failed" >> $GITHUB_ENV
+            log_with_timestamp "ERROR: Snyk authentication failed"
             exit 1
           fi
           
           log_with_timestamp "All validations passed"
+
+      - name: Extract Base Image Information
+        if: steps.check_target.outputs.skip == 'false'
+        run: |
+          source scan_results/utils.sh
           
-          # Extract base image for context and comparison
-          BASE_IMAGE=$(extract_base_image "$DOCKERFILE")
-          DISPLAY_BASE_IMAGE=$(get_display_name "$DOCKERFILE")
-          BASE_SCAN_KEY="${BASE_IMAGE//[:\/]/_}"
-          BASE_SCAN_JSON="$RESULTS_DIR/base_${BASE_SCAN_KEY}.json"
+          BASE_IMAGE=$(extract_base_image "$DOCKERFILE_PATH")
+          echo "BASE_IMAGE=$BASE_IMAGE" >> $GITHUB_ENV
+          echo "BASE_SCAN_KEY=${BASE_IMAGE//[:\/]/_}" >> $GITHUB_ENV
           
           log_with_timestamp "Configuration:"
           log_with_timestamp "  Image Tag: $IMAGE_TAG"
           log_with_timestamp "  Built Image: $BUILT_IMAGE"
           log_with_timestamp "  Base Image: $BASE_IMAGE"
-          log_with_timestamp "  Dockerfile: $DOCKERFILE"
+          log_with_timestamp "  Dockerfile: $DOCKERFILE_PATH"
           log_with_timestamp "  Scan Mode: $SCAN_MODE"
+
+      - name: Pull Image if Required
+        if: steps.check_target.outputs.skip == 'false' && env.SCAN_MODE == 'image'
+        run: |
+          source scan_results/utils.sh
           
-          # Enhanced image pulling with retry logic for large images
-          if [ "$SCAN_MODE" = "dockerfile" ]; then
-            # Legacy mode: scan base image only (for comparison)
-            SCAN_TARGET="$BASE_IMAGE"
-            log_with_timestamp "LEGACY MODE: Scanning base image only"
-          else
-            # New mode: scan complete built image
-            SCAN_TARGET="$BUILT_IMAGE"
-            log_with_timestamp "IMAGE MODE: Scanning complete built image"
+          log_with_timestamp "IMAGE MODE: Scanning complete built image"
+          
+          # Check if image exists remotely
+          log_with_timestamp "Checking image availability: $BUILT_IMAGE"
+          if retry_with_backoff 3 5 "check image existence" \
+             docker manifest inspect "$BUILT_IMAGE" >/dev/null 2>&1; then
+            log_with_timestamp "Image manifest verified"
             
-            # Check if image exists remotely before attempting pull
-            log_with_timestamp "Checking image availability: $BUILT_IMAGE"
-            if retry_with_backoff 3 5 "check image existence" \
-               docker manifest inspect "$BUILT_IMAGE" >/dev/null 2>&1; then
-              log_with_timestamp "Image manifest verified"
-              
-              # Pull the complete built image with robust error handling
-              log_with_timestamp "Pulling built image: $BUILT_IMAGE (this may take several minutes for large images)"
-              
-              # Configure Docker for large image pulls
-              export DOCKER_CLI_EXPERIMENTAL=enabled
-              
-              pull_image() {
-                timeout $DOCKER_TIMEOUT docker pull "$BUILT_IMAGE" 2>&1 | \
-                while read line; do
-                  # Log progress but avoid flooding logs
-                  if [[ "$line" =~ (Downloading|Extracting|Pull complete|Status) ]]; then
-                    log_with_timestamp "Docker: $line"
-                  fi
-                done
-                return ${PIPESTATUS[0]}
-              }
-              
-              if retry_with_backoff $MAX_RETRY_ATTEMPTS 30 "pull large image" pull_image; then
-                IMAGE_PULLED=true
-                log_with_timestamp "Successfully pulled $BUILT_IMAGE"
-                
-                # Verify pulled image integrity
-                if docker inspect "$BUILT_IMAGE" >/dev/null 2>&1; then
-                  log_with_timestamp "Image integrity verified"
-                else
-                  log_with_timestamp "⚠️ Image integrity check failed, but proceeding"
+            # Configure Docker for large image pulls
+            export DOCKER_CLI_EXPERIMENTAL=enabled
+            
+            pull_image() {
+              timeout $DOCKER_TIMEOUT docker pull "$BUILT_IMAGE" 2>&1 | \
+              while read line; do
+                if [[ "$line" =~ (Downloading|Extracting|Pull complete|Status) ]]; then
+                  log_with_timestamp "Docker: $line"
                 fi
+              done
+              return ${PIPESTATUS[0]}
+            }
+            
+            log_with_timestamp "Pulling built image: $BUILT_IMAGE (this may take several minutes for large images)"
+            if retry_with_backoff $MAX_RETRY_ATTEMPTS 30 "pull large image" pull_image; then
+              echo "IMAGE_PULLED=true" >> $GITHUB_ENV
+              log_with_timestamp "Successfully pulled $BUILT_IMAGE"
+              
+              if docker inspect "$BUILT_IMAGE" >/dev/null 2>&1; then
+                log_with_timestamp "Image integrity verified"
               else
-                log_with_timestamp "⚠️ Failed to pull $BUILT_IMAGE after $MAX_RETRY_ATTEMPTS attempts"
-                log_with_timestamp "Attempting direct scan without local pull..."
-                # Snyk can scan remote images without pulling, but pulling is more reliable
+                log_with_timestamp "Image integrity check failed, but proceeding"
               fi
             else
-              SCAN_ERROR="Image not found or inaccessible: $BUILT_IMAGE"
-              log_with_timestamp "ERROR: $SCAN_ERROR"
-              echo "scan_status=ERROR" >> $GITHUB_OUTPUT
-              echo "scan_error=$SCAN_ERROR" >> $GITHUB_OUTPUT
-              exit 1
+              log_with_timestamp "Failed to pull $BUILT_IMAGE after $MAX_RETRY_ATTEMPTS attempts"
+              log_with_timestamp "Attempting direct scan without local pull..."
             fi
+          else
+            echo "scan_error=Image not found or inaccessible: $BUILT_IMAGE" >> $GITHUB_ENV
+            log_with_timestamp "ERROR: Image not found or inaccessible: $BUILT_IMAGE"
+            exit 1
           fi
+
+      - name: Scan Base Image
+        if: steps.check_target.outputs.skip == 'false'
+        run: |
+          source scan_results/utils.sh
           
-          # Enhanced base image scanning with better error handling
+          BASE_SCAN_JSON="scan_results/base_${BASE_SCAN_KEY}.json"
+          
           log_with_timestamp "Scanning base image for comparison: $BASE_IMAGE"
           
           scan_base_image() {
@@ -382,41 +342,56 @@ jobs:
           set -e
           
           if [ -f "$BASE_SCAN_JSON" ] && [ -s "$BASE_SCAN_JSON" ] && jq -e . "$BASE_SCAN_JSON" >/dev/null 2>&1; then
-            BASE_SCAN_SUCCESSFUL=true
+            echo "BASE_SCAN_SUCCESSFUL=true" >> $GITHUB_ENV
             log_with_timestamp "Base image scan completed"
           else
-            log_with_timestamp "⚠️ Base image scan failed or returned invalid data"
-            # Create empty baseline for comparison with error tracking
+            echo "BASE_SCAN_SUCCESSFUL=false" >> $GITHUB_ENV
+            log_with_timestamp "Base image scan failed or returned invalid data"
             echo '{"vulnerabilities":[],"uniqueCount":0,"error":"base_scan_failed","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > "$BASE_SCAN_JSON"
           fi
           
           IFS='|' read -r base_critical base_high base_medium base_low base_total <<< "$(get_vuln_counts "$BASE_SCAN_JSON")"
+          echo "BASE_CRITICAL=$base_critical" >> $GITHUB_ENV
+          echo "BASE_HIGH=$base_high" >> $GITHUB_ENV
+          echo "BASE_MEDIUM=$base_medium" >> $GITHUB_ENV
+          echo "BASE_LOW=$base_low" >> $GITHUB_ENV
+          echo "BASE_TOTAL=$base_total" >> $GITHUB_ENV
+
+      - name: Scan Target Image
+        if: steps.check_target.outputs.skip == 'false'
+        id: target_scan
+        run: |
+          source scan_results/utils.sh
           
-          # Enhanced target scanning with comprehensive error handling
-          FULL_SCAN_JSON="$RESULTS_DIR/${IMAGE_TAG}_full_scan.json"
+          FULL_SCAN_JSON="scan_results/${IMAGE_TAG}_full_scan.json"
+          
+          if [ "$SCAN_MODE" = "dockerfile" ]; then
+            SCAN_TARGET="$BASE_IMAGE"
+            log_with_timestamp "LEGACY MODE: Scanning base image only"
+          else
+            SCAN_TARGET="$BUILT_IMAGE"
+          fi
+          
           log_with_timestamp "Scanning target: $SCAN_TARGET"
           
           scan_target_image() {
             local temp_output="$FULL_SCAN_JSON.tmp"
             
             if [ "$SCAN_MODE" = "image" ]; then
-              # Scan complete built image with Dockerfile context and comprehensive options
               timeout $SCAN_TIMEOUT snyk container test "$SCAN_TARGET" \
-                --file="$DOCKERFILE" \
+                --file="$DOCKERFILE_PATH" \
                 --json \
                 --severity-threshold=low \
                 --exclude-base-image-vulns=false \
                 > "$temp_output" 2>/dev/null
             else
-              # Legacy mode: scan base image with Dockerfile context
               timeout $SCAN_TIMEOUT snyk container test "$SCAN_TARGET" \
-                --file="$DOCKERFILE" \
+                --file="$DOCKERFILE_PATH" \
                 --json \
                 --severity-threshold=low \
                 > "$temp_output" 2>/dev/null
             fi
             
-            # Validate scan output before moving to final location
             if [ -f "$temp_output" ] && [ -s "$temp_output" ] && jq -e . "$temp_output" >/dev/null 2>&1; then
               mv "$temp_output" "$FULL_SCAN_JSON"
               return 0
@@ -430,58 +405,64 @@ jobs:
           SCAN_EXIT_CODE=0
           
           if retry_with_backoff $MAX_RETRY_ATTEMPTS 30 "target image scan" scan_target_image; then
-            SCAN_SUCCESSFUL=true
+            echo "SCAN_SUCCESSFUL=true" >> $GITHUB_ENV
             log_with_timestamp "Target scan completed successfully"
           else
             SCAN_EXIT_CODE=1
             
-            # Special handling for large image scan failures
-            if [ "$SCAN_MODE" = "image" ] && [ "$IMAGE_PULLED" = "false" ]; then
-              log_with_timestamp "Large image scan failed without local pull, attempting one more time after pull..."
+            # Emergency retry for large images
+            if [ "$SCAN_MODE" = "image" ] && [ "${IMAGE_PULLED:-false}" = "false" ]; then
+              log_with_timestamp "Large image scan failed without local pull, attempting emergency pull..."
               
               if retry_with_backoff 1 60 "emergency image pull" docker pull "$BUILT_IMAGE" >/dev/null 2>&1; then
-                IMAGE_PULLED=true
+                echo "IMAGE_PULLED=true" >> $GITHUB_ENV
                 if retry_with_backoff 1 60 "post-pull scan" scan_target_image; then
-                  SCAN_SUCCESSFUL=true
+                  echo "SCAN_SUCCESSFUL=true" >> $GITHUB_ENV
                   SCAN_EXIT_CODE=0
                   log_with_timestamp "Target scan succeeded after emergency pull"
                 fi
               fi
             fi
             
-            if [ "$SCAN_SUCCESSFUL" = "false" ]; then
+            if [ "${SCAN_SUCCESSFUL:-false}" = "false" ]; then
               SCAN_ERROR="Scan failed or returned invalid data for $SCAN_TARGET after $MAX_RETRY_ATTEMPTS attempts"
+              echo "scan_error=$SCAN_ERROR" >> $GITHUB_ENV
               log_with_timestamp "ERROR: $SCAN_ERROR"
-              # Create minimal structure for error handling with more details
               echo '{"vulnerabilities":[],"uniqueCount":0,"error":"target_scan_failed","target":"'$SCAN_TARGET'","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","attempts":'$MAX_RETRY_ATTEMPTS'}' > "$FULL_SCAN_JSON"
             fi
           fi
           set -e
+
+      - name: Calculate Vulnerabilities
+        if: steps.check_target.outputs.skip == 'false'
+        id: calculate
+        run: |
+          source scan_results/utils.sh
+          
+          FULL_SCAN_JSON="scan_results/${IMAGE_TAG}_full_scan.json"
+          BASE_SCAN_JSON="scan_results/base_${BASE_SCAN_KEY}.json"
           
           # Calculate vulnerability counts
           IFS='|' read -r target_critical target_high target_medium target_low target_total <<< "$(get_vuln_counts "$FULL_SCAN_JSON")"
           
           # Calculate new vulnerabilities (those not in base image)
-          if [ -f "$BASE_SCAN_JSON" ] && [ -f "$FULL_SCAN_JSON" ] && [ "$BASE_SCAN_SUCCESSFUL" = "true" ] && [ "$SCAN_SUCCESSFUL" = "true" ]; then
+          if [ -f "$BASE_SCAN_JSON" ] && [ -f "$FULL_SCAN_JSON" ] && [ "${BASE_SCAN_SUCCESSFUL:-false}" = "true" ] && [ "${SCAN_SUCCESSFUL:-false}" = "true" ]; then
             BASE_VULN_SIGS=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$BASE_SCAN_JSON" 2>/dev/null || echo "")
             
             if [ -z "$BASE_VULN_SIGS" ]; then
-              # Base image is clean, all target vulnerabilities are new
               NEW_CRITICAL=$target_critical
               NEW_HIGH=$target_high
               NEW_MEDIUM=$target_medium
               NEW_LOW=$target_low
             else
-              # Calculate vulnerabilities not present in base image
               NEW_CRITICAL=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "critical")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
               NEW_HIGH=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "high")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
               NEW_MEDIUM=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "medium")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
-              NEW_LOW=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
+              NEW_LOW=$(jq -r --arg base_sigs "$BASE_VULN_SIGS" '[.vulnerabilities[]? | select(.severity == "low")] | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not))) | length' "$FULL_SCAN_JSON" 2>/dev/null || echo "0")
             fi
             
             NEW_TOTAL=$((NEW_CRITICAL + NEW_HIGH + NEW_MEDIUM + NEW_LOW))
           else
-            # Fallback: treat all vulnerabilities as new if comparison fails
             NEW_CRITICAL=$target_critical
             NEW_HIGH=$target_high
             NEW_MEDIUM=$target_medium
@@ -489,10 +470,36 @@ jobs:
             NEW_TOTAL=$target_total
           fi
           
+          # Set outputs
+          echo "target_critical=$target_critical" >> $GITHUB_OUTPUT
+          echo "target_high=$target_high" >> $GITHUB_OUTPUT
+          echo "target_medium=$target_medium" >> $GITHUB_OUTPUT
+          echo "target_low=$target_low" >> $GITHUB_OUTPUT
+          echo "target_total=$target_total" >> $GITHUB_OUTPUT
+          echo "new_critical=$NEW_CRITICAL" >> $GITHUB_OUTPUT
+          echo "new_high=$NEW_HIGH" >> $GITHUB_OUTPUT
+          echo "new_medium=$NEW_MEDIUM" >> $GITHUB_OUTPUT
+          echo "new_low=$NEW_LOW" >> $GITHUB_OUTPUT
+          echo "new_total=$NEW_TOTAL" >> $GITHUB_OUTPUT
+
+      - name: Determine Scan Status
+        if: steps.check_target.outputs.skip == 'false'
+        id: status
+        run: |
+          source scan_results/utils.sh
+          
+          NEW_CRITICAL=${{ steps.calculate.outputs.new_critical }}
+          NEW_HIGH=${{ steps.calculate.outputs.new_high }}
+          NEW_TOTAL=${{ steps.calculate.outputs.new_total }}
+          
+          # Calculate scan duration
+          END_TIME=$(date +%s)
+          SCAN_DURATION=$((END_TIME - START_TIME))
+          
           # Determine scan status and message
-          if [ "$SCAN_SUCCESSFUL" = "false" ]; then
+          if [ "${SCAN_SUCCESSFUL:-false}" = "false" ]; then
             SCAN_STATUS="ERROR"
-            SCAN_MESSAGE="Scan failed: $SCAN_ERROR"
+            SCAN_MESSAGE="Scan failed: ${scan_error:-Unknown error}"
           elif [ $NEW_CRITICAL -gt 0 ] || [ $NEW_HIGH -gt 0 ]; then
             SCAN_STATUS="FAILED"
             if [ $NEW_CRITICAL -gt 0 ] && [ $NEW_HIGH -gt 0 ]; then
@@ -511,128 +518,109 @@ jobs:
           fi
           
           # Debug mode handling
-          if [ "$DEBUG_MODE" = "true" ] && [ $base_total -gt 0 ]; then
+          if [ "$DEBUG_MODE" = "true" ] && [ "${BASE_TOTAL:-0}" -gt 0 ]; then
             SCAN_STATUS="FAILED"
-            SCAN_MESSAGE="$SCAN_MESSAGE (Debug Mode: Base image has $base_total vulnerabilities)"
+            SCAN_MESSAGE="$SCAN_MESSAGE (Debug Mode: Base image has ${BASE_TOTAL} vulnerabilities)"
           fi
           
-          # Calculate scan duration and performance metrics
-          END_TIME=$(date +%s)
-          SCAN_DURATION=$((END_TIME - START_TIME))
-          
-          # Output scan results with enhanced logging
+          # Output results
           log_with_timestamp "Scan Results for $IMAGE_TAG:"
           log_with_timestamp "  Scan Status: $SCAN_STATUS"
           log_with_timestamp "  Message: $SCAN_MESSAGE"
-          log_with_timestamp "  Target Vulnerabilities: $target_total ($target_critical critical, $target_high high, $target_medium medium, $target_low low)"
-          log_with_timestamp "  Base Vulnerabilities: $base_total ($base_critical critical, $base_high high, $base_medium medium, $base_low low)"
-          log_with_timestamp "  New Vulnerabilities: $NEW_TOTAL ($NEW_CRITICAL critical, $NEW_HIGH high, $NEW_MEDIUM medium, $NEW_LOW low)"
-          log_with_timestamp "  Scan Mode: $SCAN_MODE"
-          log_with_timestamp "  Image Pulled: $IMAGE_PULLED"
           log_with_timestamp "  Scan Duration: ${SCAN_DURATION}s"
           
-          # Enhanced Snyk monitoring with error handling
-          if [ "$SCAN_SUCCESSFUL" = "true" ] && [ "$SCAN_MODE" = "image" ]; then
-            log_with_timestamp "Creating Snyk monitor project for continuous surveillance..."
-            set +e
-            
-            monitor_project() {
-              timeout 300 snyk container monitor "$SCAN_TARGET" \
-                --file="$DOCKERFILE" \
-                --project-name="training-$IMAGE_TAG" \
-                --org="${SNYK_ORG_ID:-}" \
-                --project-tags="team=rhoai,component=training,image=$IMAGE_TAG,scan_mode=$SCAN_MODE" \
-                >/dev/null 2>&1
-            }
-            
-            if retry_with_backoff 2 10 "monitor project creation" monitor_project; then
-              log_with_timestamp "Monitor project created successfully"
-              echo "monitor_created=true" >> $GITHUB_OUTPUT
-            else
-              log_with_timestamp "⚠️ Monitor project creation failed (non-blocking)"
-              echo "monitor_created=false" >> $GITHUB_OUTPUT
-            fi
-            set -e
-          else
-            echo "monitor_created=false" >> $GITHUB_OUTPUT
-          fi
-          # Set GitHub Actions outputs (maintaining compatibility with existing workflow)
+          # Set outputs
           echo "scan_status=$SCAN_STATUS" >> $GITHUB_OUTPUT
           echo "scan_message=$SCAN_MESSAGE" >> $GITHUB_OUTPUT
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "built_image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
-          echo "base_image=$DISPLAY_BASE_IMAGE" >> $GITHUB_OUTPUT
+          echo "base_image=$BASE_IMAGE" >> $GITHUB_OUTPUT
           echo "scan_mode=$SCAN_MODE" >> $GITHUB_OUTPUT
-          echo "image_pulled=$IMAGE_PULLED" >> $GITHUB_OUTPUT
-          echo "scan_successful=$SCAN_SUCCESSFUL" >> $GITHUB_OUTPUT
-          echo "base_scan_successful=$BASE_SCAN_SUCCESSFUL" >> $GITHUB_OUTPUT
+          echo "image_pulled=${IMAGE_PULLED:-false}" >> $GITHUB_OUTPUT
+          echo "scan_successful=${SCAN_SUCCESSFUL:-false}" >> $GITHUB_OUTPUT
+          echo "base_scan_successful=${BASE_SCAN_SUCCESSFUL:-false}" >> $GITHUB_OUTPUT
           echo "scan_duration=$SCAN_DURATION" >> $GITHUB_OUTPUT
-          echo "retry_count=$RETRY_COUNT" >> $GITHUB_OUTPUT
-          echo "target_critical=$target_critical" >> $GITHUB_OUTPUT
-          echo "target_high=$target_high" >> $GITHUB_OUTPUT
-          echo "target_medium=$target_medium" >> $GITHUB_OUTPUT
-          echo "target_low=$target_low" >> $GITHUB_OUTPUT
-          echo "target_total=$target_total" >> $GITHUB_OUTPUT
-          echo "base_critical=$base_critical" >> $GITHUB_OUTPUT
-          echo "base_high=$base_high" >> $GITHUB_OUTPUT
-          echo "base_medium=$base_medium" >> $GITHUB_OUTPUT
-          echo "base_low=$base_low" >> $GITHUB_OUTPUT
-          echo "base_total=$base_total" >> $GITHUB_OUTPUT
-          echo "new_critical=$NEW_CRITICAL" >> $GITHUB_OUTPUT
-          echo "new_high=$NEW_HIGH" >> $GITHUB_OUTPUT
-          echo "new_medium=$NEW_MEDIUM" >> $GITHUB_OUTPUT
-          echo "new_low=$NEW_LOW" >> $GITHUB_OUTPUT
-          echo "new_total=$NEW_TOTAL" >> $GITHUB_OUTPUT
+
+      - name: Create Monitoring Project
+        if: steps.check_target.outputs.skip == 'false' && env.SCAN_SUCCESSFUL == 'true' && env.SCAN_MODE == 'image'
+        continue-on-error: true
+        run: |
+          source scan_results/utils.sh
+          
+          log_with_timestamp "Creating Snyk monitor project for continuous surveillance..."
+          
+          monitor_project() {
+            timeout 300 snyk container monitor "$BUILT_IMAGE" \
+              --file="$DOCKERFILE_PATH" \
+              --project-name="training-$IMAGE_TAG" \
+              --org="${SNYK_ORG_ID:-}" \
+              --project-tags="team=rhoai,component=training,image=$IMAGE_TAG,scan_mode=$SCAN_MODE" \
+              >/dev/null 2>&1
+          }
+          
+          if retry_with_backoff 2 10 "monitor project creation" monitor_project; then
+            log_with_timestamp "Monitor project created successfully"
+            echo "monitor_created=true" >> $GITHUB_OUTPUT
+          else
+            log_with_timestamp "Monitor project creation failed (non-blocking)"
+            echo "monitor_created=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Scan Metadata
+        if: steps.check_target.outputs.skip == 'false'
+        run: |
+          source scan_results/utils.sh
+          
+          END_TIME=$(date +%s)
+          SCAN_DURATION=$((END_TIME - START_TIME))
           
           # Enhanced scan metadata with Red Hat QA compliance fields
-          cat > "$RESULTS_DIR/scan_metadata_${IMAGE_TAG}.json" << EOF
+          cat > "scan_results/scan_metadata_${IMAGE_TAG}.json" << EOF
           {
             "schema_version": "1.0",
             "image_tag": "$IMAGE_TAG",
             "built_image": "$BUILT_IMAGE",
             "base_image": "$BASE_IMAGE",
-            "display_base_image": "$DISPLAY_BASE_IMAGE",
-            "dockerfile_path": "$DOCKERFILE",
+            "dockerfile_path": "$DOCKERFILE_PATH",
             "scan_mode": "$SCAN_MODE",
-            "scan_status": "$SCAN_STATUS",
-            "scan_message": "$SCAN_MESSAGE",
-            "image_pulled": $IMAGE_PULLED,
-            "scan_successful": $SCAN_SUCCESSFUL,
-            "base_scan_successful": $BASE_SCAN_SUCCESSFUL,
+            "scan_status": "${{ steps.status.outputs.scan_status }}",
+            "scan_message": "${{ steps.status.outputs.scan_message }}",
+            "image_pulled": "${IMAGE_PULLED:-false}",
+            "scan_successful": "${SCAN_SUCCESSFUL:-false}",
+            "base_scan_successful": "${BASE_SCAN_SUCCESSFUL:-false}",
             "performance": {
               "scan_duration_seconds": $SCAN_DURATION,
-              "retry_attempts": $RETRY_COUNT,
               "max_retry_attempts": $MAX_RETRY_ATTEMPTS,
               "docker_timeout": $DOCKER_TIMEOUT,
               "scan_timeout": $SCAN_TIMEOUT
             },
             "vulnerabilities": {
               "target": {
-                "critical": $target_critical,
-                "high": $target_high,
-                "medium": $target_medium,
-                "low": $target_low,
-                "total": $target_total
+                "critical": ${{ steps.calculate.outputs.target_critical }},
+                "high": ${{ steps.calculate.outputs.target_high }},
+                "medium": ${{ steps.calculate.outputs.target_medium }},
+                "low": ${{ steps.calculate.outputs.target_low }},
+                "total": ${{ steps.calculate.outputs.target_total }}
               },
               "base": {
-                "critical": $base_critical,
-                "high": $base_high,
-                "medium": $base_medium,
-                "low": $base_low,
-                "total": $base_total
+                "critical": ${BASE_CRITICAL:-0},
+                "high": ${BASE_HIGH:-0},
+                "medium": ${BASE_MEDIUM:-0},
+                "low": ${BASE_LOW:-0},
+                "total": ${BASE_TOTAL:-0}
               },
               "new": {
-                "critical": $NEW_CRITICAL,
-                "high": $NEW_HIGH,
-                "medium": $NEW_MEDIUM,
-                "low": $NEW_LOW,
-                "total": $NEW_TOTAL
+                "critical": ${{ steps.calculate.outputs.new_critical }},
+                "high": ${{ steps.calculate.outputs.new_high }},
+                "medium": ${{ steps.calculate.outputs.new_medium }},
+                "low": ${{ steps.calculate.outputs.new_low }},
+                "total": ${{ steps.calculate.outputs.new_total }}
               }
             },
             "compliance": {
               "red_hat_compliant": true,
               "security_scan_version": "2.0",
-              "baseline_comparison": $([ "$BASE_SCAN_SUCCESSFUL" = "true" ] && echo "true" || echo "false")
+              "baseline_comparison": ${BASE_SCAN_SUCCESSFUL:-false}
             },
             "environment": {
               "github_run_id": "${{ github.run_id }}",
@@ -640,7 +628,7 @@ jobs:
               "github_repository": "${{ github.repository }}",
               "github_ref": "${{ github.ref }}",
               "runner_os": "${{ runner.os }}",
-              "snyk_version": "${SNYK_VERSION}"
+              "snyk_version": "${{ steps.verify_token.outputs.version }}"
             },
             "timestamps": {
               "scan_start": "$START_TIME",
@@ -649,226 +637,81 @@ jobs:
               "scan_timestamp_iso": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             },
             "error_details": {
-              "scan_error": "$SCAN_ERROR",
-              "has_errors": $([ -n "$SCAN_ERROR" ] && echo "true" || echo "false")
+              "scan_error": "${scan_error:-}",
+              "has_errors": $([ -n "${scan_error:-}" ] && echo "true" || echo "false")
             }
           }
           EOF
           
-                      log_with_timestamp "Scan metadata saved to $RESULTS_DIR/scan_metadata_${IMAGE_TAG}.json"
-          if [ "$SCAN_STATUS" = "ERROR" ]; then
-            echo "::error::Scan failed for $IMAGE_TAG: $SCAN_ERROR"
-            exit 1
-          elif [ "$SCAN_STATUS" = "FAILED" ]; then
-            echo "::error::Security check failed for $IMAGE_TAG: Critical or high severity vulnerabilities found"
-            exit 1
-          else
-            echo "Security check passed for $IMAGE_TAG"
-            exit 0
-          fi
+          log_with_timestamp "Scan metadata saved to scan_results/scan_metadata_${IMAGE_TAG}.json"
 
-      - name: Generate Scan Report
-        if: always() && steps.check_target.outputs.skip == 'false'
-        env:
-          SNYK_VERSION: ${{ steps.verify_token.outputs.version }}
-          IMAGE_TAG: ${{ matrix.image_config.tag }}
+      - name: Generate Security Report
+        if: steps.check_target.outputs.skip == 'false'
         run: |
-          RESULTS_DIR="scan_results"
-          
-          # Helper function to get vulnerabilities with details
-          get_vulnerability_details() {
-            local json_file="$1"
-            local baseline_file="$2"
-            local count="${3:-20}"
-            local severity_filter="${4:-critical,high,medium,low}"
-            
-            if [ ! -f "$json_file" ] || ! jq -e . "$json_file" >/dev/null 2>&1; then
-              echo "No vulnerability data available"
-              return
-            fi
-            
-            if [ ! -f "$baseline_file" ] || ! jq -e . "$baseline_file" >/dev/null 2>&1; then
-              # No baseline, show all vulnerabilities
-              jq -r --arg count "$count" --arg sevs "$severity_filter" '
-                [.vulnerabilities[]? | select(.severity as $s | ($sevs | split(",") | index($s)))] 
-                | sort_by(-.cvssScore) 
-                | .[0:($count|tonumber)] 
-                | map("**\(.severity|ascii_upcase)** - `\(.id // "Unknown CVE")` - \(.title // "No description")  
-                Package: `\(.packageName // "Unknown")@\(.version // "Unknown")`  
-                CVSS: \(.cvssScore // "N/A") | Fixed in: \(.fixedIn // "No fix available")")
-                | join("\n\n")' "$json_file" 2>/dev/null || echo "Error parsing vulnerabilities"
-              return
-            fi
-            
-            # Compare against baseline to show only new vulnerabilities
-            local baseline_sigs=$(jq -r '[.vulnerabilities[]? | "\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")"] | join(",")' "$baseline_file" 2>/dev/null || echo "")
-            
-            if [ -z "$baseline_sigs" ]; then
-              # Baseline is clean, all vulnerabilities are new
-              jq -r --arg count "$count" --arg sevs "$severity_filter" '
-                [.vulnerabilities[]? | select(.severity as $s | ($sevs | split(",") | index($s)))] 
-                | sort_by(-.cvssScore) 
-                | .[0:($count|tonumber)] 
-                | map("**\(.severity|ascii_upcase)** - `\(.id // "Unknown CVE")` - \(.title // "No description")  
-                Package: `\(.packageName // "Unknown")@\(.version // "Unknown")`  
-                CVSS: \(.cvssScore // "N/A") | Fixed in: \(.fixedIn // "No fix available")")
-                | join("\n\n")' "$json_file" 2>/dev/null || echo "Error parsing vulnerabilities"
-            else
-              # Filter out baseline vulnerabilities
-              local new_vulns=$(jq -r --arg count "$count" --arg base_sigs "$baseline_sigs" --arg sevs "$severity_filter" '
-                [.vulnerabilities[]? | select(.severity as $s | ($sevs | split(",") | index($s)))] 
-                | map(select(("\(.id // "unknown"):\(.packageName // "unknown"):\(.version // "unknown"):\(.severity // "unknown")") as $sig | ($base_sigs | split(",") | index($sig) | not)))
-                | sort_by(-.cvssScore) 
-                | .[0:($count|tonumber)] 
-                | map("**\(.severity|ascii_upcase)** - `\(.id // "Unknown CVE")` - \(.title // "No description")  
-                Package: `\(.packageName // "Unknown")@\(.version // "Unknown")`  
-                CVSS: \(.cvssScore // "N/A") | Fixed in: \(.fixedIn // "No fix available")")
-                | join("\n\n")' "$json_file" 2>/dev/null)
-              
-              if [ -z "$new_vulns" ]; then
-                echo "✅ No new vulnerabilities found beyond base image"
-              else
-                echo "$new_vulns"
-              fi
-            fi
-          }
+          source scan_results/utils.sh
           
           # Create detailed markdown report
-          REPORT_FILE="$RESULTS_DIR/security_report_${IMAGE_TAG}.md"
+          REPORT_FILE="scan_results/security_report_${IMAGE_TAG}.md"
           
-          cat > "$REPORT_FILE" << 'EOF'
+          cat > "$REPORT_FILE" << EOF
           # Security Scan Report
           
           ## Image Information
-          EOF
-          
-          # Add scan metadata if available
-          if [ -f "$RESULTS_DIR/scan_metadata_${IMAGE_TAG}.json" ]; then
-            cat >> "$REPORT_FILE" << EOF
           
           | Field | Value |
           |:------|:------|
-          | **Image Tag** | \`${{ steps.scan.outputs.image_tag }}\` |
-          | **Built Image** | \`${{ steps.scan.outputs.built_image }}\` |
-          | **Base Image** | \`${{ steps.scan.outputs.base_image }}\` |
-          | **Scan Mode** | ${{ steps.scan.outputs.scan_mode }} |
-          | **Scan Status** | ${{ steps.scan.outputs.scan_status }} |
-          | **Image Pulled** | ${{ steps.scan.outputs.image_pulled }} |
+          | **Image Tag** | \`$IMAGE_TAG\` |
+          | **Built Image** | \`$BUILT_IMAGE\` |
+          | **Base Image** | \`$BASE_IMAGE\` |
+          | **Scan Mode** | $SCAN_MODE |
+          | **Scan Status** | ${{ steps.status.outputs.scan_status }} |
+          | **Image Pulled** | ${IMAGE_PULLED:-false} |
           | **Scan Date** | $(date -u '+%Y-%m-%d %H:%M UTC') |
-          | **Snyk Version** | ${SNYK_VERSION} |
+          | **Snyk Version** | ${{ steps.verify_token.outputs.version }} |
           | **GitHub Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
           
           ## Vulnerability Summary
           
           | Severity | Target Image | Base Image | New/Introduced |
           |:---------|:-------------|:-----------|:---------------|
-          | **Critical** | ${{ steps.scan.outputs.target_critical }} | ${{ steps.scan.outputs.base_critical }} | ${{ steps.scan.outputs.new_critical }} |
-          | **High** | ${{ steps.scan.outputs.target_high }} | ${{ steps.scan.outputs.base_high }} | ${{ steps.scan.outputs.new_high }} |
-          | **Medium** | ${{ steps.scan.outputs.target_medium }} | ${{ steps.scan.outputs.base_medium }} | ${{ steps.scan.outputs.new_medium }} |
-          | **Low** | ${{ steps.scan.outputs.target_low }} | ${{ steps.scan.outputs.base_low }} | ${{ steps.scan.outputs.new_low }} |
-          | **Total** | ${{ steps.scan.outputs.target_total }} | ${{ steps.scan.outputs.base_total }} | ${{ steps.scan.outputs.new_total }} |
+          | **Critical** | ${{ steps.calculate.outputs.target_critical }} | ${BASE_CRITICAL:-0} | ${{ steps.calculate.outputs.new_critical }} |
+          | **High** | ${{ steps.calculate.outputs.target_high }} | ${BASE_HIGH:-0} | ${{ steps.calculate.outputs.new_high }} |
+          | **Medium** | ${{ steps.calculate.outputs.target_medium }} | ${BASE_MEDIUM:-0} | ${{ steps.calculate.outputs.new_medium }} |
+          | **Low** | ${{ steps.calculate.outputs.target_low }} | ${BASE_LOW:-0} | ${{ steps.calculate.outputs.new_low }} |
+          | **Total** | ${{ steps.calculate.outputs.target_total }} | ${BASE_TOTAL:-0} | ${{ steps.calculate.outputs.new_total }} |
+          
+          ## Scan Results
+          
+          **Status:** ${{ steps.status.outputs.scan_status }}  
+          **Message:** ${{ steps.status.outputs.scan_message }}
           
           EOF
           
-          # Add vulnerability details if scan was successful
-          if [ "${{ steps.scan.outputs.scan_successful }}" = "true" ]; then
-            FULL_SCAN_JSON="$RESULTS_DIR/${IMAGE_TAG}_full_scan.json"
-            BASE_SCAN_JSON=$(ls $RESULTS_DIR/base_*.json 2>/dev/null | head -1)
-            
-            if [ "${{ steps.scan.outputs.new_total }}" -gt 0 ]; then
-              cat >> "$REPORT_FILE" << EOF
-          
-          ## New Vulnerabilities (Not in Base Image)
-          
-          The following vulnerabilities were introduced by the application dependencies and build process:
-          
-          EOF
-              
-              NEW_VULNS=$(get_vulnerability_details "$FULL_SCAN_JSON" "$BASE_SCAN_JSON" 50 "critical,high,medium,low")
-              echo "$NEW_VULNS" >> "$REPORT_FILE"
-              
-            else
-              cat >> "$REPORT_FILE" << EOF
-          
-          ## ✅ No New Vulnerabilities
-          
-          This image does not introduce any new vulnerabilities beyond those inherited from the base image.
-          
-          EOF
-            fi
-            
-            if [ "${{ steps.scan.outputs.base_total }}" -gt 0 ]; then
-              cat >> "$REPORT_FILE" << EOF
-          
-          ## Inherited Vulnerabilities (From Base Image)
-          
-          The following vulnerabilities are inherited from the base image and do not block builds:
-          
-          EOF
-              
-              BASE_VULNS=$(get_vulnerability_details "$BASE_SCAN_JSON" "/dev/null" 20 "critical,high")
-              echo "$BASE_VULNS" >> "$REPORT_FILE"
-              
-              if [ "${{ steps.scan.outputs.base_total }}" -gt 20 ]; then
-                echo "" >> "$REPORT_FILE"
-                echo "_Note: Showing top 20 critical/high base image vulnerabilities. Full details in scan artifacts._" >> "$REPORT_FILE"
-              fi
-            fi
-          fi
-          
-          cat >> "$REPORT_FILE" << EOF
-          
-          ---
+          if [ "${{ steps.calculate.outputs.new_total }}" -gt 0 ]; then
+            cat >> "$REPORT_FILE" << EOF
           
           ## Next Steps
           
-          EOF
-          
-          if [ "${{ steps.scan.outputs.scan_status }}" = "FAILED" ]; then
-            cat >> "$REPORT_FILE" << EOF
-          **🚨 URGENT ACTION REQUIRED**
-          
-          This image has critical or high severity vulnerabilities that block the build:
-          
-          1. Review the vulnerabilities listed above
-          2. Update affected packages in your Pipfile or requirements
-          3. Consider updating the base image if vulnerabilities are inherited
-          4. Re-run the security scan after fixes
-          
-          EOF
-          elif [ "${{ steps.scan.outputs.scan_status }}" = "WARNING" ]; then
-            cat >> "$REPORT_FILE" << EOF
-          **⚠️ RECOMMENDED ACTIONS**
-          
-          This image has medium/low severity vulnerabilities:
-          
-          1. Review the vulnerabilities when convenient
-          2. Plan updates for affected packages in upcoming releases
-          3. Monitor for security advisories on affected packages
+          Review the detailed vulnerability information in the scan artifacts and consider updating affected packages.
           
           EOF
           else
             cat >> "$REPORT_FILE" << EOF
-          **✅ NO ACTION REQUIRED**
           
-          This image passed security scanning with no blocking vulnerabilities.
+          ## Result
+          
+          No new vulnerabilities found beyond those inherited from the base image.
           
           EOF
           fi
           
           cat >> "$REPORT_FILE" << EOF
           
-          ## Resources
-          
-          - [Snyk Documentation](https://docs.snyk.io/scan-with-snyk/snyk-container)
-          - [Container Security Best Practices](https://snyk.io/learn/container-security/)
-          - [GitHub Actions Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          
           ---
-          _Report generated by Snyk ${SNYK_VERSION} on $(date -u '+%Y-%m-%d %H:%M UTC')_
+          _Report generated by Snyk ${{ steps.verify_token.outputs.version }} on $(date -u '+%Y-%m-%d %H:%M UTC')_
           EOF
           
-          echo "Security report generated: $REPORT_FILE"
+          log_with_timestamp "Security report generated: $REPORT_FILE"
 
       - name: Upload Scan Results
         if: always() && steps.check_target.outputs.skip == 'false'
@@ -879,13 +722,33 @@ jobs:
             scan_results/
           retention-days: 30
 
+      - name: Evaluate Exit Status
+        if: steps.check_target.outputs.skip == 'false'
+        run: |
+          source scan_results/utils.sh
+          
+          SCAN_STATUS="${{ steps.status.outputs.scan_status }}"
+          
+          if [ "$SCAN_STATUS" = "ERROR" ]; then
+            log_with_timestamp "ERROR: Scan failed for $IMAGE_TAG: ${scan_error:-Unknown error}"
+            echo "::error::Scan failed for $IMAGE_TAG: ${scan_error:-Unknown error}"
+            exit 1
+          elif [ "$SCAN_STATUS" = "FAILED" ]; then
+            log_with_timestamp "SECURITY FAILURE: Critical or high severity vulnerabilities found in $IMAGE_TAG"
+            echo "::error::Security check failed for $IMAGE_TAG: Critical or high severity vulnerabilities found"
+            exit 1
+          else
+            log_with_timestamp "Security check passed for $IMAGE_TAG"
+            exit 0
+          fi
+
       - name: Slack Notification
         if: |
           always() && 
           steps.check_target.outputs.skip == 'false' &&
           github.event_name != 'pull_request' && 
-          (steps.scan.outputs.scan_status == 'FAILED' || 
-           steps.scan.outputs.scan_status == 'ERROR' ||
+          (steps.status.outputs.scan_status == 'FAILED' || 
+           steps.status.outputs.scan_status == 'ERROR' ||
            github.event.inputs.debug == 'true' ||
            github.event_name == 'schedule')
         continue-on-error: true
@@ -897,43 +760,38 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ steps.scan.outputs.scan_status == 'PASSED' && 'good' || (steps.scan.outputs.scan_status == 'WARNING' && 'warning' || 'danger') }}",
-                  "title": "Snyk Image Security Scan - ${{ steps.scan.outputs.scan_status }}${{ github.event_name == 'schedule' && ' (Nightly)' || '' }}",
-                  "text": "${{ steps.scan.outputs.scan_message }}",
+                  "color": "${{ steps.status.outputs.scan_status == 'PASSED' && 'good' || (steps.status.outputs.scan_status == 'WARNING' && 'warning' || 'danger') }}",
+                  "title": "Snyk Image Security Scan - ${{ steps.status.outputs.scan_status }}${{ github.event_name == 'schedule' && ' (Nightly)' || '' }}",
+                  "text": "${{ steps.status.outputs.scan_message }}",
                   "fields": [
                     {
                       "title": "Image",
-                      "value": "`${{ steps.scan.outputs.image_tag }}`",
+                      "value": "`${{ steps.status.outputs.image_tag }}`",
                       "short": true
                     },
                     {
                       "title": "Scan Mode",
-                      "value": "${{ steps.scan.outputs.scan_mode == 'image' && 'Full Image' || 'Dockerfile Only' }}",
+                      "value": "${{ steps.status.outputs.scan_mode == 'image' && 'Full Image' || 'Dockerfile Only' }}",
                       "short": true
                     },
                     {
                       "title": "New Vulnerabilities",
-                      "value": "Critical: ${{ steps.scan.outputs.new_critical }} | High: ${{ steps.scan.outputs.new_high }} | Medium: ${{ steps.scan.outputs.new_medium }} | Low: ${{ steps.scan.outputs.new_low }}",
+                      "value": "Critical: ${{ steps.calculate.outputs.new_critical }} | High: ${{ steps.calculate.outputs.new_high }} | Medium: ${{ steps.calculate.outputs.new_medium }} | Low: ${{ steps.calculate.outputs.new_low }}",
                       "short": false
                     },
                     {
                       "title": "Total in Image",
-                      "value": "${{ steps.scan.outputs.target_total }} total vulnerabilities found",
-                      "short": true
-                    },
-                    {
-                      "title": "Base Image",
-                      "value": "`${{ steps.scan.outputs.base_image }}`\n(${{ steps.scan.outputs.base_total }} inherited vulnerabilities)",
+                      "value": "${{ steps.calculate.outputs.target_total }} total vulnerabilities found",
                       "short": true
                     },
                     {
                       "title": "Build Status",
-                      "value": "${{ (steps.scan.outputs.new_critical != '0' || steps.scan.outputs.new_high != '0') && '❌ BLOCKED' || '✅ ALLOWED' }}",
+                      "value": "${{ (steps.calculate.outputs.new_critical != '0' || steps.calculate.outputs.new_high != '0') && '❌ BLOCKED' || '✅ ALLOWED' }}",
                       "short": true
                     },
                     {
                       "title": "Scan Performance",
-                      "value": "Duration: ${{ steps.scan.outputs.scan_duration }}s | Retries: ${{ steps.scan.outputs.retry_count }}/${{ env.MAX_RETRY_ATTEMPTS }} | Image Pulled: ${{ steps.scan.outputs.image_pulled }}",
+                      "value": "Duration: ${{ steps.status.outputs.scan_duration }}s | Image Pulled: ${{ steps.status.outputs.image_pulled }}",
                       "short": false
                     },
                     {
@@ -959,7 +817,7 @@ jobs:
                       "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts"
                     }
                   ],
-                  "footer": "Snyk Container Security | Image: ${{ steps.scan.outputs.built_image }}",
+                  "footer": "Snyk Container Security | Image: ${{ steps.status.outputs.built_image }}",
                   "footer_icon": "https://res.cloudinary.com/snyk/image/upload/v1537345894/press-kit/brand/logo-black.png"
                 }
               ]
@@ -977,29 +835,14 @@ jobs:
       - name: Evaluate Overall Status
         id: aggregate
         run: |
-          # This job will pass if all matrix jobs passed or were skipped
-          # It will fail if any matrix job failed
-          
-          OVERALL_STATUS="PASSED"
-          FAILED_IMAGES=""
-          ERROR_IMAGES=""
-          
-          # Note: In a real implementation, you would need to collect outputs
-          # from all matrix jobs. This is a simplified version.
-          
-          echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
-          echo "failed_images=$FAILED_IMAGES" >> $GITHUB_OUTPUT
-          echo "error_images=$ERROR_IMAGES" >> $GITHUB_OUTPUT
-          
-          # The actual aggregation logic would be more complex in practice
-          # and would require downloading artifacts from matrix jobs
-          
+          echo "overall_status=COMPLETED" >> $GITHUB_OUTPUT
+          echo "Aggregation job completed - check individual matrix job results for details"
+
       - name: Summary Notification
         if: |
           always() && 
           github.event_name != 'pull_request' && 
-          (steps.aggregate.outputs.overall_status == 'FAILED' || 
-           github.event_name == 'schedule')
+          github.event_name == 'schedule'
         continue-on-error: true
         uses: 8398a7/action-slack@v3
         with:
@@ -1009,7 +852,7 @@ jobs:
             {
               "attachments": [
                 {
-                  "color": "${{ steps.aggregate.outputs.overall_status == 'PASSED' && 'good' || 'danger' }}",
+                  "color": "good",
                   "title": "Training Images Security Scan Summary - ${{ steps.aggregate.outputs.overall_status }}",
                   "text": "Completed security scanning for all training images",
                   "fields": [
