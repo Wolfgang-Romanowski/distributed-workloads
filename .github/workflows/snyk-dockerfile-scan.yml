@@ -78,13 +78,47 @@ jobs:
 
       - name: Configure Snyk Authentication
         id: verify_token
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          if [ -z "${{ secrets.SNYK_TOKEN }}" ]; then
+          if [ -z "$SNYK_TOKEN" ]; then
             echo "::error::SNYK_TOKEN secret is not configured"
             exit 1
           fi
-          snyk auth "${{ secrets.SNYK_TOKEN }}"
+          
+          # Validate token format (Snyk tokens are typically UUIDs)
+          if [[ ! "$SNYK_TOKEN" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::warning::SNYK_TOKEN does not appear to be in expected UUID format"
+          fi
+          
+          echo "Configuring Snyk authentication..."
+          if snyk auth "$SNYK_TOKEN"; then
+            echo "✅ Snyk auth command completed"
+          else
+            echo "::error::Snyk auth command failed"
+            exit 1
+          fi
+          
+          echo "Testing Snyk authentication..."
+          if snyk auth test; then
+            echo "✅ Snyk authentication test successful"
+            
+            # Get additional info for debugging
+            echo "Getting Snyk configuration info..."
+            snyk config get api || echo "Could not get API endpoint"
+            snyk whoami || echo "Could not get user info"
+            
+          else
+            echo "::error::Snyk authentication test failed"
+            echo "Debugging information:"
+            echo "- Token length: ${#SNYK_TOKEN}"
+            echo "- Token starts with: ${SNYK_TOKEN:0:8}..."
+            echo "- Snyk CLI version: $(snyk --version)"
+            exit 1
+          fi
+          
           echo "version=$(snyk --version)" >> $GITHUB_OUTPUT
+          echo "✅ Snyk CLI version: $(snyk --version)"
 
       - name: Check Target Directory Filter
         id: check_target
@@ -225,6 +259,8 @@ jobs:
 
       - name: Validate Environment
         if: steps.check_target.outputs.skip == 'false'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           source scan_results/utils.sh
           
@@ -247,10 +283,21 @@ jobs:
             exit 1
           fi
           
-          if ! snyk auth test >/dev/null 2>&1; then
-            echo "scan_error=Snyk authentication failed" >> $GITHUB_ENV
-            log_with_timestamp "ERROR: Snyk authentication failed"
-            exit 1
+          # Verify Snyk is still authenticated (auth should persist from previous step)
+          log_with_timestamp "Verifying Snyk authentication..."
+          if snyk auth test >/dev/null 2>&1; then
+            log_with_timestamp "✅ Snyk authentication verified"
+          else
+            echo "scan_error=Snyk authentication verification failed" >> $GITHUB_ENV
+            log_with_timestamp "ERROR: Snyk authentication verification failed"
+            log_with_timestamp "Attempting to re-authenticate..."
+            
+            if [ -n "$SNYK_TOKEN" ] && snyk auth "$SNYK_TOKEN" >/dev/null 2>&1; then
+              log_with_timestamp "✅ Snyk re-authentication successful"
+            else
+              log_with_timestamp "ERROR: Snyk re-authentication failed"
+              exit 1
+            fi
           fi
           
           log_with_timestamp "All validations passed"
@@ -319,6 +366,8 @@ jobs:
 
       - name: Scan Base Image
         if: steps.check_target.outputs.skip == 'false'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           source scan_results/utils.sh
           
@@ -360,6 +409,8 @@ jobs:
       - name: Scan Target Image
         if: steps.check_target.outputs.skip == 'false'
         id: target_scan
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           source scan_results/utils.sh
           
@@ -544,6 +595,8 @@ jobs:
       - name: Create Monitoring Project
         if: steps.check_target.outputs.skip == 'false' && env.SCAN_SUCCESSFUL == 'true' && env.SCAN_MODE == 'image'
         continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           source scan_results/utils.sh
           
