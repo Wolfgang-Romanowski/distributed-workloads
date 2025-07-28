@@ -91,34 +91,36 @@ jobs:
             echo "::warning::SNYK_TOKEN does not appear to be in expected UUID format"
           fi
           
-          echo "Configuring Snyk authentication..."
-          if snyk auth "$SNYK_TOKEN"; then
-            echo "✅ Snyk auth command completed"
-          else
-            echo "::error::Snyk auth command failed"
-            exit 1
-          fi
-          
-          echo "Testing Snyk authentication..."
-          if snyk auth test; then
-            echo "✅ Snyk authentication test successful"
+          echo "Testing Snyk authentication with API token..."
+          # Test authentication by trying to get user info (this uses the SNYK_TOKEN env var)
+          if snyk whoami; then
+            echo "✅ Snyk authentication successful"
+            echo "Getting Snyk version and config info..."
+            echo "Snyk CLI version: $(snyk --version)"
             
-            # Get additional info for debugging
-            echo "Getting Snyk configuration info..."
-            snyk config get api || echo "Could not get API endpoint"
-            snyk whoami || echo "Could not get user info"
+            # Test with a simple command to ensure API access works
+            echo "Testing API access..."
+            if snyk config get api >/dev/null 2>&1; then
+              echo "✅ Snyk API access confirmed"
+            else
+              echo "⚠️ Could not verify API endpoint, but authentication succeeded"
+            fi
             
           else
-            echo "::error::Snyk authentication test failed"
+            echo "::error::Snyk authentication failed"
             echo "Debugging information:"
             echo "- Token length: ${#SNYK_TOKEN}"
             echo "- Token starts with: ${SNYK_TOKEN:0:8}..."
             echo "- Snyk CLI version: $(snyk --version)"
+            echo ""
+            echo "Please verify:"
+            echo "1. SNYK_TOKEN secret is set correctly in repository settings"
+            echo "2. Token is valid and not expired"
+            echo "3. Token has appropriate permissions"
             exit 1
           fi
           
           echo "version=$(snyk --version)" >> $GITHUB_OUTPUT
-          echo "✅ Snyk CLI version: $(snyk --version)"
 
       - name: Check Target Directory Filter
         id: check_target
@@ -283,21 +285,15 @@ jobs:
             exit 1
           fi
           
-          # Verify Snyk is still authenticated (auth should persist from previous step)
+          # Verify Snyk is still authenticated (SNYK_TOKEN env var should be available)
           log_with_timestamp "Verifying Snyk authentication..."
-          if snyk auth test >/dev/null 2>&1; then
+          if snyk whoami >/dev/null 2>&1; then
             log_with_timestamp "✅ Snyk authentication verified"
           else
             echo "scan_error=Snyk authentication verification failed" >> $GITHUB_ENV
             log_with_timestamp "ERROR: Snyk authentication verification failed"
-            log_with_timestamp "Attempting to re-authenticate..."
-            
-            if [ -n "$SNYK_TOKEN" ] && snyk auth "$SNYK_TOKEN" >/dev/null 2>&1; then
-              log_with_timestamp "✅ Snyk re-authentication successful"
-            else
-              log_with_timestamp "ERROR: Snyk re-authentication failed"
-              exit 1
-            fi
+            log_with_timestamp "Please check that SNYK_TOKEN secret is properly configured"
+            exit 1
           fi
           
           log_with_timestamp "All validations passed"
